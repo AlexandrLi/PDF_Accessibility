@@ -59,6 +59,9 @@ class PDFAccessibility(Stack):
         pdf_processing_vpc = ec2.Vpc(self, "PdfProcessingVpc",
             max_azs=2,
             nat_gateways=1,
+            nat_gateway_provider=ec2.NatProvider.gateway(
+                eip_allocation_ids=["eipalloc-078bb76de381f2427"]
+            ),
             subnet_configuration=[
                 ec2.SubnetConfiguration(
                     subnet_type=ec2.SubnetType.PUBLIC,
