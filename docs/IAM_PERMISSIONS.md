@@ -1,345 +1,269 @@
 # IAM Permissions Required for PDF Accessibility Solutions
 
-This document outlines the specific IAM permissions required to deploy and operate each PDF accessibility solution. All permissions follow the **principle of least privilege** with scoped resources.
+This document outlines the IAM permissions required to deploy and operate each PDF accessibility solution.
 
-## PDF-to-PDF Remediation Solution
+Deployment policies are maintained as standalone JSON files in [`policies/`](../policies/):
 
-### Required AWS Services
-- **Amazon S3** - File storage and processing
-- **AWS Lambda** - Serverless compute functions
-- **Amazon ECS** - Containerized processing tasks
-- **Amazon ECR** - Container image registry
-- **AWS Step Functions** - Workflow orchestration
-- **Amazon EC2** - VPC and networking infrastructure
-- **AWS IAM** - Role and policy management
-- **AWS CloudFormation** - Infrastructure deployment
-- **Amazon Bedrock** - AI/ML model access
-- **AWS Secrets Manager** - Adobe API credentials storage
-- **Amazon CloudWatch** - Monitoring and logging
-- **AWS Systems Manager** - Parameter storage
-- **Amazon Comprehend** - Language detection
+| File | Type | Purpose |
+|------|------|---------|
+| [`deploy-caller-policy.json`](../policies/deploy-caller-policy.json) | Identity policy | Must be manually attached to the IAM user/role running `deploy.sh` |
+| [`pdf2pdf-codebuild-policy.json`](../policies/pdf2pdf-codebuild-policy.json) | Identity policy | Loaded by `deploy.sh` and attached to the CodeBuild service role (pdf2pdf) |
+| [`pdf2html-codebuild-policy.json`](../policies/pdf2html-codebuild-policy.json) | Identity policy | Loaded by `deploy.sh` and attached to the CodeBuild service role (pdf2html) |
+| [`codebuild-trust-policy.json`](../policies/codebuild-trust-policy.json) | Trust policy | Loaded by `deploy.sh` when creating the CodeBuild service role |
 
-### Runtime Permissions (ECS Task Role)
-
-#### Bedrock Permissions (Scoped to specific models)
-```json
-{
-    "Sid": "BedrockInvokeModel",
-    "Effect": "Allow",
-    "Action": ["bedrock:InvokeModel"],
-    "Resource": [
-        "arn:aws:bedrock:${Region}::foundation-model/us.amazon.nova-pro-v1:0",
-        "arn:aws:bedrock:${Region}::foundation-model/amazon.nova-pro-v1:0"
-    ]
-}
+Validate any policy with:
+```bash
+aws accessanalyzer validate-policy \
+  --policy-document file://policies/pdf2pdf-codebuild-policy.json \
+  --policy-type IDENTITY_POLICY
 ```
-
-#### S3 Permissions (Scoped to processing bucket)
-```json
-{
-    "Sid": "S3BucketAccess",
-    "Effect": "Allow",
-    "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject"
-    ],
-    "Resource": [
-        "arn:aws:s3:::${BucketName}",
-        "arn:aws:s3:::${BucketName}/*"
-    ]
-}
-```
-
-#### Comprehend Permissions
-```json
-{
-    "Sid": "ComprehendLanguageDetection",
-    "Effect": "Allow",
-    "Action": ["comprehend:DetectDominantLanguage"],
-    "Resource": "*"
-}
-```
-> **Note:** Comprehend's `DetectDominantLanguage` action does not support resource-level permissions.
-
-#### Secrets Manager Permissions (Scoped to app secrets)
-```json
-{
-    "Sid": "SecretsManagerAccess",
-    "Effect": "Allow",
-    "Action": ["secretsmanager:GetSecretValue"],
-    "Resource": "arn:aws:secretsmanager:${Region}:${AccountId}:secret:/myapp/*"
-}
-```
-
-### Lambda Function Permissions
-
-#### Title Generator Lambda - Bedrock Access
-```json
-{
-    "Sid": "BedrockInvokeModel",
-    "Effect": "Allow",
-    "Action": ["bedrock:InvokeModel"],
-    "Resource": [
-        "arn:aws:bedrock:${Region}::foundation-model/us.amazon.nova-pro-v1:0",
-        "arn:aws:bedrock:${Region}::foundation-model/amazon.nova-pro-v1:0"
-    ]
-}
-```
-
-#### CloudWatch Metrics (All Lambdas)
-```json
-{
-    "Sid": "CloudWatchMetrics",
-    "Effect": "Allow",
-    "Action": ["cloudwatch:PutMetricData"],
-    "Resource": "*"
-}
-```
-> **Note:** CloudWatch `PutMetricData` does not support resource-level permissions.
 
 ---
 
-## PDF-to-HTML Remediation Solution
+## Caller Permissions (User Running `deploy.sh`)
 
-### Required AWS Services
-- **Amazon S3** - File storage and processing
-- **AWS Lambda** - Serverless compute functions
-- **Amazon ECR** - Container image registry
-- **AWS IAM** - Role and policy management
-- **AWS CloudFormation** - Infrastructure deployment
-- **Amazon Bedrock** - AI/ML model access and Data Automation
-- **Amazon CloudWatch** - Monitoring and logging
-- **AWS Systems Manager** - Parameter storage
+The user or role that runs `deploy.sh` makes AWS API calls *before* CodeBuild starts. This includes both the backend deploy script and the UI deploy script (from the [PDF_accessability_UI](https://github.com/ASUCICREPO/PDF_accessability_UI) repo).
 
-### Runtime Permissions (Lambda Role)
+See [`policies/deploy-policy.json`](../policies/deploy-policy.json) for the full document.
 
-#### S3 Permissions (Scoped to processing bucket)
-```json
-{
-    "Sid": "S3BucketAccess",
-    "Effect": "Allow",
-    "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:ListBucket",
-        "s3:DeleteObject",
-        "s3:DeleteObjects",
-        "s3:ListObjects",
-        "s3:ListObjectsV2",
-        "s3:GetBucketLocation",
-        "s3:GetObjectVersion",
-        "s3:GetBucketPolicy"
-    ],
-    "Resource": [
-        "arn:aws:s3:::${BucketName}",
-        "arn:aws:s3:::${BucketName}/*"
-    ]
-}
-```
-
-#### Bedrock Model Invocation (Scoped to specific models)
-```json
-{
-    "Sid": "BedrockModelInvocation",
-    "Effect": "Allow",
-    "Action": [
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
-    ],
-    "Resource": [
-        "arn:aws:bedrock:${Region}::foundation-model/us.amazon.nova-lite-v1:0",
-        "arn:aws:bedrock:${Region}::foundation-model/amazon.nova-lite-v1:0",
-        "arn:aws:bedrock:${Region}::foundation-model/us.amazon.nova-pro-v1:0",
-        "arn:aws:bedrock:${Region}::foundation-model/amazon.nova-pro-v1:0"
-    ]
-}
-```
-
-#### Bedrock Data Automation (Scoped to project)
-```json
-{
-    "Sid": "BedrockDataAutomation",
-    "Effect": "Allow",
-    "Action": [
-        "bedrock:InvokeDataAutomationAsync",
-        "bedrock:GetDataAutomationStatus",
-        "bedrock:GetDataAutomationProject"
-    ],
-    "Resource": [
-        "${BdaProjectArn}",
-        "arn:aws:bedrock:${Region}:${AccountId}:data-automation-invocation/*",
-        "arn:aws:bedrock:${Region}:${AccountId}:data-automation-profile/*"
-    ]
-}
-```
-
-#### CloudWatch Logs (Scoped to Lambda log group)
-```json
-{
-    "Sid": "CloudWatchLogs",
-    "Effect": "Allow",
-    "Action": [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents"
-    ],
-    "Resource": "arn:aws:logs:${Region}:${AccountId}:log-group:/aws/lambda/Pdf2HtmlPipeline:*"
-}
-```
+| Sid | Actions | Resources | Purpose |
+|-----|---------|-----------|---------|
+| CloudShellAccess | `cloudshell:*` | `*` | Access AWS CloudShell environment |
+| STSAccess | `sts:GetCallerIdentity` | `*` | Verify AWS credentials |
+| SecretsManagerAccess | `secretsmanager:CreateSecret`, `UpdateSecret` | `secret:/myapp/*` | Store Adobe API credentials (pdf2pdf only) |
+| BedrockDataAutomationAccess | `bedrock:CreateDataAutomationProject` | `*` | Create BDA project (pdf2html only) |
+| IAMRoleManagement | `iam:GetRole`, `CreateRole`, `CreatePolicy`, `GetPolicy`, `AttachRolePolicy`, `PutRolePolicy` | `role/*-codebuild-service-role`, `role/pdf-ui-*-service-role`, `policy/*` | Create CodeBuild service roles and policies (backend + UI) |
+| IAMPassRoleToCodeBuild | `iam:PassRole` | `role/*-codebuild-service-role`, `role/pdf-ui-*-service-role` (conditioned on `iam:PassedToService`: codebuild) | Pass role to CodeBuild projects |
+| CodeBuildAccess | `codebuild:CreateProject`, `StartBuild`, `BatchGetBuilds` | `project/pdfremediation-*`, `project/pdf-ui-*` | Create and monitor CodeBuild projects (backend + UI) |
+| CloudWatchLogsAccess | `logs:DescribeLogStreams`, `GetLogEvents` | `log-group:/aws/codebuild/*` | Read build logs on failure |
+| CloudFormationReadAccess | `cloudformation:DescribeStacks`, `ListStacks` | `*` | Retrieve stack outputs (bucket names, Cognito IDs, Amplify URLs) |
+| S3ListBuckets | `s3:ListAllMyBuckets` | `*` | Find deployed bucket by name pattern |
 
 ---
 
 ## Deployment Permissions (CodeBuild Role)
 
-The CodeBuild role requires permissions to deploy CDK stacks. These are scoped to specific resource patterns.
+The deploy script (`deploy.sh`) creates a CodeBuild service role and attaches a scoped IAM policy. The trust policy and identity policies are read from the `policies/` directory.
 
-### PDF-to-PDF Deployment
+### PDF-to-PDF Deployment Policy
 
-#### S3 (CDK and Application Buckets)
+See [`policies/pdf2pdf-codebuild-policy.json`](../policies/pdf2pdf-codebuild-policy.json) for the full document.
+
+| Sid | Actions | Resources | Purpose |
+|-----|---------|-----------|---------|
+| S3Access | `s3:*` | `cdk-*`, `pdfaccessibility*` | CDK assets and application bucket |
+| ECRAccess | `ecr:*` | `repository/cdk-*` | CDK ECR image assets |
+| ECRAuth | `ecr:GetAuthorizationToken` | `*` | Docker login to ECR |
+| LambdaAccess | `lambda:*` | `function:*` | Create/update Lambda functions |
+| ECSAccess | `ecs:*` | `*` | ECS cluster, task definitions, services |
+| EC2Access | `ec2:*` | `*` | VPC, subnets, NAT gateways, endpoints |
+| StepFunctionsAccess | `states:*` | `stateMachine:*` | Step Functions state machines |
+| IAMRoleAccess | 16 IAM role actions | `role/PDFAccessibility*`, `role/cdk-*` | Stack and CDK roles |
+| IAMPolicyAccess | 7 IAM policy actions | `policy/*` | Managed policies |
+| CloudFormationAccess | `cloudformation:*` | `PDFAccessibility*/*`, `CDKToolkit/*` | CDK stack deployment |
+| LogsAccess | `logs:*` | CodeBuild, Lambda, ECS, Step Functions log groups | CloudWatch Logs |
+| CloudWatchAccess | 4 CloudWatch actions | `*` | Metrics and dashboards |
+| SecretsManagerAccess | 4 Secrets Manager actions | `secret:/myapp/*` | Adobe API credentials |
+| STSAccess | `GetCallerIdentity`, `AssumeRole` | `*` | Identity and CDK role assumption |
+| SSMAccess | 3 SSM actions | `parameter/cdk-bootstrap/*` | CDK bootstrap parameters |
+| CodeConnectionsAccess | `UseConnection`, `GetConnection` | `connection/*` | GitHub source connection |
+
+### PDF-to-HTML Deployment Policy
+
+See [`policies/pdf2html-codebuild-policy.json`](../policies/pdf2html-codebuild-policy.json) for the full document.
+
+| Sid | Actions | Resources | Purpose |
+|-----|---------|-----------|---------|
+| S3Access | `s3:*` | `cdk-*`, `pdf2html-*` | CDK assets and application bucket |
+| ECRAccess | `ecr:*` | `repository/cdk-*`, `repository/pdf2html-*` | CDK and Lambda container images |
+| ECRAuth | `ecr:GetAuthorizationToken` | `*` | Docker login to ECR |
+| LambdaAccess | `lambda:*` | `function:Pdf2Html*`, `function:pdf2html*` | Create/update Lambda functions |
+| IAMRoleAccess | 16 IAM role actions | `role/Pdf2Html*`, `role/pdf2html*`, `role/cdk-*` | Stack and CDK roles |
+| IAMPolicyAccess | 7 IAM policy actions | `policy/*` | Managed policies |
+| CloudFormationAccess | `cloudformation:*` | `Pdf2Html*/*`, `pdf2html*/*`, `CDKToolkit/*` | CDK stack deployment |
+| BedrockAccess | 5 BDA project actions | `*` | Create/manage Bedrock Data Automation project |
+| LogsAccess | `logs:*` | CodeBuild and Lambda log groups | CloudWatch Logs |
+| STSAccess | `GetCallerIdentity`, `AssumeRole` | `*` | Identity and CDK role assumption |
+| SSMAccess | 3 SSM actions | `parameter/cdk-bootstrap/*` | CDK bootstrap parameters |
+| CodeConnectionsAccess | `UseConnection`, `GetConnection` | `connection/*` | GitHub source connection |
+
+---
+
+## Runtime Permissions — PDF-to-PDF
+
+These permissions are created by the CDK stack (`app.py`) and attached to roles at processing time.
+
+### Required AWS Services
+- Amazon S3 — File storage and processing
+- AWS Lambda — Serverless compute (PDF splitter, merger, title generator, accessibility checkers)
+- Amazon ECS (Fargate) — Containerized processing (Adobe Autotag, Alt-Text Generator)
+- Amazon ECR — Container image registry
+- AWS Step Functions — Workflow orchestration
+- Amazon EC2 — VPC and networking infrastructure
+- Amazon Bedrock — AI/ML model invocation
+- AWS Secrets Manager — Adobe API credentials storage
+- Amazon CloudWatch — Monitoring, logging, and dashboards
+- Amazon Comprehend — Language detection
+
+### ECS Task Role
+
 ```json
 {
-    "Sid": "S3CDKAndBucketAccess",
-    "Effect": "Allow",
-    "Action": [
-        "s3:CreateBucket",
-        "s3:DeleteBucket",
-        "s3:PutBucketPolicy",
-        "s3:GetBucketPolicy",
-        "s3:DeleteBucketPolicy",
-        "s3:PutBucketPublicAccessBlock",
-        "s3:GetBucketPublicAccessBlock",
-        "s3:PutEncryptionConfiguration",
-        "s3:GetEncryptionConfiguration",
-        "s3:PutBucketVersioning",
-        "s3:GetBucketVersioning",
-        "s3:PutBucketCORS",
-        "s3:GetBucketCORS",
-        "s3:PutBucketNotification",
-        "s3:GetBucketNotification",
-        "s3:PutBucketTagging",
-        "s3:GetBucketTagging",
-        "s3:GetBucketLocation",
-        "s3:ListBucket",
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject",
-        "s3:GetObjectVersion",
-        "s3:DeleteObjectVersion",
-        "s3:ListBucketVersions"
-    ],
-    "Resource": [
-        "arn:aws:s3:::cdk-*",
-        "arn:aws:s3:::cdk-*/*",
-        "arn:aws:s3:::pdfaccessibility*",
-        "arn:aws:s3:::pdfaccessibility*/*"
-    ]
+  "Statement": [
+    {
+      "Sid": "BedrockInvokeModel",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3BucketAccess",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::${BucketName}", "arn:aws:s3:::${BucketName}/*"]
+    },
+    {
+      "Sid": "ComprehendLanguageDetection",
+      "Effect": "Allow",
+      "Action": ["comprehend:DetectDominantLanguage"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SecretsManagerAccess",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:${Region}:${AccountId}:secret:/myapp/*"
+    }
+  ]
 }
 ```
 
-#### IAM (Scoped to stack-specific roles)
+> The ECS Task Execution Role also receives `AmazonECSTaskExecutionRolePolicy` (AWS managed) and S3 read/write on the processing bucket via `grant_read_write`.
+
+### Lambda Function Permissions
+
+All Lambda functions receive:
+- S3 read/write on the processing bucket via `grant_read_write`
+- `cloudwatch:PutMetricData` on `*` (no resource-level support)
+
+Additional per-function permissions:
+
+| Function | Extra Permissions | Resource |
+|----------|-------------------|----------|
+| Title Generator | `bedrock:InvokeModel` | `*` |
+| Pre-Remediation Checker | `secretsmanager:GetSecretValue` | `secret:/myapp/*` |
+| Post-Remediation Checker | `secretsmanager:GetSecretValue` | `secret:/myapp/*` |
+| PDF Splitter | `states:StartExecution` | State machine ARN (via `grant_start_execution`) |
+
+---
+
+## Runtime Permissions — PDF-to-HTML
+
+These permissions are created by the CDK stack (`pdf2html/cdk/lib/pdf2html-stack.js`).
+
+### Required AWS Services
+- Amazon S3 — File storage and processing
+- AWS Lambda — Serverless compute
+- Amazon ECR — Container image registry
+- Amazon Bedrock — Model invocation and Data Automation
+- Amazon CloudWatch — Monitoring and logging
+
+### Lambda Role
+
 ```json
 {
-    "Sid": "IAMRoleAndPolicyAccess",
-    "Effect": "Allow",
-    "Action": [
-        "iam:CreateRole",
-        "iam:DeleteRole",
-        "iam:GetRole",
-        "iam:UpdateRole",
-        "iam:PassRole",
-        "iam:AttachRolePolicy",
-        "iam:DetachRolePolicy",
-        "iam:PutRolePolicy",
-        "iam:GetRolePolicy",
-        "iam:DeleteRolePolicy",
-        "iam:ListRolePolicies",
-        "iam:ListAttachedRolePolicies",
-        "iam:TagRole",
-        "iam:UntagRole",
-        "iam:ListRoleTags",
-        "iam:UpdateAssumeRolePolicy"
-    ],
-    "Resource": [
-        "arn:aws:iam::*:role/PDFAccessibility*",
-        "arn:aws:iam::*:role/cdk-*"
-    ]
+  "Statement": [
+    {
+      "Sid": "S3BucketAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject", "s3:PutObject", "s3:ListBucket",
+        "s3:DeleteObject", "s3:DeleteObjects", "s3:ListObjects",
+        "s3:ListObjectsV2", "s3:GetBucketLocation",
+        "s3:GetObjectVersion", "s3:GetBucketPolicy"
+      ],
+      "Resource": ["arn:aws:s3:::${BucketName}", "arn:aws:s3:::${BucketName}/*"]
+    },
+    {
+      "Sid": "BedrockModelInvocation",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": [
+        "arn:aws:bedrock:${Region}::foundation-model/us.amazon.nova-lite-v1:0",
+        "arn:aws:bedrock:${Region}::foundation-model/amazon.nova-lite-v1:0",
+        "arn:aws:bedrock:${Region}::foundation-model/us.amazon.nova-pro-v1:0",
+        "arn:aws:bedrock:${Region}::foundation-model/amazon.nova-pro-v1:0"
+      ]
+    },
+    {
+      "Sid": "BedrockDataAutomation",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeDataAutomationAsync",
+        "bedrock:GetDataAutomationStatus",
+        "bedrock:GetDataAutomationProject"
+      ],
+      "Resource": [
+        "${BdaProjectArn}",
+        "arn:aws:bedrock:${Region}:${AccountId}:data-automation-invocation/*"
+      ]
+    },
+    {
+      "Sid": "BedrockDataAutomationProfile",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeDataAutomationAsync"],
+      "Resource": "arn:aws:bedrock:*:${AccountId}:data-automation-profile/*"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:${Region}:${AccountId}:log-group:/aws/lambda/Pdf2HtmlPipeline:*"
+    }
+  ]
 }
 ```
 
-#### CloudFormation (Scoped to stack names)
-```json
-{
-    "Sid": "CloudFormationStackAccess",
-    "Effect": "Allow",
-    "Action": [
-        "cloudformation:CreateStack",
-        "cloudformation:DeleteStack",
-        "cloudformation:UpdateStack",
-        "cloudformation:DescribeStacks",
-        "cloudformation:DescribeStackEvents",
-        "cloudformation:DescribeStackResources",
-        "cloudformation:GetTemplate",
-        "cloudformation:GetTemplateSummary",
-        "cloudformation:ListStacks",
-        "cloudformation:ValidateTemplate",
-        "cloudformation:CreateChangeSet",
-        "cloudformation:DeleteChangeSet",
-        "cloudformation:DescribeChangeSet",
-        "cloudformation:ExecuteChangeSet",
-        "cloudformation:ListChangeSets"
-    ],
-    "Resource": [
-        "arn:aws:cloudformation:*:*:stack/PDFAccessibility*/*",
-        "arn:aws:cloudformation:*:*:stack/CDKToolkit/*"
-    ]
-}
-```
+> The Lambda role also receives the `AWSLambdaBasicExecutionRole` AWS managed policy.
 
 ---
 
 ## Security Considerations
 
 ### Principle of Least Privilege
-All IAM policies in this solution follow the principle of least privilege:
-- **Actions** are limited to only those required for the specific operation
-- **Resources** are scoped to specific ARN patterns where possible
-- **Wildcards** are only used where AWS does not support resource-level permissions
+- Runtime roles use scoped actions and resource ARNs wherever AWS supports them.
+- Deployment (CodeBuild) policies use broader wildcards (`s3:*`, `lambda:*`, etc.) because CDK needs to create, update, and delete resources. These are scoped to specific resource name patterns.
 
 ### Services Without Resource-Level Permissions
-The following actions require `Resource: "*"` because AWS does not support resource-level permissions:
+These actions require `Resource: "*"`:
 - `cloudwatch:PutMetricData`
 - `comprehend:DetectDominantLanguage`
 - `ecr:GetAuthorizationToken`
 - `sts:GetCallerIdentity`
-- EC2 VPC-related actions (describe operations)
+- EC2 VPC-related describe operations
 - ECS cluster and task definition operations
+- Bedrock Data Automation project management actions
 
 ### Sensitive Data Protection
-- Adobe API credentials are stored securely in AWS Secrets Manager at `/myapp/client_credentials`
+- Adobe API credentials stored in AWS Secrets Manager at `/myapp/client_credentials`
 - All S3 buckets use server-side encryption (SSE-S3)
-- VPC configuration isolates ECS tasks in private subnets (PDF-to-PDF solution)
-- IAM roles are scoped to specific resource patterns
-
-### Monitoring and Auditing
-- CloudWatch logs capture all function executions
-- CloudTrail can be enabled for API call auditing
-- Custom CloudWatch dashboards provide operational visibility
+- VPC isolates ECS tasks in private subnets (PDF-to-PDF)
+- IAM roles scoped to specific resource patterns
 
 ---
 
 ## Troubleshooting Permission Issues
 
-### Common Permission Errors
+### Common Errors
 
-1. **CDK Bootstrap Failures**: Ensure CloudFormation and S3 permissions for `cdk-*` resources
-2. **ECR Push Failures**: Verify ECR repository permissions and `ecr:GetAuthorizationToken`
-3. **Lambda Deployment Failures**: Check Lambda and IAM role creation permissions
-4. **Step Function Execution Failures**: Verify Step Functions and ECS permissions
-5. **Bedrock Access Denied**: Ensure Bedrock model access is enabled in the console and IAM policy includes the correct model ARNs
+1. **CDK Bootstrap Failures** — Ensure CloudFormation and S3 permissions for `cdk-*` resources
+2. **ECR Push Failures** — Verify ECR repository permissions and `ecr:GetAuthorizationToken`
+3. **Lambda Deployment Failures** — Check Lambda and IAM role creation permissions
+4. **Step Function Execution Failures** — Verify Step Functions and ECS permissions
+5. **Bedrock Access Denied** — Ensure model access is enabled in the console and IAM policy includes correct model ARNs
+6. **BDA Project Creation Failures** — Verify `bedrock:CreateDataAutomationProject` in the pdf2html policy
 
 ### Permission Validation
-Before deployment, verify your AWS credentials have the required permissions:
 ```bash
 aws sts get-caller-identity
 aws iam get-user
@@ -347,7 +271,7 @@ aws bedrock list-foundation-models --region your-region
 ```
 
 ### Model ARN Formats
-When scoping Bedrock permissions, use the correct ARN format:
 - Foundation models: `arn:aws:bedrock:${Region}::foundation-model/${ModelId}`
 - Data automation projects: `arn:aws:bedrock:${Region}:${AccountId}:data-automation-project/${ProjectId}`
 - Data automation invocations: `arn:aws:bedrock:${Region}:${AccountId}:data-automation-invocation/${JobId}`
+- Data automation profiles: `arn:aws:bedrock:${Region}:${AccountId}:data-automation-profile/${ProfileId}`

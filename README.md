@@ -116,7 +116,6 @@ After successful deployment, the script provides specific testing instructions f
 2. **Upload Your PDF Files**
 
    - Upload any PDF file(s) to the `pdf/` folder
-   - **Note**: The `pdf/` folder is automatically created when you upload files - no manual folder creation needed
    - **Bulk Processing**: You can upload multiple PDFs in the bucket for batch remediation
    - The process automatically triggers when files are uploaded
 
@@ -264,6 +263,8 @@ This solution converts PDF documents to accessible HTML format while preserving 
 ## Contributing
 
 Contributions to this project are welcome. Please fork the repository and submit a pull request with your changes.
+
+We encourage you to use the [Issues](https://github.com/ASUCICREPO/PDF_Accessibility/issues) section to report bugs or suggest enhancements for the solution. We also welcome community members to comment on existing issues to help us identify and prioritize the features most in demand.
 
 ## Acknowledgments
 

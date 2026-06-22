@@ -169,26 +169,13 @@ deploy_backend_solution() {
         ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --output json | jq -r '.Role.Arn')
     else
         print_status "🆕 Creating new IAM role..."
-        
-        TRUST_POLICY=$(cat <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "codebuild.amazonaws.com"
-      },
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}
-EOF
-        )
+
+        # Resolve policy directory relative to this script
+        POLICY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/policies"
 
         CREATE_ROLE_OUTPUT=$(aws iam create-role \
             --role-name "$ROLE_NAME" \
-            --assume-role-policy-document "$TRUST_POLICY" \
+            --assume-role-policy-document "file://${POLICY_DIR}/codebuild-trust-policy.json" \
             --output json)
 
         if [ $? -ne 0 ]; then
@@ -205,195 +192,19 @@ EOF
             # Note: Some wildcards retained due to AWS policy size limits (6,144 chars max)
             # but resources are scoped to specific patterns
             POLICY_NAME="${PROJECT_NAME}-pdf2pdf-codebuild-policy"
-            POLICY_DOCUMENT='{
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Sid": "S3Access",
-                        "Effect": "Allow",
-                        "Action": "s3:*",
-                        "Resource": ["arn:aws:s3:::cdk-*", "arn:aws:s3:::cdk-*/*", "arn:aws:s3:::pdfaccessibility*", "arn:aws:s3:::pdfaccessibility*/*"]
-                    },
-                    {
-                        "Sid": "ECRAccess",
-                        "Effect": "Allow",
-                        "Action": ["ecr:*"],
-                        "Resource": "arn:aws:ecr:*:*:repository/cdk-*"
-                    },
-                    {
-                        "Sid": "ECRAuth",
-                        "Effect": "Allow",
-                        "Action": "ecr:GetAuthorizationToken",
-                        "Resource": "*"
-                    },
-                    {
-                        "Sid": "LambdaAccess",
-                        "Effect": "Allow",
-                        "Action": "lambda:*",
-                        "Resource": "arn:aws:lambda:*:*:function:*"
-                    },
-                    {
-                        "Sid": "ECSAccess",
-                        "Effect": "Allow",
-                        "Action": "ecs:*",
-                        "Resource": "*"
-                    },
-                    {
-                        "Sid": "EC2Access",
-                        "Effect": "Allow",
-                        "Action": "ec2:*",
-                        "Resource": "*"
-                    },
-                    {
-                        "Sid": "StepFunctionsAccess",
-                        "Effect": "Allow",
-                        "Action": "states:*",
-                        "Resource": "arn:aws:states:*:*:stateMachine:*"
-                    },
-                    {
-                        "Sid": "IAMRoleAccess",
-                        "Effect": "Allow",
-                        "Action": ["iam:CreateRole", "iam:DeleteRole", "iam:GetRole", "iam:PassRole", "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePolicy", "iam:GetRolePolicy", "iam:DeleteRolePolicy", "iam:TagRole", "iam:UntagRole", "iam:ListRolePolicies", "iam:ListAttachedRolePolicies", "iam:UpdateAssumeRolePolicy", "iam:ListRoleTags"],
-                        "Resource": ["arn:aws:iam::*:role/PDFAccessibility*", "arn:aws:iam::*:role/cdk-*"]
-                    },
-                    {
-                        "Sid": "IAMPolicyAccess",
-                        "Effect": "Allow",
-                        "Action": ["iam:CreatePolicy", "iam:DeletePolicy", "iam:GetPolicy", "iam:GetPolicyVersion", "iam:CreatePolicyVersion", "iam:DeletePolicyVersion", "iam:ListPolicyVersions"],
-                        "Resource": "arn:aws:iam::*:policy/*"
-                    },
-                    {
-                        "Sid": "CloudFormationAccess",
-                        "Effect": "Allow",
-                        "Action": "cloudformation:*",
-                        "Resource": ["arn:aws:cloudformation:*:*:stack/PDFAccessibility*/*", "arn:aws:cloudformation:*:*:stack/CDKToolkit/*"]
-                    },
-                    {
-                        "Sid": "LogsAccess",
-                        "Effect": "Allow",
-                        "Action": "logs:*",
-                        "Resource": ["arn:aws:logs:*:*:log-group:/aws/codebuild/*", "arn:aws:logs:*:*:log-group:/aws/lambda/*", "arn:aws:logs:*:*:log-group:/ecs/*", "arn:aws:logs:*:*:log-group:/aws/states/*"]
-                    },
-                    {
-                        "Sid": "CloudWatchAccess",
-                        "Effect": "Allow",
-                        "Action": ["cloudwatch:PutMetricData", "cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards", "cloudwatch:GetDashboard"],
-                        "Resource": "*"
-                    },
-                    {
-                        "Sid": "SecretsManagerAccess",
-                        "Effect": "Allow",
-                        "Action": ["secretsmanager:CreateSecret", "secretsmanager:UpdateSecret", "secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
-                        "Resource": "arn:aws:secretsmanager:*:*:secret:/myapp/*"
-                    },
-                    {
-                        "Sid": "STSAccess",
-                        "Effect": "Allow",
-                        "Action": ["sts:GetCallerIdentity", "sts:AssumeRole"],
-                        "Resource": "*"
-                    },
-                    {
-                        "Sid": "SSMAccess",
-                        "Effect": "Allow",
-                        "Action": ["ssm:GetParameter", "ssm:GetParameters", "ssm:PutParameter"],
-                        "Resource": "arn:aws:ssm:*:*:parameter/cdk-bootstrap/*"
-                    },
-                    {
-                        "Sid": "CodeConnectionsAccess",
-                        "Effect": "Allow",
-                        "Action": ["codeconnections:UseConnection", "codeconnections:GetConnection"],
-                        "Resource": "arn:aws:codeconnections:*:*:connection/*"
-                    }
-                ]
-            }'
+            POLICY_FILE="${POLICY_DIR}/pdf2pdf-codebuild-policy.json"
         else
             # PDF-to-HTML scoped policy for CDK deployment
             # Note: Some wildcards retained due to AWS policy size limits (6,144 chars max)
             POLICY_NAME="${PROJECT_NAME}-pdf2html-codebuild-policy"
-            POLICY_DOCUMENT='{
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Sid": "S3Access",
-                        "Effect": "Allow",
-                        "Action": "s3:*",
-                        "Resource": ["arn:aws:s3:::cdk-*", "arn:aws:s3:::cdk-*/*", "arn:aws:s3:::pdf2html-*", "arn:aws:s3:::pdf2html-*/*"]
-                    },
-                    {
-                        "Sid": "ECRAccess",
-                        "Effect": "Allow",
-                        "Action": "ecr:*",
-                        "Resource": ["arn:aws:ecr:*:*:repository/cdk-*", "arn:aws:ecr:*:*:repository/pdf2html-*"]
-                    },
-                    {
-                        "Sid": "ECRAuth",
-                        "Effect": "Allow",
-                        "Action": "ecr:GetAuthorizationToken",
-                        "Resource": "*"
-                    },
-                    {
-                        "Sid": "LambdaAccess",
-                        "Effect": "Allow",
-                        "Action": "lambda:*",
-                        "Resource": ["arn:aws:lambda:*:*:function:Pdf2Html*", "arn:aws:lambda:*:*:function:pdf2html*"]
-                    },
-                    {
-                        "Sid": "IAMRoleAccess",
-                        "Effect": "Allow",
-                        "Action": ["iam:CreateRole", "iam:DeleteRole", "iam:GetRole", "iam:PassRole", "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePolicy", "iam:GetRolePolicy", "iam:DeleteRolePolicy", "iam:TagRole", "iam:UntagRole", "iam:ListRolePolicies", "iam:ListAttachedRolePolicies", "iam:UpdateAssumeRolePolicy", "iam:ListRoleTags"],
-                        "Resource": ["arn:aws:iam::*:role/Pdf2Html*", "arn:aws:iam::*:role/pdf2html*", "arn:aws:iam::*:role/cdk-*"]
-                    },
-                    {
-                        "Sid": "IAMPolicyAccess",
-                        "Effect": "Allow",
-                        "Action": ["iam:CreatePolicy", "iam:DeletePolicy", "iam:GetPolicy", "iam:GetPolicyVersion", "iam:CreatePolicyVersion", "iam:DeletePolicyVersion", "iam:ListPolicyVersions"],
-                        "Resource": "arn:aws:iam::*:policy/*"
-                    },
-                    {
-                        "Sid": "CloudFormationAccess",
-                        "Effect": "Allow",
-                        "Action": "cloudformation:*",
-                        "Resource": ["arn:aws:cloudformation:*:*:stack/Pdf2Html*/*", "arn:aws:cloudformation:*:*:stack/pdf2html*/*", "arn:aws:cloudformation:*:*:stack/CDKToolkit/*"]
-                    },
-                    {
-                        "Sid": "BedrockAccess",
-                        "Effect": "Allow",
-                        "Action": ["bedrock:CreateDataAutomationProject", "bedrock:GetDataAutomationProject", "bedrock:DeleteDataAutomationProject", "bedrock:UpdateDataAutomationProject", "bedrock:ListDataAutomationProjects"],
-                        "Resource": "*"
-                    },
-                    {
-                        "Sid": "LogsAccess",
-                        "Effect": "Allow",
-                        "Action": "logs:*",
-                        "Resource": ["arn:aws:logs:*:*:log-group:/aws/codebuild/*", "arn:aws:logs:*:*:log-group:/aws/lambda/Pdf2Html*"]
-                    },
-                    {
-                        "Sid": "STSAccess",
-                        "Effect": "Allow",
-                        "Action": ["sts:GetCallerIdentity", "sts:AssumeRole"],
-                        "Resource": "*"
-                    },
-                    {
-                        "Sid": "SSMAccess",
-                        "Effect": "Allow",
-                        "Action": ["ssm:GetParameter", "ssm:GetParameters", "ssm:PutParameter"],
-                        "Resource": "arn:aws:ssm:*:*:parameter/cdk-bootstrap/*"
-                    },
-                    {
-                        "Sid": "CodeConnectionsAccess",
-                        "Effect": "Allow",
-                        "Action": ["codeconnections:UseConnection", "codeconnections:GetConnection"],
-                        "Resource": "arn:aws:codeconnections:*:*:connection/*"
-                    }
-                ]
-            }'
+            POLICY_FILE="${POLICY_DIR}/pdf2html-codebuild-policy.json"
         fi
         
         # Create the policy
         print_status "📋 Creating IAM policy: $POLICY_NAME"
         POLICY_RESPONSE=$(aws iam create-policy \
             --policy-name "$POLICY_NAME" \
-            --policy-document "$POLICY_DOCUMENT" \
+            --policy-document "file://${POLICY_FILE}" \
             --description "Minimal IAM policy for $DEPLOYMENT_TYPE CodeBuild deployment" 2>/dev/null || \
             aws iam get-policy --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/$POLICY_NAME" 2>/dev/null)
         

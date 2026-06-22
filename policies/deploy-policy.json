@@ -1,0 +1,100 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "CloudShellAccess",
+            "Effect": "Allow",
+            "Action": "cloudshell:*",
+            "Resource": "*"
+        },
+        {
+            "Sid": "STSAccess",
+            "Effect": "Allow",
+            "Action": "sts:GetCallerIdentity",
+            "Resource": "*"
+        },
+        {
+            "Sid": "SecretsManagerAccess",
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:CreateSecret",
+                "secretsmanager:UpdateSecret"
+            ],
+            "Resource": "arn:aws:secretsmanager:*:*:secret:/myapp/*"
+        },
+        {
+            "Sid": "BedrockDataAutomationAccess",
+            "Effect": "Allow",
+            "Action": "bedrock:CreateDataAutomationProject",
+            "Resource": "*"
+        },
+        {
+            "Sid": "IAMRoleManagement",
+            "Effect": "Allow",
+            "Action": [
+                "iam:GetRole",
+                "iam:CreateRole",
+                "iam:CreatePolicy",
+                "iam:GetPolicy",
+                "iam:AttachRolePolicy",
+                "iam:PutRolePolicy"
+            ],
+            "Resource": [
+                "arn:aws:iam::*:role/*-codebuild-service-role",
+                "arn:aws:iam::*:role/pdf-ui-*-service-role",
+                "arn:aws:iam::*:policy/*"
+            ]
+        },
+        {
+            "Sid": "IAMPassRoleToCodeBuild",
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": [
+                "arn:aws:iam::*:role/*-codebuild-service-role",
+                "arn:aws:iam::*:role/pdf-ui-*-service-role"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "iam:PassedToService": "codebuild.amazonaws.com"
+                }
+            }
+        },
+        {
+            "Sid": "CodeBuildAccess",
+            "Effect": "Allow",
+            "Action": [
+                "codebuild:CreateProject",
+                "codebuild:StartBuild",
+                "codebuild:BatchGetBuilds"
+            ],
+            "Resource": [
+                "arn:aws:codebuild:*:*:project/pdfremediation-*",
+                "arn:aws:codebuild:*:*:project/pdf-ui-*"
+            ]
+        },
+        {
+            "Sid": "CloudWatchLogsAccess",
+            "Effect": "Allow",
+            "Action": [
+                "logs:DescribeLogStreams",
+                "logs:GetLogEvents"
+            ],
+            "Resource": "arn:aws:logs:*:*:log-group:/aws/codebuild/*"
+        },
+        {
+            "Sid": "CloudFormationReadAccess",
+            "Effect": "Allow",
+            "Action": [
+                "cloudformation:DescribeStacks",
+                "cloudformation:ListStacks"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "S3ListBuckets",
+            "Effect": "Allow",
+            "Action": "s3:ListAllMyBuckets",
+            "Resource": "*"
+        }
+    ]
+}
