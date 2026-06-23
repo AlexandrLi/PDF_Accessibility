@@ -1,0 +1,47 @@
+# CodeBuild buildspec for channels worksheet a11y migration.
+# See docs/CHANNELS_WORKSHEET_A11Y_PLAN.md §2.9
+#
+# Required env vars: COURSE_ID, ENV
+# Optional: TOC_ID, CHAPTER_ID (chapter scope), DRY_RUN, SKIP_CDN_INVALIDATION
+
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install -r scripts/requirements-migrate.txt --quiet
+
+  pre_build:
+    commands:
+      - echo "Migration scope course=$COURSE_ID toc=$TOC_ID chapter=$CHAPTER_ID env=$ENV"
+      - |
+        if [ -z "$COURSE_ID" ] || [ -z "$ENV" ]; then
+          echo "COURSE_ID and ENV are required"
+          exit 1
+        fi
+        ARGS="--course-id $COURSE_ID --env $ENV"
+        if [ -n "$TOC_ID" ] && [ -n "$CHAPTER_ID" ]; then
+          ARGS="$ARGS --toc-id $TOC_ID --chapter-id $CHAPTER_ID"
+        elif [ -n "$CHAPTER_ID" ] && [ -z "$TOC_ID" ]; then
+          echo "TOC_ID is required when CHAPTER_ID is set"
+          exit 1
+        fi
+        if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+        if [ "$SKIP_CDN_INVALIDATION" = "true" ]; then ARGS="$ARGS --skip-cdn-invalidation"; fi
+        export MIGRATE_ARGS="$ARGS"
+        echo "migrate-channels-worksheets-a11y.sh $MIGRATE_ARGS"
+
+  build:
+    commands:
+      - ./scripts/migrate-channels-worksheets-a11y.sh $MIGRATE_ARGS
+
+  post_build:
+    commands:
+      - echo "Migration build finished"
+
+artifacts:
+  files:
+    - "reports/migrate-*.json"
+  discard-paths: yes

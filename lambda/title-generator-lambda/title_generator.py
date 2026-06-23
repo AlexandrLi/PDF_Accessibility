@@ -235,8 +235,13 @@ def lambda_handler(event, context):
             }
 
         try:
-            title = generate_title(extracted_text, file_name)
-            print(f"(lambda_handler | Generated title: {title})")
+            channels_job = event.get("channelsJob")
+            if channels_job and channels_job.get("skipTitleLlm"):
+                title = channels_job["topicTitle"]
+                print(f"(lambda_handler | Using course JSON title (skipTitleLlm): {title})")
+            else:
+                title = generate_title(extracted_text, file_name)
+                print(f"(lambda_handler | Generated title: {title})")
         except Exception as e:
             print(f"(lambda_handler | Failed to generate title: {e})")
             pdf_document.close()

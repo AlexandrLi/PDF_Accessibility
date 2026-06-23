@@ -150,7 +150,11 @@ def lambda_handler(event, context):
         # Trigger Step Function with the list of chunks
         response = stepfunctions.start_execution(
             stateMachineArn=state_machine_arn,
-            input=json.dumps({"chunks": chunks, "s3_bucket": bucket_name})
+            input=json.dumps({
+                "chunks": chunks,
+                "s3_bucket": bucket_name,
+                "source_pdf_key": pdf_file_key
+            })
         )
         print(f"Filename - {pdf_file_key} | Step Function started: {response['executionArn']}")
 

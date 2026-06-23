@@ -264,7 +264,7 @@ class PDFAccessibility(Stack):
                                       payload=sfn.TaskInput.from_object({
         "fileNames.$": "$.chunks[*].s3_key"
                      }),
-                                      output_path=sfn.JsonPath.string_at("$.Payload"))
+                                      result_path="$.merger")
         pdf_processing_bucket.grant_read_write(pdf_merger_lambda)
 
         # Define the Add Title Lambda function
@@ -294,7 +294,8 @@ class PDFAccessibility(Stack):
             self, "GenerateAccessibleTitle",
             lambda_function=title_generator_lambda,
             payload=sfn.TaskInput.from_object({
-                "Payload.$": "$"
+                "Payload.$": "$.merger.Payload",
+                "channelsJob.$": "$.channelsJob",
             })
         )
 

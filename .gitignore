@@ -7,6 +7,9 @@ __pycache__
 .git
 .cdk
 client_credentials.json
+deployment.log
+reports/
+pdfs/
 # CDK asset staging directory
 .cdk.staging
 cdk.out
