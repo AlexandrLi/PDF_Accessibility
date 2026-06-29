@@ -28,3 +28,15 @@ PDF_accessability_UI
 
 # PDF UI (separate repo)
 PDF_accessability_UI/
+
+# QA handoff — keep README; PDFs/zips are generated locally from S3
+qa-accessibility-handoff/**/*.pdf
+qa-accessibility-handoff-calculus*.zip
+
+# cpdf spike — keep scripts/docs; ignore binaries and generated PDFs
+spike/**/cpdf-binaries*/
+spike/**/*.pdf
+spike/**/*.zip
+spike/**/input/
+spike/**/output/
+spike/a11y-reports/
