@@ -30,6 +30,7 @@ from lib.config import (  # noqa: E402
     state_machine_arn,
 )
 from lib.figure_alt_sweep import repair_missing_figure_alt  # noqa: E402
+from lib.layout_table_sweep import repair_layout_tables  # noqa: E402
 from lib.pdf_a11y_audit import audit_pdf_bytes  # noqa: E402
 from lib.remediation import remediate_preview_pdf  # noqa: E402
 
@@ -57,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         "--no-repair-missing-figure-alt",
         action="store_true",
         help="Skip post-remediation fallback /Alt on figures missing alt text",
+    )
+    parser.add_argument(
+        "--no-repair-layout-tables",
+        action="store_true",
+        help="Skip post-remediation unwrap/repair of layout /Table regions",
     )
     return parser.parse_args()
 
@@ -123,11 +129,20 @@ def main() -> int:
                 remediated, repaired_figures = repair_missing_figure_alt(remediated)
                 if repaired_figures:
                     print(f"    repaired figure alt: {repaired_figures}")
+
+            table_repair = None
+            if not args.no_repair_layout_tables:
+                remediated, table_repair = repair_layout_tables(remediated)
+                if table_repair.actions:
+                    for action in table_repair.actions:
+                        print(f"    {action}")
+
             audit = audit_pdf_bytes(remediated)
             topic_audits[topic.topic_id] = {
                 **audit.to_dict(),
                 "beforeRepair": audit_before.to_dict(),
                 "repairedFigures": repaired_figures,
+                "tableRepair": table_repair.to_dict() if table_repair else None,
             }
             print(
                 f"    audit: {audit.figure_count} figures, "
@@ -179,7 +194,6 @@ def main() -> int:
         },
         "knownLimitations": [
             "Character encoding may remain failed on manual math PDFs (CID fonts, ADBE_IsScanned).",
-            "Layout regions mis-tagged as /Table are not auto-repaired in v1.",
         ],
     }
 
