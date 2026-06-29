@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """One-time Channels topic preview a11y migration.
 
-Scope (v1): remediate topic_pdfs/{topicId}.pdf only.
-Download and chapter worksheets are rebuilt separately via admin Generate worksheets.
+Remediates topic_pdfs/{topicId}.pdf via the Adobe accessibility pipeline.
+Topic download and chapter worksheets are out of scope here — rebuild separately.
 """
 
 from __future__ import annotations
@@ -29,12 +29,14 @@ from lib.config import (  # noqa: E402
     cloudfront_distribution_id,
     state_machine_arn,
 )
+from lib.figure_alt_sweep import repair_missing_figure_alt  # noqa: E402
+from lib.pdf_a11y_audit import audit_pdf_bytes  # noqa: E402
 from lib.remediation import remediate_preview_pdf  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Remediate Channels topic preview PDFs (topic_pdfs/{topicId}.pdf only)"
+        description="Remediate Channels topic preview PDFs (topic_pdfs/{topicId}.pdf)"
     )
     parser.add_argument("--course-id", required=True)
     parser.add_argument("--env", choices=["dev", "prod"], default="dev")
@@ -46,6 +48,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-cdn-invalidation", action="store_true")
+    parser.add_argument(
+        "--allow-missing-figure-alt",
+        action="store_true",
+        help="Write preview even when figures lack /Alt (reported in migration JSON)",
+    )
+    parser.add_argument(
+        "--no-repair-missing-figure-alt",
+        action="store_true",
+        help="Skip post-remediation fallback /Alt on figures missing alt text",
+    )
     return parser.parse_args()
 
 
@@ -83,11 +95,12 @@ def main() -> int:
     print_scope(topics, args.chapter_id)
     if args.dry_run:
         print("Dry run complete — no writes performed.")
-        print("Next step after live run: admin Generate worksheets for download/chapter PDFs.")
+        print("Live run would remediate preview PDFs, repair missing figure alt, and audit.")
         return 0
 
     paths_overwritten: list[str] = []
     topic_failures: list[str] = []
+    topic_audits: dict[str, dict] = {}
 
     print(f"Remediating {len(topics)} topic preview PDF(s)...")
     for topic in topics:
@@ -104,6 +117,28 @@ def main() -> int:
                 topic.topic_id,
                 topic.title,
             )
+            audit_before = audit_pdf_bytes(remediated)
+            repaired_figures: list[int] = []
+            if audit_before.figures_missing_alt and not args.no_repair_missing_figure_alt:
+                remediated, repaired_figures = repair_missing_figure_alt(remediated)
+                if repaired_figures:
+                    print(f"    repaired figure alt: {repaired_figures}")
+            audit = audit_pdf_bytes(remediated)
+            topic_audits[topic.topic_id] = {
+                **audit.to_dict(),
+                "beforeRepair": audit_before.to_dict(),
+                "repairedFigures": repaired_figures,
+            }
+            print(
+                f"    audit: {audit.figure_count} figures, "
+                f"{len(audit.figures_missing_alt)} missing alt, "
+                f"{audit.table_count} tables"
+            )
+            if audit.has_blocking_issues and not args.allow_missing_figure_alt:
+                raise RuntimeError(
+                    f"figures missing /Alt: {audit.figures_missing_alt}"
+                )
+
             s3.put_object(
                 Bucket=channels,
                 Key=topic.preview_key,
@@ -135,13 +170,17 @@ def main() -> int:
             "expected": len(topics),
             "remediated": len(topics) - len(topic_failures),
             "failed": topic_failures,
+            "audits": topic_audits,
         },
         "pathsOverwritten": paths_overwritten,
         "cdnInvalidation": {
             "distributionId": distribution_id,
             "invalidationId": invalidation_id,
         },
-        "nextStep": "Run admin Generate worksheets to rebuild topic download and chapter PDFs",
+        "knownLimitations": [
+            "Character encoding may remain failed on manual math PDFs (CID fonts, ADBE_IsScanned).",
+            "Layout regions mis-tagged as /Table are not auto-repaired in v1.",
+        ],
     }
 
     reports_dir = Path(__file__).resolve().parents[1] / "reports"
@@ -149,7 +188,6 @@ def main() -> int:
     report_path = reports_dir / f"migrate-{report['runId']}.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Report: {report_path}")
-    print("Next: run admin Generate worksheets for this course to refresh download/chapter PDFs.")
 
     if topic_failures:
         return 1
