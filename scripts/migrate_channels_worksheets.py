@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="If set, only remediate preview PDFs for topics in this chapter",
     )
+    parser.add_argument(
+        "--topic-ids",
+        default=None,
+        help="Comma-separated topic IDs to remediate (filters chapter/course scope)",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-cdn-invalidation", action="store_true")
     parser.add_argument(
@@ -93,6 +98,13 @@ def main() -> int:
         chapter_id=args.chapter_id,
         toc_id=args.toc_id,
     )
+
+    if args.topic_ids:
+        allowed = {topic_id.strip() for topic_id in args.topic_ids.split(",") if topic_id.strip()}
+        topics = [topic for topic in topics if topic.topic_id in allowed]
+        missing = allowed - {topic.topic_id for topic in topics}
+        if missing:
+            print(f"Warning: topic IDs not in scope or missing preview: {sorted(missing)}")
 
     if not topics:
         print("Nothing to migrate for the requested scope.")
