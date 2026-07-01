@@ -2,7 +2,7 @@
 """One-time Channels topic preview a11y migration.
 
 Remediates topic_pdfs/{topicId}.pdf via the Adobe accessibility pipeline.
-Topic download and chapter worksheets are out of scope here — rebuild separately.
+Topic download and chapter worksheets are rebuilt separately via generate-pdf-lambda.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def main() -> int:
     sm_arn = state_machine_arn()
     distribution_id = cloudfront_distribution_id(args.env)
 
-    topics, _chapters = resolve_migration_scope(
+    topics = resolve_migration_scope(
         s3,
         channels,
         args.course_id,
