@@ -293,6 +293,29 @@ def print_auto_chapter_plan(
     print(f"Course-wide pending topics (incl. orphans): {orphan_total}")
 
 
+def save_topic_progress(
+    s3,
+    bucket: str,
+    course_id: str,
+    progress: dict,
+    run_id: str,
+    *,
+    done_count: int,
+    total_topics: int,
+    topic_id: str,
+    status: str,
+    chapter_index: int | None = None,
+) -> None:
+    if chapter_index is not None:
+        progress["currentChapterIndex"] = chapter_index
+    progress["currentTopicId"] = topic_id
+    save_progress(s3, bucket, course_id, progress, run_id)
+    print(
+        f"    progress: {done_count}/{total_topics} topics ({status})",
+        flush=True,
+    )
+
+
 def run_auto_chapters(
     s3,
     stepfunctions,
@@ -322,9 +345,11 @@ def run_auto_chapters(
     chapters_processed = 0
 
     start_index = int(progress.get("nextChapterIndex") or 0)
+    total_topics = sum(len(chapter.topics) for chapter in chapters)
     print(
-        f"Auto-chapters: {len(chapters)} chapters, starting at index {start_index}, "
-        f"time budget {args.time_budget_seconds}s"
+        f"Auto-chapters: {len(chapters)} chapters, {total_topics} topics, "
+        f"starting at index {start_index}, time budget {args.time_budget_seconds}s",
+        flush=True,
     )
 
     for index in range(start_index, len(chapters)):
@@ -346,17 +371,18 @@ def run_auto_chapters(
 
         print(
             f"Chapter [{index}] {chapter.chapter_id}: {chapter.title} "
-            f"({len(pending_topics)} topic(s))"
+            f"({len(pending_topics)} topic(s))",
+            flush=True,
         )
         chapter_failures: list[str] = []
         for topic in pending_topics:
             if time.monotonic() >= deadline:
-                print("Time budget reached mid-chapter.")
+                print("Time budget reached mid-chapter.", flush=True)
                 progress["nextChapterIndex"] = index
                 stopped_early = True
                 break
 
-            print(f"  Adobe pass: {topic.topic_id} ({topic.title})")
+            print(f"  Adobe pass: {topic.topic_id} ({topic.title})", flush=True)
             result = remediate_single_topic(
                 s3, stepfunctions, a11y, sm_arn, args.course_id, topic, args
             )
@@ -371,6 +397,18 @@ def run_auto_chapters(
                 chapter_failures.append(topic.topic_id)
                 topic_failures.append(topic.topic_id)
                 mark_topic_failed(progress, topic.topic_id)
+                save_topic_progress(
+                    s3,
+                    channels,
+                    args.course_id,
+                    progress,
+                    run_id,
+                    done_count=len(done),
+                    total_topics=total_topics,
+                    topic_id=topic.topic_id,
+                    status="failed",
+                    chapter_index=index,
+                )
                 continue
 
             clear_topic_failed(progress, topic.topic_id)
@@ -380,6 +418,18 @@ def run_auto_chapters(
             done.add(topic.topic_id)
             if result.preview_key and result.status == "remediated":
                 paths_overwritten.append(result.preview_key)
+            save_topic_progress(
+                s3,
+                channels,
+                args.course_id,
+                progress,
+                run_id,
+                done_count=len(done),
+                total_topics=total_topics,
+                topic_id=topic.topic_id,
+                status=result.status,
+                chapter_index=index,
+            )
 
         if stopped_early:
             save_progress(s3, channels, args.course_id, progress, run_id)
@@ -406,13 +456,16 @@ def run_auto_chapters(
             if topic.topic_id not in toc_topic_ids and topic.topic_id not in done
         ]
         if orphan_topics:
-            print(f"Orphan pass: {len(orphan_topics)} topic(s) outside reference TOC chapters")
+            print(
+                f"Orphan pass: {len(orphan_topics)} topic(s) outside reference TOC chapters",
+                flush=True,
+            )
             for topic in orphan_topics:
                 if time.monotonic() >= deadline:
                     stopped_early = True
                     save_progress(s3, channels, args.course_id, progress, run_id)
                     break
-                print(f"  Adobe pass: {topic.topic_id} ({topic.title})")
+                print(f"  Adobe pass: {topic.topic_id} ({topic.title})", flush=True)
                 result = remediate_single_topic(
                     s3, stepfunctions, a11y, sm_arn, args.course_id, topic, args
                 )
@@ -425,6 +478,17 @@ def run_auto_chapters(
                 if result.status == "failed":
                     topic_failures.append(topic.topic_id)
                     mark_topic_failed(progress, topic.topic_id)
+                    save_topic_progress(
+                        s3,
+                        channels,
+                        args.course_id,
+                        progress,
+                        run_id,
+                        done_count=len(done),
+                        total_topics=total_topics,
+                        topic_id=topic.topic_id,
+                        status="failed",
+                    )
                     continue
                 clear_topic_failed(progress, topic.topic_id)
                 skipped_reason = "skip-if-audited" if result.status == "skipped-audited" else None
@@ -432,7 +496,17 @@ def run_auto_chapters(
                 done.add(topic.topic_id)
                 if result.preview_key and result.status == "remediated":
                     paths_overwritten.append(result.preview_key)
-            save_progress(s3, channels, args.course_id, progress, run_id)
+                save_topic_progress(
+                    s3,
+                    channels,
+                    args.course_id,
+                    progress,
+                    run_id,
+                    done_count=len(done),
+                    total_topics=total_topics,
+                    topic_id=topic.topic_id,
+                    status=result.status,
+                )
 
     invalidation_id = None
     if not args.skip_cdn_invalidation and paths_overwritten:

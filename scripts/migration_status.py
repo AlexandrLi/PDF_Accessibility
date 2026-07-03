@@ -56,6 +56,13 @@ def main() -> int:
     )
     if summary["lastRunId"]:
         print(f"Last run: {summary['lastRunId']} (updated {summary['updatedAt']})")
+    current_topic = progress.get("currentTopicId")
+    if current_topic and summary["topicsCompleted"] < summary["topicsTotalInToc"]:
+        chapter_index = progress.get("currentChapterIndex")
+        if chapter_index is not None:
+            print(f"In progress: topic {current_topic} (chapter index {chapter_index})")
+        else:
+            print(f"In progress: topic {current_topic} (orphan pass)")
     next_chapter = summary.get("nextChapter")
     if next_chapter:
         print(

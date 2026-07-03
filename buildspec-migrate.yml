@@ -7,6 +7,10 @@
 
 version: 0.2
 
+env:
+  variables:
+    PYTHONUNBUFFERED: "1"
+
 phases:
   install:
     runtime-versions:

@@ -13,4 +13,5 @@ source .venv/bin/activate
 
 pip install -q -r scripts/requirements-migrate.txt
 
+export PYTHONUNBUFFERED=1
 exec python3 scripts/migrate_channels_worksheets.py "$@"
