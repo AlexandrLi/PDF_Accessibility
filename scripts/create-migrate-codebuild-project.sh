@@ -113,7 +113,7 @@ SOURCE="$(jq -n \
     gitCloneDepth: 1
   }')"
 
-ARTIFACTS='{"type":"CODEBUILD","packaging":"NONE","name":"channels-worksheet-a11y-migrate-artifacts"}'
+ARTIFACTS='{"type":"NO_ARTIFACTS"}'
 
 info "Creating/updating CodeBuild project: $PROJECT_NAME"
 if aws codebuild batch-get-projects --names "$PROJECT_NAME" --query 'projects[0].name' --output text 2>/dev/null | grep -q "$PROJECT_NAME"; then
