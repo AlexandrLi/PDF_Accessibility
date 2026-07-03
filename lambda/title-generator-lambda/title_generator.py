@@ -4,6 +4,7 @@ import os
 import time
 import random
 import fitz  # PyMuPDF
+from botocore.exceptions import ClientError
 
 # Helper function for exponential backoff and retry
 def exponential_backoff_retry(
@@ -198,6 +199,25 @@ def generate_title(extracted_text, current_title):
     return generated_title.strip('"')
 
 
+def load_channels_job(bucket_name, merged_file_key, event):
+    channels_job = event.get("channelsJob")
+    if channels_job:
+        return channels_job
+
+    parts = merged_file_key.split("/")
+    if len(parts) >= 2 and parts[0] == "temp":
+        topic_folder = parts[1]
+        sidecar_key = f"temp/{topic_folder}/{topic_folder}.channels.json"
+        s3 = boto3.client("s3")
+        try:
+            response = s3.get_object(Bucket=bucket_name, Key=sidecar_key)
+            return json.loads(response["Body"].read().decode("utf-8"))
+        except ClientError as error:
+            if error.response["Error"]["Code"] not in ("404", "NoSuchKey", "NotFound"):
+                raise
+    return None
+
+
 def lambda_handler(event, context):
     try:
         payload = event.get("Payload")
@@ -235,7 +255,7 @@ def lambda_handler(event, context):
             }
 
         try:
-            channels_job = event.get("channelsJob")
+            channels_job = load_channels_job(file_info["bucket"], file_info["merged_file_key"], event)
             if channels_job and channels_job.get("skipTitleLlm"):
                 title = channels_job["topicTitle"]
                 print(f"(lambda_handler | Using course JSON title (skipTitleLlm): {title})")

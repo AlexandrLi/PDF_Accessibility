@@ -88,23 +88,40 @@ def remediate_preview_pdf(
     topic_id: str,
     topic_title: str,
 ) -> bytes:
-    source_key = f"pdf/migrate/{course_id}/{topic_id}.pdf"
+    # Use migrate/ prefix (not pdf/) so the bucket's pdf/ S3 trigger does not start a
+    # duplicate Step Function execution without channelsJob.
+    source_key = f"migrate/{course_id}/{topic_id}.pdf"
+    channels_sidecar_key = f"migrate/{course_id}/{topic_id}.channels.json"
+    channels_job = {
+        "skipTitleLlm": True,
+        "topicTitle": topic_title,
+    }
     s3_client.put_object(
         Bucket=a11y_bucket,
         Key=source_key,
         Body=pdf_bytes,
         ContentType="application/pdf",
     )
+    s3_client.put_object(
+        Bucket=a11y_bucket,
+        Key=channels_sidecar_key,
+        Body=json.dumps(channels_job).encode("utf-8"),
+        ContentType="application/json",
+    )
 
     chunks = split_pdf_into_chunks(pdf_bytes, source_key, s3_client, a11y_bucket)
+    topic_folder = source_key.split("/")[-1].rsplit(".", 1)[0]
+    s3_client.put_object(
+        Bucket=a11y_bucket,
+        Key=f"temp/{topic_folder}/{topic_folder}.channels.json",
+        Body=json.dumps(channels_job).encode("utf-8"),
+        ContentType="application/json",
+    )
     execution_input: dict[str, Any] = {
         "chunks": chunks,
         "s3_bucket": a11y_bucket,
         "source_pdf_key": source_key,
-        "channelsJob": {
-            "skipTitleLlm": True,
-            "topicTitle": topic_title,
-        },
+        "channelsJob": channels_job,
     }
     execution = stepfunctions_client.start_execution(
         stateMachineArn=state_machine_arn,

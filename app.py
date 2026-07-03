@@ -295,7 +295,6 @@ class PDFAccessibility(Stack):
             lambda_function=title_generator_lambda,
             payload=sfn.TaskInput.from_object({
                 "Payload.$": "$.merger.Payload",
-                "channelsJob.$": "$.channelsJob",
             })
         )
 
