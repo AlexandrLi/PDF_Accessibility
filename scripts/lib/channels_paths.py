@@ -12,6 +12,14 @@ class TopicScope:
     preview_key: str
 
 
+@dataclass
+class ChapterScope:
+    chapter_id: str
+    title: str
+    toc_id: str
+    topics: list[TopicScope]
+
+
 def course_json_key(course_id: str) -> str:
     return f"courses/{course_id}/{course_id}.json"
 
@@ -93,6 +101,68 @@ def topics_for_chapter(
         if scope:
             scopes.append(scope)
     return scopes
+
+
+def default_toc_id(course: dict, toc_id: str | None = None) -> str:
+    if toc_id:
+        tocs = course.get("tocs") or {}
+        if toc_id not in tocs:
+            raise ValueError(f"TOC not found: {toc_id}")
+        return toc_id
+
+    details = course.get("details") or {}
+    default_toc = details.get("defaultToc")
+    if default_toc:
+        tocs = course.get("tocs") or {}
+        if default_toc in tocs:
+            return default_toc
+
+    tocs = course.get("tocs") or {}
+    if not tocs:
+        raise ValueError("Course has no TOCs")
+    return next(iter(tocs))
+
+
+def chapters_for_toc(
+    s3_client,
+    bucket: str,
+    course_id: str,
+    course: dict,
+    toc_id: str,
+) -> list[ChapterScope]:
+    toc = (course.get("tocs") or {}).get(toc_id)
+    if not toc:
+        raise ValueError(f"TOC not found: {toc_id}")
+
+    chapters: list[ChapterScope] = []
+    for chapter in toc.get("chapters") or []:
+        chapter_id = chapter.get("id")
+        if not chapter_id:
+            continue
+        topics = topics_for_chapter(s3_client, bucket, course_id, course, chapter)
+        if not topics:
+            continue
+        chapters.append(
+            ChapterScope(
+                chapter_id=chapter_id,
+                title=chapter.get("title") or chapter_id,
+                toc_id=toc_id,
+                topics=topics,
+            )
+        )
+    return chapters
+
+
+def resolve_auto_chapter_plan(
+    s3_client,
+    bucket: str,
+    course_id: str,
+    toc_id: str | None = None,
+) -> tuple[str, list[ChapterScope]]:
+    course = load_course_json(s3_client, bucket, course_id)
+    resolved_toc_id = default_toc_id(course, toc_id)
+    chapters = chapters_for_toc(s3_client, bucket, course_id, course, resolved_toc_id)
+    return resolved_toc_id, chapters
 
 
 def resolve_migration_scope(

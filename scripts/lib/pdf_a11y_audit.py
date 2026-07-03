@@ -24,6 +24,14 @@ class PdfA11yAudit:
     def has_blocking_issues(self) -> bool:
         return bool(self.figures_missing_alt)
 
+    @property
+    def is_likely_remediated(self) -> bool:
+        return self.marked and not self.has_blocking_issues
+
+
+def is_likely_remediated(pdf_bytes: bytes) -> bool:
+    return audit_pdf_bytes(pdf_bytes).is_likely_remediated
+
 
 def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
     figures_missing_alt: list[int] = []

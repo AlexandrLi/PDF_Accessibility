@@ -1,0 +1,71 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ChannelsDataObjectAccess",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:HeadObject"],
+      "Resource": [
+        "arn:aws:s3:::channels-data-dev/courses/*",
+        "arn:aws:s3:::channels-data-prod/courses/*"
+      ]
+    },
+    {
+      "Sid": "ChannelsDataList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": [
+        "arn:aws:s3:::channels-data-dev",
+        "arn:aws:s3:::channels-data-prod"
+      ],
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["courses/*"]
+        }
+      }
+    },
+    {
+      "Sid": "A11yBucketAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:HeadObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::pdfaccessibility-*",
+        "arn:aws:s3:::pdfaccessibility-*/*"
+      ]
+    },
+    {
+      "Sid": "StepFunctionsRemediation",
+      "Effect": "Allow",
+      "Action": [
+        "states:StartExecution",
+        "states:DescribeExecution",
+        "states:StopExecution"
+      ],
+      "Resource": [
+        "arn:aws:states:*:*:stateMachine:PdfAccessibilityRemediationWorkflow*",
+        "arn:aws:states:*:*:execution:PdfAccessibilityRemediationWorkflow*:*"
+      ]
+    },
+    {
+      "Sid": "CloudFrontInvalidation",
+      "Effect": "Allow",
+      "Action": "cloudfront:CreateInvalidation",
+      "Resource": "arn:aws:cloudfront::*:distribution/*"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:*:log-group:/aws/codebuild/*"
+    }
+  ]
+}

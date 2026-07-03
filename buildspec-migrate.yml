@@ -2,7 +2,8 @@
 # See docs/CHANNELS_WORKSHEET_A11Y_PLAN.md §2.9
 #
 # Required env vars: COURSE_ID, ENV
-# Optional: TOC_ID, CHAPTER_ID (chapter scope), DRY_RUN, SKIP_CDN_INVALIDATION
+# Optional: AUTO_CHAPTERS, SKIP_IF_AUDITED, DRY_RUN, SKIP_CDN_INVALIDATION,
+#           TOC_ID, CHAPTER_ID (manual chapter scope), MIGRATION_TIME_BUDGET_SECONDS
 
 version: 0.2
 
@@ -15,21 +16,32 @@ phases:
 
   pre_build:
     commands:
-      - echo "Migration scope course=$COURSE_ID toc=$TOC_ID chapter=$CHAPTER_ID env=$ENV"
+      - echo "Migration course=$COURSE_ID env=$ENV auto_chapters=$AUTO_CHAPTERS"
       - |
         if [ -z "$COURSE_ID" ] || [ -z "$ENV" ]; then
           echo "COURSE_ID and ENV are required"
           exit 1
         fi
+        if [ -z "$A11Y_BUCKET" ] || [ -z "$STATE_MACHINE_ARN" ]; then
+          echo "Resolving A11Y_BUCKET and STATE_MACHINE_ARN from stack..."
+          eval "$(./scripts/discover-migrate-env.sh)"
+          export A11Y_BUCKET STATE_MACHINE_ARN CHANNELS_DATA_BUCKET CHANNELS_CLOUDFRONT_DISTRIBUTION_ID
+        fi
         ARGS="--course-id $COURSE_ID --env $ENV"
-        if [ -n "$TOC_ID" ] && [ -n "$CHAPTER_ID" ]; then
+        if [ "${AUTO_CHAPTERS:-false}" = "true" ]; then
+          ARGS="$ARGS --auto-chapters"
+        elif [ -n "$TOC_ID" ] && [ -n "$CHAPTER_ID" ]; then
           ARGS="$ARGS --toc-id $TOC_ID --chapter-id $CHAPTER_ID"
         elif [ -n "$CHAPTER_ID" ] && [ -z "$TOC_ID" ]; then
           echo "TOC_ID is required when CHAPTER_ID is set"
           exit 1
         fi
+        if [ "${SKIP_IF_AUDITED:-false}" = "true" ]; then ARGS="$ARGS --skip-if-audited"; fi
         if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
         if [ "$SKIP_CDN_INVALIDATION" = "true" ]; then ARGS="$ARGS --skip-cdn-invalidation"; fi
+        if [ -n "$MIGRATION_TIME_BUDGET_SECONDS" ]; then
+          ARGS="$ARGS --time-budget-seconds $MIGRATION_TIME_BUDGET_SECONDS"
+        fi
         export MIGRATE_ARGS="$ARGS"
         echo "migrate-channels-worksheets-a11y.sh $MIGRATE_ARGS"
 
