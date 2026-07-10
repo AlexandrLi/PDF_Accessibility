@@ -47,7 +47,14 @@ def _table_rows_and_cells(table: pikepdf.Dictionary) -> tuple[list[pikepdf.Dicti
     return rows, cells
 
 
-def _is_layout_table(rows: list[pikepdf.Dictionary], cells: list[pikepdf.Dictionary]) -> bool:
+def _is_layout_table(
+    rows: list[pikepdf.Dictionary],
+    cells: list[pikepdf.Dictionary],
+    table: pikepdf.Dictionary,
+) -> bool:
+    summary = table.get("/Summary")
+    if summary is not None and len(str(summary).strip()) > 40:
+        return False
     if len(rows) == 1 and len(cells) == 1:
         return True
     if len(rows) <= 2 and len(cells) <= 4:
@@ -87,9 +94,102 @@ def _unwrap_grid_table(table: pikepdf.Dictionary, cells: list[pikepdf.Dictionary
     _remove_key(table, "/Alt")
 
 
+def _row_cell_counts(table: pikepdf.Dictionary) -> list[int]:
+    rows = [
+        node
+        for node in _iter_dict_nodes(table)
+        if node.get("/S") == "/TR" and node is not table
+    ]
+    counts: list[int] = []
+    for row in rows:
+        kids = row.get("/K")
+        if not isinstance(kids, pikepdf.Array):
+            counts.append(0)
+            continue
+        counts.append(
+            sum(1 for kid in kids if isinstance(kid, pikepdf.Dictionary))
+        )
+    return counts
+
+
+def _is_irregular_table(table: pikepdf.Dictionary) -> bool:
+    counts = _row_cell_counts(table)
+    if not counts:
+        return True
+    return len(set(counts)) > 1
+
+
+def _collect_table_mcids(table: pikepdf.Dictionary) -> list[int]:
+    mcids: list[int] = []
+    for node in _iter_dict_nodes(table):
+        if node is table:
+            continue
+        content = node.get("/K")
+        if isinstance(content, int):
+            mcids.append(content)
+        elif isinstance(content, pikepdf.Array):
+            for item in content:
+                if isinstance(item, int):
+                    mcids.append(item)
+    return mcids
+
+
+def _revert_table_to_figure(table: pikepdf.Dictionary, *, index: int) -> None:
+    summary = str(table.get("/Summary") or "").strip()
+    contents = str(table.get("/Contents") or "").strip()
+    alt = contents or summary
+
+    headers: list[str] = []
+    for row in _iter_dict_nodes(table):
+        if row is table or row.get("/S") != "/TR":
+            continue
+        kids = row.get("/K")
+        if not isinstance(kids, pikepdf.Array):
+            continue
+        for cell in kids:
+            if not isinstance(cell, pikepdf.Dictionary):
+                continue
+            if cell.get("/S") == "/TH":
+                cell_text = cell.get("/K")
+                if cell_text is not None and not isinstance(cell_text, (int, pikepdf.Array)):
+                    headers.append(str(cell_text).strip())
+
+    if headers and (not alt or alt == f"Table {index}"):
+        alt = (
+            "Table with columns labeled "
+            + ", ".join(f"'{header}'" for header in headers)
+            + "."
+        )
+    if not alt or alt == f"Table {index}":
+        alt = "Table"
+
+    mcids = _collect_table_mcids(table)
+    table["/S"] = pikepdf.Name("/Figure")
+    table["/Alt"] = pikepdf.String(alt)
+    table["/Contents"] = pikepdf.String(alt)
+    _remove_key(table, "/Summary")
+    table["/K"] = pikepdf.Array(mcids) if mcids else pikepdf.Array([])
+    existing_class = table.get("/C")
+    if existing_class is None:
+        table["/C"] = pikepdf.Name("/table-figure-reverted")
+    elif isinstance(existing_class, pikepdf.Array):
+        table["/C"] = pikepdf.Array(["/table-figure-reverted", *existing_class])
+    else:
+        table["/C"] = pikepdf.Array(["/table-figure-reverted", existing_class])
+
+
 def _annotate_data_table(table: pikepdf.Dictionary, rows: list[pikepdf.Dictionary], index: int) -> None:
-    table["/Summary"] = pikepdf.String(f"Table {index}")
+    summary = table.get("/Summary")
+    if summary is None or len(str(summary).strip()) <= 40:
+        table["/Summary"] = pikepdf.String(f"Table {index}")
     first_row = rows[0]
+    has_th = any(
+        cell.get("/S") == "/TH"
+        for cell in _iter_dict_nodes(first_row)
+        if cell is not first_row
+    )
+    if has_th:
+        return
     for cell in _iter_dict_nodes(first_row):
         if cell.get("/S") == "/TD":
             cell["/S"] = pikepdf.Name("/TH")
@@ -100,6 +200,7 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
     unwrapped_1x1 = 0
     unwrapped_grid = 0
     annotated_data_tables = 0
+    reverted_irregular = 0
     actions: list[str] = []
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -111,7 +212,12 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
         tables = [node for node in _iter_dict_nodes(struct_root) if node.get("/S") == "/Table"]
         for index, table in enumerate(tables, start=1):
             rows, cells = _table_rows_and_cells(table)
-            if _is_layout_table(rows, cells):
+            if _is_irregular_table(table):
+                _revert_table_to_figure(table, index=index)
+                reverted_irregular += 1
+                actions.append(f"table{index}: reverted irregular /Table to /Figure")
+                continue
+            if _is_layout_table(rows, cells, table):
                 if len(rows) == 1 and len(cells) == 1:
                     _unwrap_single_cell_table(table, cells[0])
                     unwrapped_1x1 += 1

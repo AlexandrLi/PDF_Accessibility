@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -34,7 +35,10 @@ from lib.config import (  # noqa: E402
     state_machine_arn,
 )
 from lib.figure_alt_sweep import repair_missing_figure_alt  # noqa: E402
+from lib.figure_to_table_sweep import repair_figure_to_table  # noqa: E402
+from lib.inline_formula_sweep import repair_inline_formula_figures  # noqa: E402
 from lib.layout_table_sweep import repair_layout_tables  # noqa: E402
+from lib.marked_content_actualtext_sweep import repair_marked_content_actualtext  # noqa: E402
 from lib.migration_progress import (  # noqa: E402
     clear_topic_failed,
     completed_topic_ids,
@@ -100,6 +104,11 @@ def parse_args() -> argparse.Namespace:
         help="Write preview even when figures lack /Alt (reported in migration JSON)",
     )
     parser.add_argument(
+        "--allow-suspicious-figure-alt",
+        action="store_true",
+        help="Write preview even when figure /Alt looks truncated or mis-tagged",
+    )
+    parser.add_argument(
         "--no-repair-missing-figure-alt",
         action="store_true",
         help="Skip post-remediation fallback /Alt on figures missing alt text",
@@ -108,6 +117,26 @@ def parse_args() -> argparse.Namespace:
         "--no-repair-layout-tables",
         action="store_true",
         help="Skip post-remediation unwrap/repair of layout /Table regions",
+    )
+    parser.add_argument(
+        "--repair-figure-to-table",
+        action="store_true",
+        help="Opt-in: retag table-like /Figure elements as /Table (default keeps /Figure)",
+    )
+    parser.add_argument(
+        "--no-repair-figure-to-table",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-repair-inline-formula",
+        action="store_true",
+        help="Skip expanding caption-only inline-formula /Figure alt text",
+    )
+    parser.add_argument(
+        "--no-repair-marked-content-actualtext",
+        action="store_true",
+        help="Skip /ActualText injection for table and inline-formula marked content",
     )
     return parser.parse_args()
 
@@ -119,6 +148,32 @@ def print_scope(topics: list[TopicScope], chapter_id: str | None) -> None:
     for topic in topics:
         print(f"  - {topic.topic_id}: {topic.title}")
         print(f"      preview: {topic.preview_key}")
+
+
+def filter_blocking_suspicious_figure_alts(
+    suspicious: list,
+    *,
+    marked_content_actions: list[str] | None,
+) -> list:
+    """Drop table-as-figure flags when /ActualText was injected for that figure."""
+    if not marked_content_actions:
+        return suspicious
+
+    actualtext_figures: set[int] = set()
+    for action in marked_content_actions:
+        match = re.match(r"figure(\d+): added /ActualText", action)
+        if match:
+            actualtext_figures.add(int(match.group(1)))
+
+    if not actualtext_figures:
+        return suspicious
+
+    filtered: list = []
+    for item in suspicious:
+        if item.figure_index in actualtext_figures:
+            continue
+        filtered.append(item)
+    return filtered
 
 
 def filter_topics_by_ids(topics: list[TopicScope], topic_ids: str | None) -> list[TopicScope]:
@@ -176,25 +231,74 @@ def remediate_single_topic(
                 print(f"    repaired figure alt: {repaired_figures}")
 
         table_repair = None
+        figure_to_table_repair = None
+        inline_formula_repair = None
+        marked_content_repair = None
+        if args.repair_figure_to_table and not args.no_repair_figure_to_table:
+            remediated, figure_to_table_repair = repair_figure_to_table(remediated)
+            if figure_to_table_repair.actions:
+                for action in figure_to_table_repair.actions:
+                    print(f"    {action}")
+
+        if not args.no_repair_inline_formula:
+            remediated, inline_formula_repair = repair_inline_formula_figures(remediated)
+            if inline_formula_repair.actions:
+                for action in inline_formula_repair.actions:
+                    print(f"    {action}")
+
         if not args.no_repair_layout_tables:
             remediated, table_repair = repair_layout_tables(remediated)
             if table_repair.actions:
                 for action in table_repair.actions:
                     print(f"    {action}")
 
+        if not args.no_repair_marked_content_actualtext:
+            remediated, marked_content_repair = repair_marked_content_actualtext(remediated)
+            if marked_content_repair.actions:
+                for action in marked_content_repair.actions:
+                    print(f"    {action}")
+
         audit = audit_pdf_bytes(remediated)
+        blocking_suspicious = filter_blocking_suspicious_figure_alts(
+            audit.figures_suspicious_alt,
+            marked_content_actions=(
+                marked_content_repair.actions if marked_content_repair else None
+            ),
+        )
         audit_payload = {
             **audit.to_dict(),
             "beforeRepair": audit_before.to_dict(),
+            "blockingSuspiciousFigureAlt": [
+                item.to_dict() for item in blocking_suspicious
+            ],
             "repairedFigures": repaired_figures,
+            "figureToTableRepair": (
+                figure_to_table_repair.to_dict() if figure_to_table_repair else None
+            ),
+            "inlineFormulaRepair": (
+                inline_formula_repair.to_dict() if inline_formula_repair else None
+            ),
+            "markedContentRepair": (
+                marked_content_repair.to_dict() if marked_content_repair else None
+            ),
             "tableRepair": table_repair.to_dict() if table_repair else None,
         }
         print(
             f"    audit: {audit.figure_count} figures, "
             f"{len(audit.figures_missing_alt)} missing alt, "
+            f"{len(audit.figures_suspicious_alt)} suspicious alt, "
             f"{audit.table_count} tables"
         )
-        if audit.has_blocking_issues and not args.allow_missing_figure_alt:
+        if audit.figures_suspicious_alt:
+            for item in audit.figures_suspicious_alt:
+                print(
+                    f"    suspicious figure {item.figure_index}: "
+                    f"{', '.join(item.reasons)} — {item.alt_text[:80]!r}"
+                )
+        if blocking_suspicious and not args.allow_suspicious_figure_alt:
+            indices = [item.figure_index for item in blocking_suspicious]
+            raise RuntimeError(f"figures with suspicious /Alt: {indices}")
+        if audit.figures_missing_alt and not args.allow_missing_figure_alt:
             raise RuntimeError(f"figures missing /Alt: {audit.figures_missing_alt}")
 
         s3.put_object(

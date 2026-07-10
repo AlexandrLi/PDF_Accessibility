@@ -7,22 +7,29 @@ from dataclasses import asdict, dataclass
 
 import pikepdf
 
+from lib.figure_alt_quality import SuspiciousFigureAlt, classify_figure_alt, struct_class_names
+
 
 @dataclass
 class PdfA11yAudit:
     marked: bool
     figure_count: int
     figures_missing_alt: list[int]
+    figures_suspicious_alt: list[SuspiciousFigureAlt]
     table_count: int
     tables_without_summary: int
     tables_without_th: int
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        payload = asdict(self)
+        payload["figures_suspicious_alt"] = [
+            item.to_dict() for item in self.figures_suspicious_alt
+        ]
+        return payload
 
     @property
     def has_blocking_issues(self) -> bool:
-        return bool(self.figures_missing_alt)
+        return bool(self.figures_missing_alt or self.figures_suspicious_alt)
 
     @property
     def is_likely_remediated(self) -> bool:
@@ -35,6 +42,7 @@ def is_likely_remediated(pdf_bytes: bytes) -> bool:
 
 def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
     figures_missing_alt: list[int] = []
+    figures_suspicious_alt: list[SuspiciousFigureAlt] = []
     figure_index = 0
     table_count = 0
     tables_without_summary = 0
@@ -55,6 +63,19 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
                 alt_text = str(alt).strip() if alt is not None else ""
                 if not alt_text:
                     figures_missing_alt.append(figure_index)
+                else:
+                    reasons = classify_figure_alt(
+                        alt_text,
+                        struct_classes=struct_class_names(obj),
+                    )
+                    if reasons:
+                        figures_suspicious_alt.append(
+                            SuspiciousFigureAlt(
+                                figure_index=figure_index,
+                                alt_text=alt_text,
+                                reasons=tuple(reasons),
+                            )
+                        )
             kids = obj.get("/K")
             if isinstance(kids, pikepdf.Array):
                 for kid in kids:
@@ -111,6 +132,7 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         marked=marked,
         figure_count=figure_index,
         figures_missing_alt=figures_missing_alt,
+        figures_suspicious_alt=figures_suspicious_alt,
         table_count=table_count,
         tables_without_summary=tables_without_summary,
         tables_without_th=tables_without_th,

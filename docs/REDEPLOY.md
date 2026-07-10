@@ -22,7 +22,7 @@
 
 - AWS account with existing **PDFAccessibility** stack (dev: account `264230611910`, region `us-east-1` typical)
 - Adobe credentials in Secrets Manager: `/myapp/client_credentials`
-- Tools: Python 3.12+, Node.js 18+, AWS CLI, AWS CDK, Docker Desktop (for ECS image builds)
+- Tools: Python 3.12+, Node.js 18+, AWS CLI, AWS CDK, **Docker** (Colima or Docker Desktop — for Lambda/ECS image builds)
 - IAM permissions to deploy CDK stack and (for migration) read/write `channels-data-dev`
 
 See also: [MANUAL_DEPLOYMENT.md](./MANUAL_DEPLOYMENT.md)
@@ -36,28 +36,32 @@ Run from your **local clone** of `PDF_Accessibility_fork` (not upstream `PDF_Acc
 ```bash
 cd /path/to/PDF_Accessibility_fork
 
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+# Colima + CDK (recommended on macOS)
+colima start
+./scripts/cdk-deploy.sh              # deploy PDFAccessibility
+./scripts/cdk-deploy.sh diff         # preview changes
+
+# Manual equivalent:
+python3 -m venv .venv-cdk && source .venv-cdk/bin/activate
 pip install -r requirements.txt
-
-npm install -g aws-cdk   # if not installed
-
+npm install -g aws-cdk
+docker context use colima            # see scripts/env.cdk.example
 export AWS_DEFAULT_REGION=us-east-1
 export BUILDX_NO_DEFAULT_ATTESTATIONS=1
-
-# Verify credentials
-aws sts get-caller-identity
-
-# See stack name
-cdk list
-# Expected: PDFAccessibility
-
-# Preview changes
-cdk diff
-
-# Apply (updates in place)
-cdk deploy --require-approval never
+cdk deploy PDFAccessibility --app "python3 app.py" --require-approval never
 ```
+
+### Colima troubleshooting
+
+| Symptom                                    | Fix                                                   |
+| ------------------------------------------ | ----------------------------------------------------- |
+| `command not found: docker`                | `brew install docker && brew link --overwrite docker` |
+| `spawnSync docker ENOENT` (CDK)            | Docker CLI not on PATH — link brew docker             |
+| `Cannot connect to the Docker daemon`      | `colima start` then `docker context use colima`       |
+| `DOCKER_HOST overrides the active context` | `unset DOCKER_HOST` — use context instead             |
+| Colima socket missing                      | `colima stop && colima start`                         |
+
+Socket path: `~/.colima/default/docker.sock`
 
 ### After deploy
 

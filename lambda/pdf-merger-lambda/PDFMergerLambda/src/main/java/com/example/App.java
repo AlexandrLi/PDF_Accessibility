@@ -9,6 +9,8 @@ import com.amazonaws.services.s3.model.PutObjectRequest;
 import org.apache.pdfbox.multipdf.PDFMergerUtility;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -109,6 +111,23 @@ public class App implements RequestHandler<Map<String, Object>, String> {
      * @throws IOException If there is an issue merging the PDF files.
      */
     private void mergePDFs(List<String> sourceKeys, String destinationPath, String baseFileName) throws IOException {
+        if (sourceKeys.size() == 1) {
+            String localFilePath = "/tmp/" + sourceKeys.get(0).substring(sourceKeys.get(0).lastIndexOf('/') + 1);
+            File localFile = new File(localFilePath);
+            if (!localFile.exists()) {
+                System.out.println(String.format("Filename: %s, File not found: %s", baseFileName, localFilePath));
+                throw new IOException("Single source PDF not found: " + localFilePath);
+            }
+            System.out.println(String.format(
+                "Filename: %s, Single chunk — copying without PDFBox merge: %s",
+                baseFileName,
+                localFilePath
+            ));
+            Files.copy(localFile.toPath(), new File(destinationPath).toPath(), StandardCopyOption.REPLACE_EXISTING);
+            System.out.println(String.format("Filename: %s, PDF copied successfully to: %s", baseFileName, destinationPath));
+            return;
+        }
+
         PDFMergerUtility pdfMerger = new PDFMergerUtility();
 
         for (String key : sourceKeys) {

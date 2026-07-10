@@ -39,6 +39,13 @@ const { promisify } = require('util');
 const path = require('path');
 const { PDFDocument, PDFName, PDFDict, PDFString } = require('pdf-lib');
 const Database = require('better-sqlite3');
+const { execFileSync } = require('child_process');
+const {
+    MAX_ALT_TEXT_ATTEMPTS,
+    classifyFigureAlt,
+    isRetryableSuspiciousAlt,
+    parseAltTextFromResponse,
+} = require('./figure_alt_quality');
 
 const pipeline = promisify(stream.pipeline);
 
@@ -83,6 +90,7 @@ function sleep(ms) {
 const invokeModel = async (
     prompt = "generate alt text for this image",
     imageBuffer = null,
+    inferenceOverrides = {},
 ) => {
     // Create a new Bedrock Runtime client instance.
     const client = new BedrockRuntimeClient({ region: AWS_REGION });
@@ -116,11 +124,11 @@ const invokeModel = async (
           }
         ],
         inferenceConfig: {
-          max_new_tokens: 1000, // Adjust as needed (default is dynamic)
-          temperature: 0.7, // Default temperature for randomness
-          top_p: 0.9, // Default top-p sampling value
-          top_k: 50, // Default top-k sampling value
-          stopSequences: [] // Optional stop sequences if needed
+          max_new_tokens: inferenceOverrides.max_new_tokens ?? 1000,
+          temperature: inferenceOverrides.temperature ?? 0.7,
+          top_p: inferenceOverrides.top_p ?? 0.9,
+          top_k: inferenceOverrides.top_k ?? 50,
+          stopSequences: inferenceOverrides.stopSequences ?? []
         },
       };
 
@@ -149,9 +157,19 @@ const invokeModel = async (
  * @returns {Promise<string>} - A promise that resolves with the generated alt text in JSON format.
  * @throws {Error} - Throws an error if generating the alt text fails.
  */
-async function generateAltText(imageObject, imageBuffer) {
+async function generateAltText(imageObject, imageBuffer, options = {}) {
+    const { attempt = 1, previousAlt = '' } = options;
     logger.info(`imageObject in generate alt text function: ${imageObject.id}`);
     logger.info(`imageObject in generate alt text function: ${imageObject.context_json.context}`);
+
+    const retryBlock = attempt > 1
+        ? `
+
+IMPORTANT — your previous alt text was rejected because it appears truncated or incomplete:
+"${previousAlt}"
+
+Rewrite the alt text so it is complete. If the image shows numbered stages, steps, or phases, describe every stage through the final one. Do not stop mid-enumeration or end on a bare number.`
+        : '';
 
     
     const prompt = `Generate WCAG 2.1-compliant alt text for an image embedded in a PDF document. The output must be in strict JSON format as follows:
@@ -160,6 +178,7 @@ async function generateAltText(imageObject, imageBuffer) {
     1. Image Description:
        - Describe the key elements of the image, including objects, people, scenes, and any visible text.
        - Consider the image's role within the PDF. What information or function does it provide?
+       - If the image shows numbered stages, steps, or phases, describe ALL of them completely through the final stage.
     2. WCAG 2.1 Compliance:
        a) Text in Image:
           - If duplicated nearby, use empty alt text: alt=""
@@ -217,17 +236,65 @@ async function generateAltText(imageObject, imageBuffer) {
     ${imageObject.context_json.context}
     <ACTUAL CONTENT>
 
-    Now, based on the above guidelines, generate the appropriate alt text in the required JSON format.
+    Now, based on the above guidelines, generate the appropriate alt text in the required JSON format.${retryBlock}
     `;
 
+    const inferenceOverrides = attempt > 1
+        ? { max_new_tokens: 1500, temperature: 0.3 }
+        : { max_new_tokens: 1000, temperature: 0.7 };
+
     try {
-        const response = await invokeModel(prompt, imageBuffer);
+        const response = await invokeModel(prompt, imageBuffer, inferenceOverrides);
         
         return response.content[0].text;
     } catch (error) {
       
         throw error;
     }
+}
+
+async function generateAltTextWithRetry(imageObject, imageBuffer) {
+    const figureId = String(imageObject.id);
+    let previousAlt = '';
+
+    for (let attempt = 1; attempt <= MAX_ALT_TEXT_ATTEMPTS; attempt++) {
+        const responseText = await generateAltText(imageObject, imageBuffer, {
+            attempt,
+            previousAlt,
+        });
+        const parsed = parseAltTextFromResponse(responseText, figureId);
+        const alt =
+            parsed[figureId] ??
+            parsed[imageObject.id] ??
+            Object.values(parsed)[0] ??
+            '';
+        const reasons = classifyFigureAlt(alt);
+
+        if (!reasons.length) {
+            return { [figureId]: alt };
+        }
+
+        if (attempt === MAX_ALT_TEXT_ATTEMPTS) {
+            logger.warn(
+                `Figure ${figureId}: using alt after ${MAX_ALT_TEXT_ATTEMPTS} attempts despite: ${reasons.join(', ')}`
+            );
+            return { [figureId]: alt };
+        }
+
+        if (!isRetryableSuspiciousAlt(alt)) {
+            logger.warn(
+                `Figure ${figureId}: suspicious alt (${reasons.join(', ')}) is not retryable; skipping further attempts`
+            );
+            return { [figureId]: alt };
+        }
+
+        logger.warn(
+            `Figure ${figureId}: attempt ${attempt} produced truncated alt (${reasons.join(', ')}), retrying...`
+        );
+        previousAlt = alt;
+    }
+
+    return { [figureId]: previousAlt };
 }
 
 
@@ -322,17 +389,17 @@ async function generateAltTextForLink(url) {
  * @throws {Error} - Throws an error if any step in the PDF processing or S3 operations fails.
  */
 async function modifyPDF(zipped, bucketName, inputKey, outputKey, filebasename) {
-    const downloadPath = path.join('/tmp', path.basename(inputKey)); // Download to /tmp directory
+    const downloadPath = path.join('/tmp', path.basename(inputKey));
+    const altJsonPath = path.join('/tmp', `${filebasename}_figure_alt.json`);
+    const figureAltPdfPath = path.join('/tmp', `${filebasename}_figure_alt.pdf`);
 
     try {
-        // Step 1: Download the PDF file from S3 to a local path
         const downloadParams = {
            Bucket: process.env.S3_BUCKET_NAME,
             Key: `temp/${filebasename}/output_autotag/COMPLIANT_${process.env.S3_FILE_KEY.split("/").pop()}`,
         };
         const pdfData = await s3Client.send(new GetObjectCommand(downloadParams));
 
-        // Stream the data to a file
         const writeStream = fs_1.createWriteStream(downloadPath);
         pdfData.Body.pipe(writeStream);
 
@@ -341,8 +408,15 @@ async function modifyPDF(zipped, bucketName, inputKey, outputKey, filebasename) 
             writeStream.on('error', reject);
         });
 
-        // Step 2: Read the downloaded PDF file
-        const pdfBytes = fs_1.readFileSync(downloadPath);
+        fs_1.writeFileSync(altJsonPath, JSON.stringify(zipped));
+        execFileSync('python3', [
+            path.join(__dirname, 'apply_figure_alt.py'),
+            downloadPath,
+            figureAltPdfPath,
+            altJsonPath,
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+        const pdfBytes = fs_1.readFileSync(figureAltPdfPath);
         const pdfDoc = await PDFDocument.load(pdfBytes);
 
         const linkProcessingPromises = [];
@@ -353,24 +427,7 @@ async function modifyPDF(zipped, bucketName, inputKey, outputKey, filebasename) 
                 const structType = pdfObject.lookup(PDFName.of('S'))?.encodedName;
 
                 if (structType === '/Figure') {
-                    Object.entries(zipped).forEach(([key, value]) => {
-                        logger.info(`Filename: ${filebasename} | Key: ${key}, Value: ${value}`);
-                        if (key == pdfRef.objectNumber) {
-                            if (value === 'artifact') {
-                             
-                                pdfObject.set(PDFName.of('S'), PDFName.of('Artifact'));
-                            } else {
-                                logger.info(`Filename: ${filebasename} | Adding the alt text`);
-                        
-                                const newAltText = value;
-                                pdfObject.set(PDFName.of('Alt'), PDFString.of(newAltText));
-                                pdfObject.set(PDFName.of('Contents'), PDFString.of(newAltText));
-                                delete zipped[key];
-                                logger.info(`Filename: ${filebasename} | Alt text added:${newAltText}`);
-                                logger.info(`Filename: ${filebasename} | Alt text  for object number:${pdfRef.objectNumber} and key ${key}`);
-                            }
-                        }
-                    });
+                    return;
                 }
                 if (pdfObject.has(PDFName.of('Type')) && pdfObject.lookup(PDFName.of('Type')).encodedName === '/Annot') {
                     const subType = pdfObject.lookup(PDFName.of('Subtype'))?.encodedName;
@@ -515,9 +572,9 @@ async function startProcess() {
                 logger.info(`Filename: ${filebasename} | Local File Path: ${localFilePath}`);
                 fs_1.writeFileSync(localFilePath, fileBuffer);
                 const image_Buffer = await fs.readFile(localFilePath);
-                const response = await generateAltText(imageObject, image_Buffer);
-                logger.info(`Filename: ${filebasename} | Response:${response}`);
-                Object.assign(combinedResults, JSON.parse(response));
+                const altTextJson = await generateAltTextWithRetry(imageObject, image_Buffer);
+                logger.info(`Filename: ${filebasename} | Response:${JSON.stringify(altTextJson)}`);
+                Object.assign(combinedResults, altTextJson);
                 successCount++;
                 logger.info(`Filename: ${filebasename} | Alt text generation succeeded for image ${imageObject.id} (${successCount} succeeded, ${failureCount} failed)`);
             } catch (error) {

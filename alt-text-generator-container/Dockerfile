@@ -19,9 +19,13 @@ FROM public.ecr.aws/docker/library/node:22-slim
 
 WORKDIR /app
 
-# Install only runtime dependencies for better-sqlite3
+# Install runtime dependencies for better-sqlite3 and pikepdf alt apply
+COPY requirements-alt-apply.txt ./
 RUN apt-get update && apt-get install -y \
     libsqlite3-0 \
+    python3 \
+    python3-pip \
+    && pip3 install --no-cache-dir -r requirements-alt-apply.txt --break-system-packages \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy node_modules from builder stage
