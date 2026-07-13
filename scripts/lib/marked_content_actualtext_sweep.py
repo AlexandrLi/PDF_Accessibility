@@ -104,11 +104,18 @@ def _table_mcid_actual_texts(alt_text: str, mcids: list[int]) -> dict[int, str]:
     return {mcid: alt_text for mcid in mcids}
 
 
+_MCID_BDC_TAG = rb"(?:Figure|Span|P|TD|TH|Formula|LBody|LI|Lbl|StyleSpan)"
+
+
+def _mcid_token(mcid: int) -> bytes:
+    return str(mcid).encode() + rb"(?!\d)"
+
+
 def _get_mcid_block(data: bytes, mcid: int) -> tuple[str, bytes] | None:
     pattern = re.compile(
-        rb"/(?P<tag>Figure|Span|P|TD|TH|Formula|LBody|LI|Lbl|StyleSpan)\s*<<"
+        rb"/(?P<tag>" + _MCID_BDC_TAG + rb")\s*<<"
         rb"((?:(?!>>).)*?/MCID\s+"
-        + str(mcid).encode()
+        + _mcid_token(mcid)
         + rb"(?:(?!>>).)*?)>>\s*BDC"
         rb"(?P<body>.*?)(?:EMC|ET)",
         re.DOTALL,
@@ -176,6 +183,74 @@ def _read_page_contents(contents: object) -> bytes:
     return contents.read_bytes()
 
 
+def _page_contents_data(page: pikepdf.Page | None) -> bytes | None:
+    if page is None:
+        return None
+    contents = page.get("/Contents")
+    if contents is None:
+        return None
+    return _read_page_contents(contents)
+
+
+def _page_has_mcids(data: bytes, mcids: list[int]) -> bool:
+    if not mcids:
+        return False
+    for mcid in mcids:
+        if not re.search(rb"/MCID\s+" + _mcid_token(mcid), data):
+            return False
+    return True
+
+
+def _resolve_struct_page(
+    pdf: pikepdf.Pdf,
+    obj: pikepdf.Dictionary,
+) -> pikepdf.Page | None:
+    mcids = _collect_mcids(obj.get("/K"))
+    candidates: list[pikepdf.Page] = []
+
+    page = obj.get("/Pg")
+    if page is not None:
+        candidates.append(page)
+
+    parent = obj.get("/P")
+    while isinstance(parent, pikepdf.Dictionary):
+        page = parent.get("/Pg")
+        if page is not None and page not in candidates:
+            candidates.append(page)
+        parent = parent.get("/P")
+
+    for candidate in candidates:
+        data = _page_contents_data(candidate)
+        if data is not None and _page_has_mcids(data, mcids):
+            return candidate
+
+    if not mcids:
+        return None
+
+    for candidate in pdf.pages:
+        if candidate in candidates:
+            continue
+        data = _page_contents_data(candidate)
+        if data is not None and _page_has_mcids(data, mcids):
+            return candidate
+
+    best_page: pikepdf.Page | None = None
+    best_count = 0
+    for candidate in pdf.pages:
+        data = _page_contents_data(candidate)
+        if data is None:
+            continue
+        count = sum(
+            1
+            for mcid in mcids
+            if re.search(rb"/MCID\s+" + _mcid_token(mcid), data)
+        )
+        if count > best_count:
+            best_count = count
+            best_page = candidate
+    return best_page if best_count > 0 else None
+
+
 def _collect_li_mcids(li: pikepdf.Dictionary) -> list[int]:
     mcids: list[int] = []
 
@@ -214,7 +289,7 @@ def _repair_list_image_labels(
             pass
         else:
             li_index += 1
-            page = obj.get("/Pg")
+            page = _resolve_struct_page(pdf, obj)
             if page is None:
                 pass
             else:
@@ -274,6 +349,7 @@ def _inject_actualtext_on_page(
     mcid: int,
     actual_text: str,
     preferred_tag: bytes | None = None,
+    replace_existing: bool = False,
 ) -> bool:
     contents = page.get("/Contents")
     if contents is None:
@@ -282,26 +358,42 @@ def _inject_actualtext_on_page(
     data = _read_page_contents(contents)
     actual_bytes = _pdf_literal_string(actual_text)
     pattern = re.compile(
-        rb"/(?P<tag>Figure|Span|P|TD|TH|Formula|LBody|LI|Lbl|StyleSpan)\s*<<"
+        rb"/(?P<tag>" + _MCID_BDC_TAG + rb")\s*<<"
         rb"((?:(?!>>).)*?/MCID\s+"
-        + str(mcid).encode()
+        + _mcid_token(mcid)
         + rb"(?:(?!>>).)*?)>>\s*BDC",
         re.DOTALL,
     )
+    changed = False
 
     def repl(match: re.Match[bytes]) -> bytes:
+        nonlocal changed
         inner = match.group(2)
         if b"/ActualText" in inner:
-            return match.group(0)
+            if not replace_existing:
+                return match.group(0)
+            existing = re.search(rb"/ActualText\s+(\([^)]*\)|<[^>]*>)", inner)
+            if existing is not None and existing.group(1) == actual_bytes:
+                return match.group(0)
+            inner = re.sub(rb"/ActualText\s+(\([^)]*\)|<[^>]*>)", b"", inner)
+        changed = True
         tag = preferred_tag or (b"/" + match.group("tag"))
         return tag + b"<<" + inner + b"/ActualText " + actual_bytes + b">> BDC"
 
     new_data, count = pattern.subn(repl, data, count=1)
-    if count == 0:
+    if count == 0 or not changed:
         return False
 
     page["/Contents"] = pdf.make_stream(new_data, compress=True)
     return True
+
+
+def _set_struct_page_if_missing(
+    obj: pikepdf.Dictionary,
+    page: pikepdf.Page,
+) -> None:
+    if obj.get("/Pg") is None:
+        obj["/Pg"] = page.obj
 
 
 def repair_marked_content_actualtext(
@@ -334,12 +426,13 @@ def repair_marked_content_actualtext(
                 needs_table_actualtext = looks_like_table_figure_alt(alt_text) or any(
                     "table-figure-reverted" in name for name in classes
                 )
-                if not needs_table_actualtext and not has_inline_formula:
+                page = _resolve_struct_page(pdf, obj)
+                if page is None or not alt_text:
                     pass
-                else:
+                elif has_inline_formula or needs_table_actualtext:
                     figures_found += 1
-                    page = obj.get("/Pg")
-                    if page is None:
+                    contents = page.get("/Contents")
+                    if contents is None:
                         pass
                     else:
                         spoken_alt = (
@@ -352,7 +445,7 @@ def repair_marked_content_actualtext(
                             obj["/Alt"] = pikepdf.String(spoken_alt)
                             obj["/Contents"] = pikepdf.String(spoken_alt)
                             _strip_inline_formula_class(obj)
-                        elif alt_text:
+                        else:
                             obj["/Alt"] = pikepdf.String(alt_text)
                             if "/Contents" in obj:
                                 obj["/Contents"] = pikepdf.String(alt_text)
@@ -370,8 +463,11 @@ def repair_marked_content_actualtext(
                                 page,
                                 mcid=mcid,
                                 actual_text=actual_text,
+                                replace_existing=needs_table_actualtext,
                             ):
                                 updated.append(mcid)
+                        if updated:
+                            _set_struct_page_if_missing(obj, page)
                         mcids_updated += len(updated)
                         if updated:
                             label = (
