@@ -10,6 +10,8 @@ import io
 import re
 import unittest
 
+from pathlib import Path
+
 import pikepdf
 
 from lib.marked_content_actualtext_sweep import (
@@ -17,6 +19,13 @@ from lib.marked_content_actualtext_sweep import (
     _inject_actualtext_on_page,
     _read_page_contents,
     repair_marked_content_actualtext,
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_NUCLEIC_ACIDS_VALIDATION_PDF = (
+    _REPO_ROOT
+    / "qa-accessibility-handoff/ch1-topic-previews-acrobat-validation"
+    / "04-Nucleic-Acids_preview_733277a2.pdf"
 )
 
 
@@ -233,6 +242,21 @@ class Cd099d0aRegressionTests(unittest.TestCase):
 
         self.assertEqual(second.mcids_updated, 0)
         self.assertEqual(second.actions, [])
+
+
+class NucleicAcidsRegressionTests(unittest.TestCase):
+    def test_repair_multi_mcid_table_does_not_bloat_content_stream(self) -> None:
+        if not _NUCLEIC_ACIDS_VALIDATION_PDF.is_file():
+            self.skipTest("733277a2 validation PDF not available")
+
+        pdf_bytes = _NUCLEIC_ACIDS_VALIDATION_PDF.read_bytes()
+        with pikepdf.open(io.BytesIO(pdf_bytes)) as before:
+            before_len = len(_read_page_contents(before.pages[0]["/Contents"]))
+        repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        with pikepdf.open(io.BytesIO(repaired)) as after:
+            after_len = len(_read_page_contents(after.pages[0]["/Contents"]))
+        self.assertGreater(result.mcids_updated, 0)
+        self.assertLess(after_len, before_len * 1.05)
 
 
 if __name__ == "__main__":

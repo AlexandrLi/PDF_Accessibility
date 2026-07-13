@@ -91,6 +91,19 @@ def _collect_mcids(content: object) -> list[int]:
     return []
 
 
+def _normalize_figure_alt_text(alt: object) -> str:
+    if alt is None:
+        return ""
+    text = str(alt).strip()
+    if not text:
+        return ""
+    if text.startswith("<pikepdf.") or "pikepdf.Dictionary" in text:
+        return "Table"
+    if len(text) > 300 and looks_like_table_figure_alt(text[:120]):
+        return "Table"
+    return text
+
+
 def _table_mcid_actual_texts(alt_text: str, mcids: list[int]) -> dict[int, str]:
     headers = _parse_column_headers(alt_text)
     rows = _parse_table_rows(alt_text, headers)
@@ -101,7 +114,8 @@ def _table_mcid_actual_texts(alt_text: str, mcids: list[int]) -> dict[int, str]:
         }
     if headers and len(mcids) == len(headers):
         return {mcid: headers[index] for index, mcid in enumerate(mcids)}
-    return {mcid: alt_text for mcid in mcids}
+    fallback = alt_text if len(alt_text) <= 200 else "Table"
+    return {mcid: fallback for mcid in mcids}
 
 
 _MCID_BDC_TAG = rb"(?:Figure|Span|P|TD|TH|Formula|LBody|LI|Lbl|StyleSpan)"
@@ -342,20 +356,14 @@ def _repair_list_image_labels(
     return updated
 
 
-def _inject_actualtext_on_page(
-    pdf: pikepdf.Pdf,
-    page: pikepdf.Page,
+def _inject_actualtext_in_data(
+    data: bytes,
     *,
     mcid: int,
     actual_text: str,
     preferred_tag: bytes | None = None,
     replace_existing: bool = False,
-) -> bool:
-    contents = page.get("/Contents")
-    if contents is None:
-        return False
-
-    data = _read_page_contents(contents)
+) -> tuple[bytes, bool]:
     actual_bytes = _pdf_literal_string(actual_text)
     pattern = re.compile(
         rb"/(?P<tag>" + _MCID_BDC_TAG + rb")\s*<<"
@@ -382,10 +390,69 @@ def _inject_actualtext_on_page(
 
     new_data, count = pattern.subn(repl, data, count=1)
     if count == 0 or not changed:
+        return data, False
+    return new_data, True
+
+
+def _inject_actualtext_on_page(
+    pdf: pikepdf.Pdf,
+    page: pikepdf.Page,
+    *,
+    mcid: int,
+    actual_text: str,
+    preferred_tag: bytes | None = None,
+    replace_existing: bool = False,
+) -> bool:
+    contents = page.get("/Contents")
+    if contents is None:
+        return False
+
+    data = _read_page_contents(contents)
+    new_data, changed = _inject_actualtext_in_data(
+        data,
+        mcid=mcid,
+        actual_text=actual_text,
+        preferred_tag=preferred_tag,
+        replace_existing=replace_existing,
+    )
+    if not changed:
         return False
 
     page["/Contents"] = pdf.make_stream(new_data, compress=True)
     return True
+
+
+def _inject_actualtext_batch_on_page(
+    pdf: pikepdf.Pdf,
+    page: pikepdf.Page,
+    mcid_texts: dict[int, str],
+    *,
+    replace_existing: bool = False,
+) -> list[int]:
+    if not mcid_texts:
+        return []
+
+    contents = page.get("/Contents")
+    if contents is None:
+        return []
+
+    data = _read_page_contents(contents)
+    updated: list[int] = []
+    for mcid, actual_text in mcid_texts.items():
+        data, changed = _inject_actualtext_in_data(
+            data,
+            mcid=mcid,
+            actual_text=actual_text,
+            replace_existing=replace_existing,
+        )
+        if changed:
+            updated.append(mcid)
+
+    if not updated:
+        return []
+
+    page["/Contents"] = pdf.make_stream(data, compress=True)
+    return updated
 
 
 def _set_struct_page_if_missing(
@@ -418,7 +485,7 @@ def repair_marked_content_actualtext(
             else:
                 figure_index += 1
                 alt = obj.get("/Alt")
-                alt_text = str(alt).strip() if alt is not None else ""
+                alt_text = _normalize_figure_alt_text(alt)
                 classes = struct_class_names(obj)
                 has_inline_formula = "inlineFormula" in classes or any(
                     "inlineFormula" in name for name in classes
@@ -456,16 +523,12 @@ def repair_marked_content_actualtext(
                             if has_inline_formula and mcids
                             else _table_mcid_actual_texts(alt_text, mcids)
                         )
-                        updated: list[int] = []
-                        for mcid, actual_text in mcid_texts.items():
-                            if _inject_actualtext_on_page(
-                                pdf,
-                                page,
-                                mcid=mcid,
-                                actual_text=actual_text,
-                                replace_existing=needs_table_actualtext,
-                            ):
-                                updated.append(mcid)
+                        updated = _inject_actualtext_batch_on_page(
+                            pdf,
+                            page,
+                            mcid_texts,
+                            replace_existing=needs_table_actualtext,
+                        )
                         if updated:
                             _set_struct_page_if_missing(obj, page)
                         mcids_updated += len(updated)
