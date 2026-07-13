@@ -16,6 +16,7 @@ import pikepdf
 
 from lib.marked_content_actualtext_sweep import (
     _get_mcid_block,
+    _inject_actualtext_in_data,
     _inject_actualtext_on_page,
     _read_page_contents,
     repair_marked_content_actualtext,
@@ -197,6 +198,25 @@ class InjectActualTextTests(unittest.TestCase):
             )
             self.assertFalse(first)
             self.assertFalse(second)
+
+    def test_inject_rebuilds_clean_block_when_actualtext_literal_is_corrupt(self) -> None:
+        garbage = b"pikepdf.Dictionary({'/ActualText': 'Table'})" * 200
+        data = (
+            b"/StyleSpan<< /MCID 44 /ActualText ("
+            + garbage
+            + b") >> BDC /Im1 Do EMC"
+        )
+        new_data, changed = _inject_actualtext_in_data(
+            data,
+            mcid=44,
+            actual_text="Table",
+            replace_existing=True,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(
+            new_data,
+            b"/StyleSpan<< /MCID 44 /ActualText (Table) >> BDC /Im1 Do EMC",
+        )
 
 
 class TableFigureRepairTests(unittest.TestCase):

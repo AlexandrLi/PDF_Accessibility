@@ -356,6 +356,10 @@ def _repair_list_image_labels(
     return updated
 
 
+def _clean_mcid_bdc_block(tag: bytes, mcid: bytes, actual_bytes: bytes) -> bytes:
+    return tag + b"<< /MCID " + mcid + b" /ActualText " + actual_bytes + b" >> BDC"
+
+
 def _inject_actualtext_in_data(
     data: bytes,
     *,
@@ -377,16 +381,26 @@ def _inject_actualtext_in_data(
     def repl(match: re.Match[bytes]) -> bytes:
         nonlocal changed
         inner = match.group(2)
+        mcid_match = re.search(rb"/MCID\s+(\d+)(?!\d)", inner)
+        if mcid_match is None:
+            return match.group(0)
+
+        tag = preferred_tag or (b"/" + match.group("tag"))
+        mcid_bytes = mcid_match.group(1)
+        rebuilt = _clean_mcid_bdc_block(tag, mcid_bytes, actual_bytes)
+        if match.group(0) == rebuilt:
+            return match.group(0)
+
         if b"/ActualText" in inner:
             if not replace_existing:
                 return match.group(0)
-            existing = re.search(rb"/ActualText\s+(\([^)]*\)|<[^>]*>)", inner)
-            if existing is not None and existing.group(1) == actual_bytes:
-                return match.group(0)
-            inner = re.sub(rb"/ActualText\s+(\([^)]*\)|<[^>]*>)", b"", inner)
+            if len(inner) < 256:
+                existing = re.search(rb"/ActualText\s+(\([^)]*\)|<[^>]*>)", inner)
+                if existing is not None and existing.group(1) == actual_bytes:
+                    return match.group(0)
+
         changed = True
-        tag = preferred_tag or (b"/" + match.group("tag"))
-        return tag + b"<<" + inner + b"/ActualText " + actual_bytes + b">> BDC"
+        return rebuilt
 
     new_data, count = pattern.subn(repl, data, count=1)
     if count == 0 or not changed:
