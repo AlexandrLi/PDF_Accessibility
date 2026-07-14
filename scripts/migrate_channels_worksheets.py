@@ -38,6 +38,7 @@ from lib.figure_alt_sweep import repair_missing_figure_alt  # noqa: E402
 from lib.figure_to_table_sweep import repair_figure_to_table  # noqa: E402
 from lib.inline_formula_sweep import repair_inline_formula_figures  # noqa: E402
 from lib.layout_table_sweep import repair_layout_tables  # noqa: E402
+from lib.character_encoding_sweep import repair_character_encoding  # noqa: E402
 from lib.marked_content_actualtext_sweep import repair_marked_content_actualtext  # noqa: E402
 from lib.migration_progress import (  # noqa: E402
     clear_topic_failed,
@@ -132,6 +133,11 @@ def parse_args() -> argparse.Namespace:
         "--no-repair-inline-formula",
         action="store_true",
         help="Skip expanding caption-only inline-formula /Figure alt text",
+    )
+    parser.add_argument(
+        "--no-repair-character-encoding",
+        action="store_true",
+        help="Skip /ActualText and /ToUnicode repairs for character encoding failures",
     )
     parser.add_argument(
         "--no-repair-marked-content-actualtext",
@@ -234,6 +240,7 @@ def remediate_single_topic(
         figure_to_table_repair = None
         inline_formula_repair = None
         marked_content_repair = None
+        character_encoding_repair = None
         if args.repair_figure_to_table and not args.no_repair_figure_to_table:
             remediated, figure_to_table_repair = repair_figure_to_table(remediated)
             if figure_to_table_repair.actions:
@@ -258,6 +265,12 @@ def remediate_single_topic(
                 for action in marked_content_repair.actions:
                     print(f"    {action}")
 
+        if not args.no_repair_character_encoding:
+            remediated, character_encoding_repair = repair_character_encoding(remediated)
+            if character_encoding_repair.actions:
+                for action in character_encoding_repair.actions:
+                    print(f"    {action}")
+
         audit = audit_pdf_bytes(remediated)
         blocking_suspicious = filter_blocking_suspicious_figure_alts(
             audit.figures_suspicious_alt,
@@ -280,6 +293,11 @@ def remediate_single_topic(
             ),
             "markedContentRepair": (
                 marked_content_repair.to_dict() if marked_content_repair else None
+            ),
+            "characterEncodingRepair": (
+                character_encoding_repair.to_dict()
+                if character_encoding_repair
+                else None
             ),
             "tableRepair": table_repair.to_dict() if table_repair else None,
         }

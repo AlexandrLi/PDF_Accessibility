@@ -5,9 +5,11 @@
 > **Run granularity:** Per **course** or per **chapter**.  
 > **Execution:** Local CLI (dev) + **AWS CodeBuild** (production migration).  
 > **Deploy:** `cdk deploy` from this fork — see [REDEPLOY.md](./REDEPLOY.md). Full uninstall rarely required.  
-> **Last updated:** 2026-06-23 (v1: **preview-only** migration; download/chapter via admin Generate worksheets)
+> **Last updated:** 2026-07-14 (v1: **preview-only** migration; download/chapter via admin Generate worksheets)
 
-> **v1 implementation note:** The migration CLI only remediates `topic_pdfs/{topicId}.pdf`. Sections below that describe fork-owned topic download wrap, chapter assembly, or `--post-wrap-a11y` are **deferred** — kept for reference only.
+> **Canonical scope:** [PREVIEW_SCOPE.md](./PREVIEW_SCOPE.md) — this repo owns **topic previews only**. Wrapped topic/chapter PDFs are **`generate-pdf-lambda`**.
+
+> **v1 implementation note:** The migration CLI only remediates `topic_pdfs/{topicId}.pdf`. Sections below that describe fork-owned topic download wrap, chapter assembly, or `--post-wrap-a11y` are **deferred / historical** — do not implement in this repo.
 
 ---
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Topic preview a11y migration (Adobe + sweeps) — see docs/PREVIEW_SCOPE.md
+# Post-remediation sweeps on topic preview PDFs only — see docs/PREVIEW_SCOPE.md
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,4 +14,4 @@ source .venv/bin/activate
 pip install -q -r scripts/requirements-migrate.txt
 
 export PYTHONUNBUFFERED=1
-exec python3 scripts/migrate_channels_worksheets.py "$@"
+exec python3 scripts/sweep_topic_previews.py "$@"

@@ -33,3 +33,7 @@ PDF_accessability_UI/
 # QA handoff — keep README; PDFs/zips are generated locally from S3
 qa-accessibility-handoff/**/*.pdf
 qa-accessibility-handoff-calculus*.zip
+qa-accessibility-handoff-biochemistry*.zip
+
+# Local preview sweep artifacts (topic previews only)
+tmp/
