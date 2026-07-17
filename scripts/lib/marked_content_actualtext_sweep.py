@@ -391,6 +391,8 @@ def _repair_list_image_labels(
         nonlocal updated, li_index
         if obj.get("/S") != "/LI":
             pass
+        elif obj.get("/Alt") is not None:
+            li_index += 1
         else:
             li_index += 1
             page = _resolve_struct_page(pdf, obj)
@@ -540,39 +542,42 @@ def _repair_list_item_label_actualtext(
         nonlocal updated, li_index
         if obj.get("/S") == "/LI":
             li_index += 1
-            for lbl in _struct_li_lbl_elements(obj):
-                if lbl.get("/ActualText") is not None:
-                    continue
-                mcid = lbl.get("/K")
-                if not isinstance(mcid, int):
-                    continue
-                resolved = _lbl_page_content(pdf, lbl)
-                if resolved is None:
-                    continue
-                page, data = resolved
-                if _mcid_bdc_has_actualtext(data, mcid):
-                    continue
-                block = _get_mcid_block(data, mcid)
-                if block is None:
-                    continue
-                spoken = _spoken_list_label_text(
-                    _decode_label_mcid_text(block[1])
-                )
-                if not spoken:
-                    continue
-                lbl["/ActualText"] = pikepdf.String(spoken)
-                if _inject_actualtext_on_page(
-                    pdf,
-                    page,
-                    mcid=mcid,
-                    actual_text=spoken,
-                    preferred_tag=b"/Lbl",
-                ):
-                    updated += 1
-                    actions.append(
-                        f"list item {li_index}: added /ActualText "
-                        f"{spoken!r} on Lbl MCID {mcid}"
+            if obj.get("/Alt") is not None:
+                pass
+            else:
+                for lbl in _struct_li_lbl_elements(obj):
+                    if lbl.get("/ActualText") is not None:
+                        continue
+                    mcid = lbl.get("/K")
+                    if not isinstance(mcid, int):
+                        continue
+                    resolved = _lbl_page_content(pdf, lbl)
+                    if resolved is None:
+                        continue
+                    page, data = resolved
+                    if _mcid_bdc_has_actualtext(data, mcid):
+                        continue
+                    block = _get_mcid_block(data, mcid)
+                    if block is None:
+                        continue
+                    spoken = _spoken_list_label_text(
+                        _decode_label_mcid_text(block[1])
                     )
+                    if not spoken:
+                        continue
+                    lbl["/ActualText"] = pikepdf.String(spoken)
+                    if _inject_actualtext_on_page(
+                        pdf,
+                        page,
+                        mcid=mcid,
+                        actual_text=spoken,
+                        preferred_tag=b"/Lbl",
+                    ):
+                        updated += 1
+                        actions.append(
+                            f"list item {li_index}: added /ActualText "
+                            f"{spoken!r} on Lbl MCID {mcid}"
+                        )
 
         kids = obj.get("/K")
         if isinstance(kids, pikepdf.Array):
@@ -597,20 +602,23 @@ def count_li_lbl_missing_actualtext(pdf_bytes: bytes) -> int:
         def walk(obj: pikepdf.Dictionary) -> None:
             nonlocal missing
             if obj.get("/S") == "/LI":
-                for lbl in _struct_li_lbl_elements(obj):
-                    mcid = lbl.get("/K")
-                    if not isinstance(mcid, int):
+                if obj.get("/Alt") is not None:
+                    pass
+                else:
+                    for lbl in _struct_li_lbl_elements(obj):
+                        mcid = lbl.get("/K")
+                        if not isinstance(mcid, int):
+                            missing += 1
+                            continue
+                        struct_ok = lbl.get("/ActualText") is not None
+                        resolved = _lbl_page_content(pdf, lbl)
+                        bdc_ok = (
+                            resolved is not None
+                            and _mcid_bdc_has_actualtext(resolved[1], mcid)
+                        )
+                        if struct_ok and bdc_ok:
+                            continue
                         missing += 1
-                        continue
-                    struct_ok = lbl.get("/ActualText") is not None
-                    resolved = _lbl_page_content(pdf, lbl)
-                    bdc_ok = (
-                        resolved is not None
-                        and _mcid_bdc_has_actualtext(resolved[1], mcid)
-                    )
-                    if struct_ok and bdc_ok:
-                        continue
-                    missing += 1
 
             kids = obj.get("/K")
             if isinstance(kids, pikepdf.Array):

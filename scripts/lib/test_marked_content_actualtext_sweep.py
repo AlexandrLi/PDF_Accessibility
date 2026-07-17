@@ -629,6 +629,85 @@ class ListItemLabelActualTextTests(unittest.TestCase):
             spoken = sorted(str(lbl.get("/ActualText")) for lbl in lbl_elems)
             self.assertEqual(spoken, ["option a", "option c"])
 
+    def test_skip_list_item_label_actualtext_when_li_has_alt(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"q /Lbl<</MCID 5 >> BDC (1\\)   )Tj EMC "
+            b"q /LBody<</MCID 6 >> BDC (Step text) Tj EMC Q"
+        )
+        lbl = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Lbl"),
+                "/K": 5,
+                "/Pg": page.obj,
+            }
+        )
+        lbody = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/LBody"),
+                "/K": 6,
+                "/Pg": page.obj,
+            }
+        )
+        li = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/LI"),
+                "/Alt": "Step 1. Example list item",
+                "/Pg": page.obj,
+                "/K": pikepdf.Array([lbl, lbody]),
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([li]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+        pdf_bytes = buf.getvalue()
+
+        self.assertEqual(count_li_lbl_missing_actualtext(pdf_bytes), 0)
+        repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertNotIn("Lbl MCID 5", "\n".join(result.actions))
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertFalse(_mcid_bdc_has_actualtext(data, 5))
+
+    def test_count_li_lbl_missing_actualtext_ignores_li_with_alt(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        lbl = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Lbl"),
+                "/K": 5,
+                "/Pg": page.obj,
+            }
+        )
+        li = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/LI"),
+                "/Alt": "Step 1. Example",
+                "/Pg": page.obj,
+                "/K": pikepdf.Array([lbl]),
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([li]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+        self.assertEqual(count_li_lbl_missing_actualtext(buf.getvalue()), 0)
+
     def test_repair_list_item_label_resolves_lbl_page_not_li_page(self) -> None:
         pdf = pikepdf.Pdf.new()
         page0 = pdf.add_blank_page()
@@ -684,6 +763,54 @@ class ListItemLabelActualTextTests(unittest.TestCase):
             self.assertTrue(_mcid_bdc_has_actualtext(data_page1, 4))
             lbl = opened.Root["/StructTreeRoot"]["/K"][0]["/K"][0]
             self.assertEqual(str(lbl.get("/ActualText")), "option a")
+
+
+_ENCODING_FIX_DIR = _REPO_ROOT / "tmp/encoding-fix-review"
+
+
+def _li_alt_with_lbl_actualtext_violations(pdf_bytes: bytes) -> list[str]:
+    """Struct paths where /LI has /Alt and a child /Lbl has /ActualText."""
+    violations: list[str] = []
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        struct_root = pdf.Root.get("/StructTreeRoot")
+        if struct_root is None:
+            return violations
+
+        def walk(obj: pikepdf.Dictionary, path: str) -> None:
+            if obj.get("/S") == "/LI" and obj.get("/Alt") is not None:
+                for child in obj.get("/K", []):
+                    if not isinstance(child, pikepdf.Dictionary):
+                        continue
+                    if child.get("/S") == "/Lbl" and child.get("/ActualText") is not None:
+                        violations.append(
+                            f"{path}/Lbl has /ActualText under /LI with /Alt"
+                        )
+            kids = obj.get("/K")
+            if isinstance(kids, pikepdf.Array):
+                for index, kid in enumerate(kids):
+                    if isinstance(kid, pikepdf.Dictionary):
+                        walk(kid, f"{path}[{index}]")
+            elif isinstance(kids, pikepdf.Dictionary):
+                walk(kids, path)
+
+        walk(struct_root, "StructTreeRoot")
+    return violations
+
+
+class BiosignalingNestedAltRegressionTests(unittest.TestCase):
+    @unittest.skipUnless(
+        (_ENCODING_FIX_DIR / "6f84ffb1-before.pdf").is_file(),
+        "6f84ffb1 validation PDF not available",
+    )
+    def test_marked_sweep_avoids_lbl_actualtext_under_li_with_alt(self) -> None:
+        pdf_bytes = (_ENCODING_FIX_DIR / "6f84ffb1-before.pdf").read_bytes()
+        repaired, _ = repair_marked_content_actualtext(pdf_bytes)
+        violations = _li_alt_with_lbl_actualtext_violations(repaired)
+        self.assertEqual(
+            violations,
+            [],
+            f"nested alt regression: {violations}",
+        )
 
 
 class OrphanMarkedContentTests(unittest.TestCase):

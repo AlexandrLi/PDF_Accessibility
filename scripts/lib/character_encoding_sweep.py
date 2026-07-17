@@ -40,7 +40,7 @@ _SYMBOL_SPOKEN = {
     "\ufffd": "",
 }
 
-_BFCHAR_SECTION = re.compile(r"beginbfchar\s*(.*?)endbfchar", re.DOTALL)
+_BFCHAR_SECTION = re.compile(r"(?:\d+\s+)?beginbfchar\s*(.*?)endbfchar", re.DOTALL)
 
 
 def _parse_bfchar_pairs(data: str) -> list[tuple[str, str]]:
@@ -176,37 +176,82 @@ def _dedupe_font_tounicode(pdf: pikepdf.Pdf, font: pikepdf.Dictionary) -> bool:
         return False
 
     seen_unicode: dict[str, str] = {}
+    used_dst: set[str] = set()
     replacements: list[tuple[str, str, str]] = []
+    next_pua = 0xF000
     for src, dst in pairs:
         if len(src) > 4:
             continue
         unicode_char = _unicode_from_tounicode_dst(dst)
+        used_dst.add(unicode_char)
         if unicode_char in seen_unicode:
-            pua = f"U+{0xE000 + int(src, 16):04X}"
-            replacements.append((src, dst, pua))
+            pua_codepoint = next_pua
+            while chr(pua_codepoint) in used_dst:
+                pua_codepoint += 1
+                if pua_codepoint > 0xF8FF:
+                    pua_codepoint = 0xF000
+            next_pua = pua_codepoint + 1
+            if next_pua > 0xF8FF:
+                next_pua = 0xF000
+            pua_char = chr(pua_codepoint)
+            used_dst.add(pua_char)
+            pua_hex = pua_char.encode("utf-16-be").hex().upper()
+            replacements.append((src, dst, pua_hex))
         else:
             seen_unicode[unicode_char] = src
 
     if not replacements:
         return False
 
+    replacement_map = {
+        (src.upper(), dst.upper()): pua_hex for src, dst, pua_hex in replacements
+    }
+
     def replace_bfchar_section(match: re.Match[str]) -> str:
         section = match.group(1)
-        new_section = section
-        for src, dst, pua in replacements:
-            pua_hex = pua.encode("utf-16-be").hex().upper()
-            new_section = re.sub(
-                rf"<{src}>\s*<{re.escape(dst)}>",
-                f"<{src}><{pua_hex}>",
-                new_section,
-                count=1,
-            )
-        return f"beginbfchar{new_section}endbfchar"
+        lines: list[str] = []
+        for src, dst in re.findall(
+            r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", section
+        ):
+            new_dst = replacement_map.get((src.upper(), dst.upper()), dst)
+            lines.append(f"<{src.upper()}> <{new_dst.upper()}>")
+        return f"{len(lines)} beginbfchar\r\n" + "\r\n".join(lines) + "\r\nendbfchar"
 
     new_data = _BFCHAR_SECTION.sub(replace_bfchar_section, data)
 
     font["/ToUnicode"] = pdf.make_stream(new_data.encode("latin1"))
     return True
+
+
+def count_ambiguous_tounicode_fonts(pdf_bytes: bytes) -> int:
+    """Count /ToUnicode bfchar entries where multiple CIDs map to the same Unicode."""
+    duplicates = 0
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        seen: set[tuple[int, int]] = set()
+        for page in pdf.pages:
+            fonts = page.get("/Resources", {}).get("/Font", {})
+            if not fonts:
+                continue
+            for font in fonts.values():
+                key = font.objgen
+                if key in seen:
+                    continue
+                seen.add(key)
+                stream = font.get("/ToUnicode")
+                if stream is None:
+                    continue
+                data = stream.read_bytes().decode("latin1", errors="replace")
+                pairs = _parse_bfchar_pairs(data)
+                seen_unicode: dict[str, str] = {}
+                for src, dst in pairs:
+                    if len(src) > 4:
+                        continue
+                    unicode_char = _unicode_from_tounicode_dst(dst)
+                    if unicode_char in seen_unicode:
+                        duplicates += 1
+                    else:
+                        seen_unicode[unicode_char] = src
+    return duplicates
 
 
 def _repair_font_tounicode_ambiguity(

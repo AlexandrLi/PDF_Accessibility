@@ -26,6 +26,7 @@ from lib.character_encoding_sweep import (  # noqa: E402
     _decode_mcid_text,
     _needs_character_encoding_repair,
     _page_fontmaps,
+    count_ambiguous_tounicode_fonts,
     repair_character_encoding,
 )
 from lib.cloudfront import invalidate_paths  # noqa: E402
@@ -54,6 +55,7 @@ class PreviewAuditFlags:
     lbl_blank_without_actualtext: int
     lbl_mcq_without_actualtext: int
     orphan_marked_without_actualtext: int
+    ambiguous_tounicode_mappings: int
     symbol_without_actualtext: int
     status: str
     notes: list[str]
@@ -106,6 +108,7 @@ def audit_preview_bytes(topic_id: str, title: str, pdf_bytes: bytes) -> PreviewA
     lbl_bad = 0
     lbl_mcq_bad = count_li_lbl_missing_actualtext(pdf_bytes)
     orphan_bad = count_orphan_marked_missing_actualtext(pdf_bytes)
+    ambiguous_tounicode = count_ambiguous_tounicode_fonts(pdf_bytes)
     sym_bad = 0
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -141,7 +144,7 @@ def audit_preview_bytes(topic_id: str, title: str, pdf_bytes: bytes) -> PreviewA
     elif blocking:
         status = "warn-suspicious-alt"
         notes.append(f"suspicious alt figures: {[i.figure_index for i in blocking]}")
-    elif lbl_bad or lbl_mcq_bad or orphan_bad or sym_bad:
+    elif lbl_bad or lbl_mcq_bad or orphan_bad or ambiguous_tounicode or sym_bad:
         status = "warn-encoding"
         if lbl_bad:
             notes.append(f"lbl blank without ActualText: {lbl_bad}")
@@ -149,6 +152,10 @@ def audit_preview_bytes(topic_id: str, title: str, pdf_bytes: bytes) -> PreviewA
             notes.append(f"lbl mcq without ActualText: {lbl_mcq_bad}")
         if orphan_bad:
             notes.append(f"orphan marked without ActualText: {orphan_bad}")
+        if ambiguous_tounicode:
+            notes.append(
+                f"ambiguous /ToUnicode mappings: {ambiguous_tounicode}"
+            )
         if sym_bad:
             notes.append(f"symbol without ActualText: {sym_bad}")
 
@@ -160,6 +167,7 @@ def audit_preview_bytes(topic_id: str, title: str, pdf_bytes: bytes) -> PreviewA
         lbl_blank_without_actualtext=lbl_bad,
         lbl_mcq_without_actualtext=lbl_mcq_bad,
         orphan_marked_without_actualtext=orphan_bad,
+        ambiguous_tounicode_mappings=ambiguous_tounicode,
         symbol_without_actualtext=sym_bad,
         status=status,
         notes=notes,
