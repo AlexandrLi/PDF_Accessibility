@@ -42,7 +42,9 @@ const Database = require('better-sqlite3');
 const { execFileSync } = require('child_process');
 const {
     MAX_ALT_TEXT_ATTEMPTS,
+    buildSafeFallbackFigureAlt,
     classifyFigureAlt,
+    isBedrockContentFilterResponse,
     isRetryableSuspiciousAlt,
     parseAltTextFromResponse,
 } = require('./figure_alt_quality');
@@ -144,8 +146,10 @@ const invokeModel = async (
     // Decode and return the response(s)
     const decodedResponseBody = new TextDecoder("utf-8").decode(apiResponse.body);
     const responseBody = JSON.parse(decodedResponseBody);
-    logger.info(`response of alt text: ${responseBody.output.message}`);
-    return responseBody.output.message;
+    const message = responseBody.output.message;
+    const responseText = message?.content?.[0]?.text ?? '';
+    logger.info(`response of alt text: ${responseText}`);
+    return message;
 };
 
 /**
@@ -244,11 +248,8 @@ Rewrite the alt text so it is complete. If the image shows numbered stages, step
         : { max_new_tokens: 1000, temperature: 0.7 };
 
     try {
-        const response = await invokeModel(prompt, imageBuffer, inferenceOverrides);
-        
-        return response.content[0].text;
+        return await invokeModel(prompt, imageBuffer, inferenceOverrides);
     } catch (error) {
-      
         throw error;
     }
 }
@@ -258,11 +259,49 @@ async function generateAltTextWithRetry(imageObject, imageBuffer) {
     let previousAlt = '';
 
     for (let attempt = 1; attempt <= MAX_ALT_TEXT_ATTEMPTS; attempt++) {
-        const responseText = await generateAltText(imageObject, imageBuffer, {
-            attempt,
-            previousAlt,
-        });
-        const parsed = parseAltTextFromResponse(responseText, figureId);
+        let responseText;
+        try {
+            const response = await generateAltText(imageObject, imageBuffer, {
+                attempt,
+                previousAlt,
+            });
+            responseText = response?.content?.[0]?.text ?? '';
+        } catch (error) {
+            logger.warn(
+                `Figure ${figureId}: Bedrock invoke failed on attempt ${attempt}: ${error.message || error}`
+            );
+            if (attempt < MAX_ALT_TEXT_ATTEMPTS) {
+                continue;
+            }
+            break;
+        }
+
+        if (isBedrockContentFilterResponse(responseText)) {
+            logger.warn(
+                `Figure ${figureId}: Bedrock content filter blocked attempt ${attempt}`
+            );
+            if (attempt < MAX_ALT_TEXT_ATTEMPTS) {
+                continue;
+            }
+            break;
+        }
+
+        let parsed;
+        try {
+            parsed = parseAltTextFromResponse(responseText, figureId);
+        } catch (error) {
+            logger.warn(
+                `Figure ${figureId}: could not parse alt text on attempt ${attempt}: ${error.message || error}`
+            );
+            logger.warn(
+                `Figure ${figureId}: raw response snippet: ${responseText.slice(0, 500)}`
+            );
+            if (attempt < MAX_ALT_TEXT_ATTEMPTS) {
+                continue;
+            }
+            break;
+        }
+
         const alt =
             parsed[figureId] ??
             parsed[imageObject.id] ??
@@ -294,7 +333,11 @@ async function generateAltTextWithRetry(imageObject, imageBuffer) {
         previousAlt = alt;
     }
 
-    return { [figureId]: previousAlt };
+    const fallbackAlt = buildSafeFallbackFigureAlt(imageObject);
+    logger.warn(
+        `Figure ${figureId}: using safe fallback alt after ${MAX_ALT_TEXT_ATTEMPTS} failed Bedrock attempts`
+    );
+    return { [figureId]: fallbackAlt };
 }
 
 
@@ -579,22 +622,25 @@ async function startProcess() {
                 logger.info(`Filename: ${filebasename} | Alt text generation succeeded for image ${imageObject.id} (${successCount} succeeded, ${failureCount} failed)`);
             } catch (error) {
                 failureCount++;
-                logger.error(`Filename: ${filebasename} | Alt text generation failed for image ${imageObject.id}: ${error.message || error}`);
+                const fallbackAlt = buildSafeFallbackFigureAlt(imageObject);
+                combinedResults[imageObject.id] = fallbackAlt;
+                logger.error(
+                    `Filename: ${filebasename} | Alt text generation failed for image ${imageObject.id}: ${error.message || error}; using fallback alt`
+                );
                 logger.info(`Filename: ${filebasename} | Progress: ${successCount} succeeded, ${failureCount} failed`);
             }
             await sleep(2000);
         }
 
-        // Check if we have any images and if all of them failed
-        if (imageObjects.length > 0 && successCount === 0) {
-            logger.error(`Filename: ${filebasename} | All ${failureCount} alt text generation requests failed - likely due to throttling or Bedrock API issues`);
-            logger.error(`File: ${filebasename}, Status: Failed in second ECS task - All Bedrock requests failed`);
-            process.exit(1);
+        if (failureCount > 0) {
+            logger.warn(
+                `Filename: ${filebasename} | ${failureCount} image(s) used fallback alt; migration post-sweeps may improve them`
+            );
         }
-        
+
         logger.info(`Filename: ${filebasename} | Alt text generation complete: ${successCount} succeeded, ${failureCount} failed out of ${imageObjects.length} images`);
 
-        let defaultText = "No text available"; 
+        let defaultText = "No text available";
 
         for (const imageObject of imageObjects) {
             if (!combinedResults.hasOwnProperty(imageObject.id)) {

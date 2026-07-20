@@ -1,6 +1,8 @@
 const assert = require('assert');
 const {
+    buildSafeFallbackFigureAlt,
     classifyFigureAlt,
+    isBedrockContentFilterResponse,
     isRetryableSuspiciousAlt,
     parseAltTextFromResponse,
 } = require('./figure_alt_quality');
@@ -21,5 +23,14 @@ assert.strictEqual(isRetryableSuspiciousAlt(complete), false);
 assert.deepStrictEqual(parseAltTextFromResponse('```json\n{"42": "hello"}\n```', '42'), {
     42: 'hello',
 });
+
+assert.strictEqual(
+    isBedrockContentFilterResponse('The generated text has been blocked by our content filters.'),
+    true
+);
+assert.strictEqual(
+    buildSafeFallbackFigureAlt({ id: 71 }),
+    'Figure 71'
+);
 
 console.log('figure_alt_quality.test.js: OK');

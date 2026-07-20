@@ -14,6 +14,18 @@ const RETRYABLE_REASONS = new Set([
 
 const MAX_ALT_TEXT_ATTEMPTS = 3;
 
+const BEDROCK_CONTENT_FILTER_PATTERN =
+    /blocked by our content filters/i;
+
+function isBedrockContentFilterResponse(responseText) {
+    return BEDROCK_CONTENT_FILTER_PATTERN.test((responseText || '').trim());
+}
+
+function buildSafeFallbackFigureAlt(imageObject) {
+    const figureId = String(imageObject?.id ?? 'unknown');
+    return `Figure ${figureId}`;
+}
+
 function classifyFigureAlt(altText) {
     const text = (altText || '').trim();
     if (!text) {
@@ -76,7 +88,10 @@ function parseAltTextFromResponse(responseText, expectedId) {
 
 module.exports = {
     MAX_ALT_TEXT_ATTEMPTS,
+    BEDROCK_CONTENT_FILTER_PATTERN,
+    buildSafeFallbackFigureAlt,
     classifyFigureAlt,
+    isBedrockContentFilterResponse,
     isSuspiciousFigureAlt,
     isRetryableSuspiciousAlt,
     parseAltTextFromResponse,
