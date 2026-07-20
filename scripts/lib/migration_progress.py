@@ -113,7 +113,11 @@ def mark_chapter_completed(progress: dict[str, Any], chapter_id: str, chapter_in
     completed = progress.setdefault("completedChapters", [])
     if chapter_id not in completed:
         completed.append(chapter_id)
-    progress["nextChapterIndex"] = chapter_index + 1
+    # Only advance the resume cursor when the frontier chapter completes so an
+    # earlier chapter with failures is not skipped on the next run.
+    current_next = int(progress.get("nextChapterIndex") or 0)
+    if chapter_index == current_next:
+        progress["nextChapterIndex"] = chapter_index + 1
 
 
 def migration_status_summary(

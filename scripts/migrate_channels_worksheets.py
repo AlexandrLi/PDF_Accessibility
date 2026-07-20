@@ -474,6 +474,8 @@ def run_auto_chapters(
         flush=True,
     )
 
+    chapter_walk_finished = False
+
     for index in range(start_index, len(chapters)):
         if time.monotonic() >= deadline:
             print(f"Time budget reached before chapter index {index}.")
@@ -558,18 +560,26 @@ def run_auto_chapters(
             break
 
         if chapter_failures:
-            print(f"Chapter {chapter.chapter_id} had failures — not marking chapter complete")
-            progress["nextChapterIndex"] = index
+            current_next = int(progress.get("nextChapterIndex") or 0)
+            progress["nextChapterIndex"] = min(current_next, index)
             save_progress(s3, channels, args.course_id, progress, run_id)
-            break
+            print(
+                f"Chapter {chapter.chapter_id} had {len(chapter_failures)} failure(s) "
+                f"— not marking chapter complete, continuing to next chapter",
+                flush=True,
+            )
+            continue
 
         mark_chapter_completed(progress, chapter.chapter_id, index)
         chapters_processed += 1
         save_progress(s3, channels, args.course_id, progress, run_id)
         print(f"Chapter [{index}] complete — progress saved")
+    else:
+        chapter_walk_finished = True
+        if not stopped_early:
+            print("Chapter walk finished for this run.", flush=True)
 
-    chapter_walk_complete = int(progress.get("nextChapterIndex") or 0) >= len(chapters)
-    if not stopped_early and chapter_walk_complete:
+    if not stopped_early and chapter_walk_finished:
         course_topics = resolve_migration_scope(s3, channels, args.course_id)
         toc_topic_ids = {topic.topic_id for chapter in chapters for topic in chapter.topics}
         orphan_topics = [
@@ -675,7 +685,13 @@ def run_auto_chapters(
         print("Run stopped early — re-run the same build to continue from saved progress.")
         return 0
     if topic_failures:
-        return 1
+        print(
+            f"Migration finished with {len(topic_failures)} topic failure(s): "
+            f"{', '.join(topic_failures)}",
+            flush=True,
+        )
+        print("Re-run the same build to retry failed topics.", flush=True)
+        return 0
     print("Auto-chapters migration complete for course scope.")
     return 0
 
@@ -769,7 +785,13 @@ def main() -> int:
     print(f"Report: {report_path}")
 
     if topic_failures:
-        return 1
+        print(
+            f"Migration finished with {len(topic_failures)} topic failure(s): "
+            f"{', '.join(topic_failures)}",
+            flush=True,
+        )
+        print("Re-run to retry failed topics.", flush=True)
+        return 0
     return 0
 
 
