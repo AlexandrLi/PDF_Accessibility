@@ -109,6 +109,15 @@ def clear_topic_failed(progress: dict[str, Any], topic_id: str) -> None:
         progress["failedTopics"] = [item for item in failed if item != topic_id]
 
 
+def pending_failed_topic_ids(progress: dict[str, Any]) -> list[str]:
+    done = completed_topic_ids(progress)
+    return [
+        topic_id
+        for topic_id in (progress.get("failedTopics") or [])
+        if topic_id not in done
+    ]
+
+
 def mark_chapter_completed(progress: dict[str, Any], chapter_id: str, chapter_index: int) -> None:
     completed = progress.setdefault("completedChapters", [])
     if chapter_id not in completed:

@@ -47,6 +47,7 @@ from lib.migration_progress import (  # noqa: E402
     mark_chapter_completed,
     mark_topic_completed,
     mark_topic_failed,
+    pending_failed_topic_ids,
     save_progress,
 )
 from lib.pdf_a11y_audit import audit_pdf_bytes, is_likely_remediated  # noqa: E402
@@ -413,6 +414,32 @@ def print_auto_chapter_plan(
         if len(orphans) > 10:
             print(f"  ... and {len(orphans) - 10} more")
     print(f"Course-wide pending topics (incl. orphans): {orphan_total}")
+    failed_retry = pending_failed_topic_ids(progress)
+    if failed_retry:
+        print(f"Failed-topic retry pass: {len(failed_retry)} topic(s) pending")
+
+
+def build_topic_chapter_lookup(
+    chapters: list[ChapterScope],
+) -> tuple[dict[str, TopicScope], dict[str, tuple[int, ChapterScope]]]:
+    topics_by_id: dict[str, TopicScope] = {}
+    chapter_by_topic: dict[str, tuple[int, ChapterScope]] = {}
+    for index, chapter in enumerate(chapters):
+        for topic in chapter.topics:
+            topics_by_id[topic.topic_id] = topic
+            chapter_by_topic[topic.topic_id] = (index, chapter)
+    return topics_by_id, chapter_by_topic
+
+
+def reconcile_chapter_if_complete(
+    progress: dict,
+    chapter_index: int,
+    chapter: ChapterScope,
+) -> None:
+    done = completed_topic_ids(progress)
+    if all(topic.topic_id in done for topic in chapter.topics):
+        if chapter.chapter_id not in (progress.get("completedChapters") or []):
+            mark_chapter_completed(progress, chapter.chapter_id, chapter_index)
 
 
 def save_topic_progress(
@@ -639,6 +666,94 @@ def run_auto_chapters(
                     topic_id=topic.topic_id,
                     status=result.status,
                 )
+
+        if not stopped_early:
+            failed_retry_ids = pending_failed_topic_ids(progress)
+            if failed_retry_ids:
+                topics_by_id, chapter_by_topic = build_topic_chapter_lookup(chapters)
+                course_topics_map = {
+                    topic.topic_id: topic
+                    for topic in resolve_migration_scope(s3, channels, args.course_id)
+                }
+                print(
+                    f"Failed-topic retry pass: {len(failed_retry_ids)} topic(s)",
+                    flush=True,
+                )
+                for topic_id in failed_retry_ids:
+                    if time.monotonic() >= deadline:
+                        print("Time budget reached during failed-topic retry.", flush=True)
+                        stopped_early = True
+                        save_progress(s3, channels, args.course_id, progress, run_id)
+                        break
+
+                    topic = topics_by_id.get(topic_id) or course_topics_map.get(topic_id)
+                    if not topic:
+                        print(
+                            f"  WARN: failed topic {topic_id} not in scope, skipping",
+                            flush=True,
+                        )
+                        continue
+
+                    chapter_info = chapter_by_topic.get(topic_id)
+                    chapter_index = chapter_info[0] if chapter_info else None
+                    chapter = chapter_info[1] if chapter_info else None
+                    chapter_id = chapter.chapter_id if chapter else None
+
+                    print(
+                        f"  Adobe pass (retry): {topic.topic_id} ({topic.title})",
+                        flush=True,
+                    )
+                    result = remediate_single_topic(
+                        s3, stepfunctions, a11y, sm_arn, args.course_id, topic, args
+                    )
+                    topic_results[topic.topic_id] = {
+                        "status": result.status,
+                        "audit": result.audit,
+                        "error": result.error,
+                        "chapterId": chapter_id,
+                        "retry": True,
+                    }
+
+                    if result.status == "failed":
+                        topic_failures.append(topic.topic_id)
+                        mark_topic_failed(progress, topic.topic_id)
+                        save_topic_progress(
+                            s3,
+                            channels,
+                            args.course_id,
+                            progress,
+                            run_id,
+                            done_count=len(done),
+                            total_topics=total_topics,
+                            topic_id=topic.topic_id,
+                            status="failed",
+                            chapter_index=chapter_index,
+                        )
+                        continue
+
+                    clear_topic_failed(progress, topic.topic_id)
+                    skipped_reason = (
+                        "skip-if-audited" if result.status == "skipped-audited" else None
+                    )
+                    mark_topic_completed(progress, topic.topic_id, skipped_reason=skipped_reason)
+                    done.add(topic.topic_id)
+                    if result.preview_key and result.status == "remediated":
+                        paths_overwritten.append(result.preview_key)
+                    save_topic_progress(
+                        s3,
+                        channels,
+                        args.course_id,
+                        progress,
+                        run_id,
+                        done_count=len(done),
+                        total_topics=total_topics,
+                        topic_id=topic.topic_id,
+                        status=result.status,
+                        chapter_index=chapter_index,
+                    )
+                    if chapter is not None and chapter_index is not None:
+                        reconcile_chapter_if_complete(progress, chapter_index, chapter)
+                        save_progress(s3, channels, args.course_id, progress, run_id)
 
     invalidation_id = None
     if not args.skip_cdn_invalidation and paths_overwritten:

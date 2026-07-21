@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from lib.migration_progress import mark_chapter_completed
+from lib.migration_progress import mark_chapter_completed, pending_failed_topic_ids
 
 
 class MarkChapterCompletedTests(unittest.TestCase):
@@ -23,6 +23,24 @@ class MarkChapterCompletedTests(unittest.TestCase):
 
         self.assertEqual(progress["nextChapterIndex"], 3)
         self.assertEqual(progress["completedChapters"], ["ch-05"])
+
+
+class PendingFailedTopicIdsTests(unittest.TestCase):
+    def test_returns_failed_topics_not_yet_completed(self) -> None:
+        progress = {
+            "completedTopics": ["done-1"],
+            "failedTopics": ["done-1", "still-failed", "pending-retry"],
+        }
+
+        self.assertEqual(
+            pending_failed_topic_ids(progress),
+            ["still-failed", "pending-retry"],
+        )
+
+    def test_returns_empty_when_no_failures(self) -> None:
+        progress = {"completedTopics": ["done-1"], "failedTopics": []}
+
+        self.assertEqual(pending_failed_topic_ids(progress), [])
 
 
 if __name__ == "__main__":
