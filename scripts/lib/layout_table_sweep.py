@@ -94,25 +94,38 @@ def _unwrap_grid_table(table: pikepdf.Dictionary, cells: list[pikepdf.Dictionary
     _remove_key(table, "/Alt")
 
 
+def _row_direct_cells(row: pikepdf.Dictionary) -> list[pikepdf.Dictionary]:
+    kids = row.get("/K")
+    if not isinstance(kids, pikepdf.Array):
+        return []
+    return [kid for kid in kids if isinstance(kid, pikepdf.Dictionary)]
+
+
 def _row_cell_counts(table: pikepdf.Dictionary) -> list[int]:
     rows = [
         node
         for node in _iter_dict_nodes(table)
         if node.get("/S") == "/TR" and node is not table
     ]
-    counts: list[int] = []
-    for row in rows:
-        kids = row.get("/K")
-        if not isinstance(kids, pikepdf.Array):
-            counts.append(0)
-            continue
-        counts.append(
-            sum(1 for kid in kids if isinstance(kid, pikepdf.Dictionary))
-        )
-    return counts
+    return [len(_row_direct_cells(row)) for row in rows]
+
+
+def _is_two_row_header_table(rows: list[pikepdf.Dictionary]) -> bool:
+    if len(rows) != 2:
+        return False
+    header_count = len(_row_direct_cells(rows[0]))
+    data_count = len(_row_direct_cells(rows[1]))
+    return header_count > 0 and data_count > header_count and data_count % header_count == 0
 
 
 def _is_irregular_table(table: pikepdf.Dictionary) -> bool:
+    rows = [
+        node
+        for node in _iter_dict_nodes(table)
+        if node.get("/S") == "/TR" and node is not table
+    ]
+    if _is_two_row_header_table(rows):
+        return False
     counts = _row_cell_counts(table)
     if not counts:
         return True
@@ -178,22 +191,100 @@ def _revert_table_to_figure(table: pikepdf.Dictionary, *, index: int) -> None:
         table["/C"] = pikepdf.Array(["/table-figure-reverted", existing_class])
 
 
-def _annotate_data_table(table: pikepdf.Dictionary, rows: list[pikepdf.Dictionary], index: int) -> None:
+def _ensure_summary(table: pikepdf.Dictionary, index: int) -> None:
     summary = table.get("/Summary")
     if summary is None or len(str(summary).strip()) <= 40:
         table["/Summary"] = pikepdf.String(f"Table {index}")
-    first_row = rows[0]
-    has_th = any(
-        cell.get("/S") == "/TH"
-        for cell in _iter_dict_nodes(first_row)
-        if cell is not first_row
+
+
+def _promote_to_th(cell: pikepdf.Dictionary, *, cell_id: str) -> None:
+    if cell.get("/S") in ("/TD", "/Span"):
+        cell["/S"] = pikepdf.Name("/TH")
+    cell["/Scope"] = pikepdf.Name("/Column")
+    cell["/ID"] = pikepdf.String(cell_id)
+
+
+def _ensure_td(cell: pikepdf.Dictionary) -> None:
+    if cell.get("/S") == "/Span":
+        cell["/S"] = pikepdf.Name("/TD")
+
+
+def _make_empty_th(page: pikepdf.Object | None, cell_id: str) -> pikepdf.Dictionary:
+    cell = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/TH"),
+            "/Scope": pikepdf.Name("/Column"),
+            "/ID": pikepdf.String(cell_id),
+            "/K": pikepdf.Array([]),
+        }
     )
-    if has_th:
+    if page is not None:
+        cell["/Pg"] = page
+    return cell
+
+
+def _annotate_two_row_header_table(
+    table: pikepdf.Dictionary,
+    rows: list[pikepdf.Dictionary],
+    index: int,
+) -> None:
+    _ensure_summary(table, index)
+    header_row = rows[0]
+    header_cells = _row_direct_cells(header_row)
+    data_cells = _row_direct_cells(rows[1])
+    if not header_cells or not data_cells:
         return
-    for cell in _iter_dict_nodes(first_row):
-        if cell.get("/S") == "/TD":
-            cell["/S"] = pikepdf.Name("/TH")
-            cell["/Scope"] = pikepdf.Name("/Column")
+
+    colspan = len(data_cells) // len(header_cells)
+    expanded_header_cells: list[pikepdf.Dictionary] = []
+    th_ids: list[str] = []
+
+    for group_index, header_cell in enumerate(header_cells):
+        page = header_cell.get("/Pg")
+        for span_index in range(colspan):
+            column_index = group_index * colspan + span_index
+            cell_id = f"tbl{index}-h{column_index}"
+            if span_index == 0:
+                cell = header_cell
+                _promote_to_th(cell, cell_id=cell_id)
+                _remove_key(cell, "/Attributes")
+            else:
+                cell = _make_empty_th(page, cell_id)
+            expanded_header_cells.append(cell)
+            th_ids.append(cell_id)
+
+    header_row["/K"] = pikepdf.Array(expanded_header_cells)
+
+    for data_index, cell in enumerate(data_cells):
+        _ensure_td(cell)
+        if data_index < len(th_ids):
+            cell["/Headers"] = pikepdf.Array([pikepdf.String(th_ids[data_index])])
+
+
+def _annotate_data_table(table: pikepdf.Dictionary, rows: list[pikepdf.Dictionary], index: int) -> None:
+    _ensure_summary(table, index)
+    if not rows:
+        return
+    if any(
+        cell.get("/S") == "/TH"
+        for row in rows
+        for cell in _row_direct_cells(row)
+    ):
+        return
+
+    header_cells = _row_direct_cells(rows[0])
+    th_ids: list[str] = []
+    for cell_index, cell in enumerate(header_cells):
+        cell_id = f"tbl{index}-h{cell_index}"
+        _promote_to_th(cell, cell_id=cell_id)
+        th_ids.append(cell_id)
+
+    for row in rows[1:]:
+        for col_index, cell in enumerate(_row_direct_cells(row)):
+            _ensure_td(cell)
+            if col_index < len(th_ids):
+                cell["/Headers"] = pikepdf.Array([pikepdf.String(th_ids[col_index])])
 
 
 def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResult]:
@@ -212,11 +303,6 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
         tables = [node for node in _iter_dict_nodes(struct_root) if node.get("/S") == "/Table"]
         for index, table in enumerate(tables, start=1):
             rows, cells = _table_rows_and_cells(table)
-            if _is_irregular_table(table):
-                _revert_table_to_figure(table, index=index)
-                reverted_irregular += 1
-                actions.append(f"table{index}: reverted irregular /Table to /Figure")
-                continue
             if _is_layout_table(rows, cells, table):
                 if len(rows) == 1 and len(cells) == 1:
                     _unwrap_single_cell_table(table, cells[0])
@@ -228,6 +314,14 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                     actions.append(
                         f"table{index}: unwrapped {len(rows)}x{len(cells)} layout grid to /Sect"
                     )
+            elif _is_two_row_header_table(rows):
+                _annotate_two_row_header_table(table, rows, index)
+                annotated_data_tables += 1
+                actions.append(f"table{index}: annotated two-row header table")
+            elif _is_irregular_table(table):
+                _revert_table_to_figure(table, index=index)
+                reverted_irregular += 1
+                actions.append(f"table{index}: reverted irregular /Table to /Figure")
             else:
                 _annotate_data_table(table, rows, index)
                 annotated_data_tables += 1
