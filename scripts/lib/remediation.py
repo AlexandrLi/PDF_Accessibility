@@ -1,10 +1,9 @@
-import io
 import json
 import time
 from typing import Any
 
+import pymupdf
 from botocore.exceptions import ClientError
-from pypdf import PdfReader, PdfWriter
 
 
 def split_pdf_into_chunks(
@@ -14,30 +13,43 @@ def split_pdf_into_chunks(
     bucket_name: str,
     pages_per_chunk: int = 200,
 ) -> list[dict[str, str]]:
-    reader = PdfReader(io.BytesIO(pdf_bytes))
     file_basename = source_key.split("/")[-1].rsplit(".", 1)[0]
     chunks: list[dict[str, str]] = []
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        num_pages = doc.page_count
+        for start in range(0, num_pages, pages_per_chunk):
+            end = min(start + pages_per_chunk, num_pages)
+            chunk_index = start // pages_per_chunk + 1
+            page_filename = f"{file_basename}_chunk_{chunk_index}.pdf"
+            s3_key = f"temp/{file_basename}/{page_filename}"
 
-    for start in range(0, len(reader.pages), pages_per_chunk):
-        writer = PdfWriter()
-        for i in range(start, min(start + pages_per_chunk, len(reader.pages))):
-            writer.add_page(reader.pages[i])
+            if start == 0 and end == num_pages:
+                # Avoid re-serializing small PDFs; pypdf can fail on malformed numbers.
+                chunk_bytes = pdf_bytes
+            else:
+                chunk_doc = pymupdf.open()
+                try:
+                    chunk_doc.insert_pdf(doc, from_page=start, to_page=end - 1)
+                    chunk_bytes = chunk_doc.tobytes()
+                finally:
+                    chunk_doc.close()
 
-        output = io.BytesIO()
-        writer.write(output)
-        output.seek(0)
-
-        chunk_index = start // pages_per_chunk + 1
-        page_filename = f"{file_basename}_chunk_{chunk_index}.pdf"
-        s3_key = f"temp/{file_basename}/{page_filename}"
-        s3_client.upload_fileobj(output, bucket_name, s3_key)
-        chunks.append(
-            {
-                "s3_bucket": bucket_name,
-                "s3_key": s3_key,
-                "chunk_key": s3_key,
-            }
-        )
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key,
+                Body=chunk_bytes,
+                ContentType="application/pdf",
+            )
+            chunks.append(
+                {
+                    "s3_bucket": bucket_name,
+                    "s3_key": s3_key,
+                    "chunk_key": s3_key,
+                }
+            )
+    finally:
+        doc.close()
 
     return chunks
 
