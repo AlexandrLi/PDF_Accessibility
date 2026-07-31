@@ -48,6 +48,7 @@ from lib.migration_progress import (  # noqa: E402
     mark_topic_completed,
     mark_topic_failed,
     pending_failed_topic_ids,
+    resolve_allowed_chapter_indices,
     save_progress,
 )
 from lib.pdf_a11y_audit import audit_pdf_bytes, is_likely_remediated  # noqa: E402
@@ -81,6 +82,11 @@ def parse_args() -> argparse.Namespace:
         "--auto-chapters",
         action="store_true",
         help="Walk chapters from course default TOC (or --toc-id), with S3 progress",
+    )
+    parser.add_argument(
+        "--chapter-ids",
+        default=None,
+        help="Auto-chapters: comma-separated chapter IDs to process (TOC order)",
     )
     parser.add_argument(
         "--topic-ids",
@@ -379,6 +385,7 @@ def print_auto_chapter_plan(
     reference_toc_id: str,
     progress: dict,
     args: argparse.Namespace,
+    allowed_indices: set[int] | None = None,
 ) -> None:
     done = completed_topic_ids(progress)
     print(f"Auto-chapters plan (reference TOC: {reference_toc_id})")
@@ -398,6 +405,8 @@ def print_auto_chapter_plan(
         marker = " (next)" if index == int(progress.get("nextChapterIndex") or 0) else ""
         if chapter.chapter_id in (progress.get("completedChapters") or []):
             marker = " (done)"
+        if allowed_indices is not None and index not in allowed_indices:
+            marker = " (out of scope)"
         print(
             f"  [{index}] {chapter.chapter_id}: {chapter.title} — "
             f"{len(pending)} pending, {skipped} would skip-audit{marker}"
@@ -480,9 +489,28 @@ def run_auto_chapters(
     progress = load_progress(s3, channels, args.course_id, reference_toc_id, args.env)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     done = completed_topic_ids(progress)
+    chapter_id_to_index = {chapter.chapter_id: index for index, chapter in enumerate(chapters)}
+    allowed_indices: set[int] | None = None
+    if args.chapter_ids:
+        try:
+            allowed_indices = resolve_allowed_chapter_indices(
+                chapter_id_to_index,
+                args.chapter_ids,
+            )
+        except ValueError as error:
+            print(error)
+            return 1
 
     if args.dry_run:
-        print_auto_chapter_plan(s3, channels, chapters, reference_toc_id, progress, args)
+        print_auto_chapter_plan(
+            s3,
+            channels,
+            chapters,
+            reference_toc_id,
+            progress,
+            args,
+            allowed_indices,
+        )
         print("Dry run complete — no writes performed.")
         return 0
 
@@ -500,10 +528,19 @@ def run_auto_chapters(
         f"starting at index {start_index}, time budget {args.time_budget_seconds}s",
         flush=True,
     )
+    if allowed_indices is not None:
+        in_scope = sorted(allowed_indices)
+        print(
+            f"Chapter filter: {len(in_scope)} chapter(s) — "
+            f"indices {in_scope[0]}-{in_scope[-1]}",
+            flush=True,
+        )
 
     chapter_walk_finished = False
 
     for index in range(start_index, len(chapters)):
+        if allowed_indices is not None and index not in allowed_indices:
+            continue
         if time.monotonic() >= deadline:
             print(f"Time budget reached before chapter index {index}.")
             progress["nextChapterIndex"] = index
@@ -606,7 +643,7 @@ def run_auto_chapters(
         if not stopped_early:
             print("Chapter walk finished for this run.", flush=True)
 
-    if not stopped_early and chapter_walk_finished:
+    if not stopped_early and chapter_walk_finished and allowed_indices is None:
         course_topics = resolve_migration_scope(s3, channels, args.course_id)
         toc_topic_ids = {topic.topic_id for chapter in chapters for topic in chapter.topics}
         orphan_topics = [
@@ -770,6 +807,7 @@ def run_auto_chapters(
         "env": args.env,
         "dryRun": False,
         "autoChapters": True,
+        "chapterIds": args.chapter_ids,
         "chaptersProcessedThisRun": chapters_processed,
         "stoppedEarly": stopped_early,
         "timeBudgetSeconds": args.time_budget_seconds,
@@ -815,6 +853,9 @@ def main() -> int:
     args = parse_args()
     if args.auto_chapters and args.chapter_id:
         print("Use either --auto-chapters or --chapter-id, not both.")
+        return 1
+    if args.chapter_ids and not args.auto_chapters:
+        print("--chapter-ids requires --auto-chapters.")
         return 1
 
     s3 = boto3.client("s3")

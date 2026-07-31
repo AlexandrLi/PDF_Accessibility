@@ -129,6 +129,22 @@ def mark_chapter_completed(progress: dict[str, Any], chapter_id: str, chapter_in
         progress["nextChapterIndex"] = chapter_index + 1
 
 
+def resolve_allowed_chapter_indices(
+    chapter_id_to_index: dict[str, int],
+    chapter_ids: str,
+) -> set[int]:
+    """Return TOC indices for the given chapter IDs (auto-chapters partial scope)."""
+    ids = {item.strip() for item in chapter_ids.split(",") if item.strip()}
+    if not ids:
+        raise ValueError("chapter-ids must list at least one chapter ID")
+    unknown = ids - set(chapter_id_to_index)
+    if unknown:
+        raise ValueError(
+            f"Chapter IDs not in reference TOC: {', '.join(sorted(unknown))}"
+        )
+    return {chapter_id_to_index[item] for item in ids}
+
+
 def migration_status_summary(
     progress: dict[str, Any],
     chapters: list,

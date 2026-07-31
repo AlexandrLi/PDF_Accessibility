@@ -3,7 +3,8 @@
 #
 # Required env vars: COURSE_ID, ENV
 # Optional: AUTO_CHAPTERS, SKIP_IF_AUDITED, DRY_RUN, SKIP_CDN_INVALIDATION,
-#           TOC_ID, CHAPTER_ID (manual chapter scope), MIGRATION_TIME_BUDGET_SECONDS
+#           TOC_ID, CHAPTER_ID (manual chapter scope), CHAPTER_IDS (auto-chapters),
+#           MIGRATION_TIME_BUDGET_SECONDS
 
 version: 0.2
 
@@ -34,6 +35,8 @@ phases:
         ARGS="--course-id $COURSE_ID --env $ENV"
         if [ "${AUTO_CHAPTERS:-false}" = "true" ]; then
           ARGS="$ARGS --auto-chapters"
+          if [ -n "$TOC_ID" ]; then ARGS="$ARGS --toc-id $TOC_ID"; fi
+          if [ -n "$CHAPTER_IDS" ]; then ARGS="$ARGS --chapter-ids $CHAPTER_IDS"; fi
         elif [ -n "$TOC_ID" ] && [ -n "$CHAPTER_ID" ]; then
           ARGS="$ARGS --toc-id $TOC_ID --chapter-id $CHAPTER_ID"
         elif [ -n "$CHAPTER_ID" ] && [ -z "$TOC_ID" ]; then

@@ -8,12 +8,15 @@ ENV="dev"
 DRY_RUN="false"
 SKIP_CDN="false"
 SOURCE_VERSION="${SOURCE_VERSION:-}"
+CHAPTER_IDS=""
 
 usage() {
   cat <<EOF
-Usage: $0 --course-id <id> [--env dev|prod] [--dry-run] [--skip-cdn-invalidation] [--source-version branch]
+Usage: $0 --course-id <id> [--env dev|prod] [--dry-run] [--skip-cdn-invalidation]
+       [--source-version branch] [--chapter-ids id1,id2]
 
 Starts CodeBuild project $PROJECT_NAME with AUTO_CHAPTERS enabled.
+Use --chapter-ids for partial TOC migration (S3 progress still updated).
 Re-run the same command to resume from S3 progress (courses/<id>/.a11y-migration-progress.json).
 EOF
 }
@@ -25,6 +28,7 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN="true"; shift ;;
     --skip-cdn-invalidation) SKIP_CDN="true"; shift ;;
     --source-version) SOURCE_VERSION="$2"; shift 2 ;;
+    --chapter-ids) CHAPTER_IDS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
@@ -42,13 +46,15 @@ ENV_OVERRIDES="$(jq -n \
   --arg env "$ENV" \
   --arg dry_run "$DRY_RUN" \
   --arg skip_cdn "$SKIP_CDN" \
+  --arg chapter_ids "$CHAPTER_IDS" \
   '[
     {"name":"COURSE_ID","value":$course_id,"type":"PLAINTEXT"},
     {"name":"ENV","value":$env,"type":"PLAINTEXT"},
     {"name":"AUTO_CHAPTERS","value":"true","type":"PLAINTEXT"},
     {"name":"SKIP_IF_AUDITED","value":"true","type":"PLAINTEXT"},
     {"name":"DRY_RUN","value":$dry_run,"type":"PLAINTEXT"},
-    {"name":"SKIP_CDN_INVALIDATION","value":$skip_cdn,"type":"PLAINTEXT"}
+    {"name":"SKIP_CDN_INVALIDATION","value":$skip_cdn,"type":"PLAINTEXT"},
+    {"name":"CHAPTER_IDS","value":$chapter_ids,"type":"PLAINTEXT"}
   ]')"
 
 ARGS=(aws codebuild start-build --project-name "$PROJECT_NAME")
@@ -58,6 +64,9 @@ if [ -n "$SOURCE_VERSION" ]; then
 fi
 
 echo "Starting CodeBuild for course=$COURSE_ID env=$ENV dry_run=$DRY_RUN"
+if [ -n "$CHAPTER_IDS" ]; then
+  echo "Chapter IDs: $CHAPTER_IDS"
+fi
 BUILD_JSON="$("${ARGS[@]}")"
 BUILD_ID="$(echo "$BUILD_JSON" | jq -r '.build.id')"
 echo "Build ID: $BUILD_ID"

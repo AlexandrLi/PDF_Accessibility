@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import unittest
 
-from lib.migration_progress import mark_chapter_completed, pending_failed_topic_ids
+from lib.migration_progress import (
+    mark_chapter_completed,
+    pending_failed_topic_ids,
+    resolve_allowed_chapter_indices,
+)
 
 
 class MarkChapterCompletedTests(unittest.TestCase):
@@ -41,6 +45,19 @@ class PendingFailedTopicIdsTests(unittest.TestCase):
         progress = {"completedTopics": ["done-1"], "failedTopics": []}
 
         self.assertEqual(pending_failed_topic_ids(progress), [])
+
+
+class ChapterFilterTests(unittest.TestCase):
+    def test_resolve_allowed_chapter_indices(self) -> None:
+        allowed = resolve_allowed_chapter_indices(
+            {"a": 1, "b": 4},
+            "b,a",
+        )
+        self.assertEqual(allowed, {1, 4})
+
+    def test_rejects_unknown_chapter_ids(self) -> None:
+        with self.assertRaises(ValueError):
+            resolve_allowed_chapter_indices({"a": 1}, "a,missing")
 
 
 if __name__ == "__main__":
