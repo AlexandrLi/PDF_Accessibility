@@ -704,19 +704,27 @@ def run_auto_chapters(
                     status=result.status,
                 )
 
-        if not stopped_early:
-            failed_retry_ids = pending_failed_topic_ids(progress)
+    if not stopped_early and chapter_walk_finished:
+        failed_retry_ids = pending_failed_topic_ids(progress)
+        if failed_retry_ids:
+            topics_by_id, chapter_by_topic = build_topic_chapter_lookup(chapters)
+            if allowed_indices is not None:
+                failed_retry_ids = [
+                    topic_id
+                    for topic_id in failed_retry_ids
+                    if topic_id in chapter_by_topic
+                    and chapter_by_topic[topic_id][0] in allowed_indices
+                ]
+            course_topics_map = {
+                topic.topic_id: topic
+                for topic in resolve_migration_scope(s3, channels, args.course_id)
+            }
             if failed_retry_ids:
-                topics_by_id, chapter_by_topic = build_topic_chapter_lookup(chapters)
-                course_topics_map = {
-                    topic.topic_id: topic
-                    for topic in resolve_migration_scope(s3, channels, args.course_id)
-                }
                 print(
                     f"Failed-topic retry pass: {len(failed_retry_ids)} topic(s)",
                     flush=True,
                 )
-                for topic_id in failed_retry_ids:
+            for topic_id in failed_retry_ids:
                     if time.monotonic() >= deadline:
                         print("Time budget reached during failed-topic retry.", flush=True)
                         stopped_early = True
