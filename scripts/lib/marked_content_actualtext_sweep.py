@@ -1418,12 +1418,19 @@ def _inject_actualtext_batch_on_page(
     return updated
 
 
+def _struct_page_ref(page: pikepdf.Page | pikepdf.Dictionary) -> pikepdf.Dictionary:
+    """Return a page dictionary suitable for struct-tree /Pg entries."""
+    if isinstance(page, pikepdf.Page):
+        return page.obj
+    return page
+
+
 def _set_struct_page_if_missing(
     obj: pikepdf.Dictionary,
-    page: pikepdf.Page,
+    page: pikepdf.Page | pikepdf.Dictionary,
 ) -> None:
     if obj.get("/Pg") is None:
-        obj["/Pg"] = page.obj
+        obj["/Pg"] = _struct_page_ref(page)
 
 
 def repair_marked_content_actualtext(

@@ -21,6 +21,7 @@ from lib.marked_content_actualtext_sweep import (
     _mcid_bdc_has_actualtext,
     _read_page_contents,
     _resolve_struct_page,
+    _set_struct_page_if_missing,
     count_li_lbl_missing_actualtext,
     count_orphan_marked_missing_actualtext,
     repair_marked_content_actualtext,
@@ -853,6 +854,20 @@ class OrphanMarkedContentTests(unittest.TestCase):
             block = _get_mcid_block(data, 12)
             self.assertIsNotNone(block)
             self.assertEqual(block[0], "Artifact")
+
+
+class StructPageRefTests(unittest.TestCase):
+    def test_set_struct_page_if_missing_accepts_page_dictionary(self) -> None:
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            struct = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Figure"),
+                }
+            )
+            _set_struct_page_if_missing(struct, page.obj)
+            self.assertEqual(struct["/Pg"], page.obj)
 
 
 class NucleicAcidsRegressionTests(unittest.TestCase):
