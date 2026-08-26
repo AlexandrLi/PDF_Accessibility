@@ -10,6 +10,8 @@ from lib.character_encoding_sweep import (
     _load_tounicode_map,
     _needs_character_encoding_repair,
     _parse_bfchar_pairs,
+    _parse_bfrange_pairs,
+    _parse_tounicode_entries,
     _spoken_encoding_text,
     count_ambiguous_tounicode_fonts,
     repair_character_encoding,
@@ -47,6 +49,81 @@ endbfchar
 """
         pairs = _parse_bfchar_pairs(cmap)
         self.assertEqual(pairs, [("41", "0041"), ("42", "0041")])
+
+    def test_parse_bfrange_scalar_and_array_destinations(self) -> None:
+        scalar = """1 beginbfrange
+<0001> <0003> <0041>
+endbfrange"""
+        array = """1 beginbfrange
+<0004> <0006> [<0044> <0045> <0046>]
+endbfrange"""
+        self.assertEqual(
+            _parse_bfrange_pairs(scalar),
+            [("0001", "0041"), ("0002", "0042"), ("0003", "0043")],
+        )
+        self.assertEqual(
+            _parse_bfrange_pairs(array),
+            [("0004", "0044"), ("0005", "0045"), ("0006", "0046")],
+        )
+
+    def test_invalid_tounicode_map_is_diagnostic_and_not_invented(self) -> None:
+        pairs, diagnostics = _parse_tounicode_entries(
+            """1 beginbfchar
+<0001> <D800>
+endbfchar"""
+        )
+        self.assertEqual(pairs, [])
+        self.assertTrue(diagnostics)
+        self.assertEqual(_decode_mcid_text(b"BT /F1 12 Tf <0002>Tj ET", {"/F1": {}}), "�")
+
+    def test_type0_map_loads_without_guessing_unknown_cids(self) -> None:
+        cmap = """1 beginbfrange
+<0001> <0002> <0041>
+endbfrange"""
+        with pikepdf.new() as pdf:
+            descendant = pikepdf.Dictionary(
+                Type=pikepdf.Name("/Font"),
+                Subtype=pikepdf.Name("/CIDFontType2"),
+            )
+            font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type0"),
+                    Encoding=pikepdf.Name("/Identity-H"),
+                    DescendantFonts=pikepdf.Array([descendant]),
+                    ToUnicode=pdf.make_stream(cmap.encode("latin1")),
+                )
+            )
+            self.assertEqual(_load_tounicode_map(font), {1: "A", 2: "B"})
+            self.assertEqual(
+                _decode_mcid_text(
+                    b"BT /F1 12 Tf <00010003>Tj ET",
+                    {"/F1": _load_tounicode_map(font)},
+                ),
+                "A�",
+            )
+
+    def test_missing_tounicode_is_reported_without_changing_pdf(self) -> None:
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Helvetica"),
+                )
+            )
+            page["/Resources"] = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(F1=font)
+            )
+            original = io.BytesIO()
+            pdf.save(original)
+
+        repaired, result = repair_character_encoding(original.getvalue())
+        self.assertEqual(repaired, original.getvalue())
+        self.assertEqual(result.fonts_inspected, 1)
+        self.assertEqual(len(result.missing_tounicode_fonts), 1)
+        self.assertFalse(result.invalid_tounicode_fonts)
 
     def test_dedupe_preserves_codespacerange(self) -> None:
         cmap = """begincmap

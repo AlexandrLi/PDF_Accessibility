@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import io
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import pikepdf
 
 from lib.figure_alt_quality import SuspiciousFigureAlt, classify_figure_alt, struct_class_names
+from lib.tagged_content_sweep import collect_tagged_content_diagnostics
 
 
 @dataclass
@@ -19,6 +20,13 @@ class PdfA11yAudit:
     table_count: int
     tables_without_summary: int
     tables_without_th: int
+    struct_tree_root_present: bool = False
+    parent_tree_present: bool = False
+    pages_with_struct_parents: int = 0
+    pages_with_mapped_mcids: int = 0
+    mapped_mcid_count: int = 0
+    unresolved_mcids: list[str] = field(default_factory=list)
+    parent_tree_keys: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -52,6 +60,7 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         mark_info = pdf.Root.get("/MarkInfo")
         marked = bool(mark_info and mark_info.get("/Marked"))
         struct_root = pdf.Root.get("/StructTreeRoot")
+        tagged_content = collect_tagged_content_diagnostics(pdf)
 
         def walk_figures(obj: pikepdf.Object) -> None:
             nonlocal figure_index
@@ -136,4 +145,11 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         table_count=table_count,
         tables_without_summary=tables_without_summary,
         tables_without_th=tables_without_th,
+        struct_tree_root_present=tagged_content.struct_tree_root_present,
+        parent_tree_present=tagged_content.parent_tree_present,
+        pages_with_struct_parents=tagged_content.pages_with_struct_parents,
+        pages_with_mapped_mcids=tagged_content.pages_with_mapped_mcids,
+        mapped_mcid_count=tagged_content.mapped_mcid_count,
+        unresolved_mcids=tagged_content.unresolved_mcids,
+        parent_tree_keys=tagged_content.parent_tree_keys,
     )

@@ -156,6 +156,8 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
         if struct_root is not None:
             walk(struct_root)
 
+        if not repaired:
+            return pdf_bytes, repaired
         output = io.BytesIO()
         pdf.save(output)
         return output.getvalue(), repaired

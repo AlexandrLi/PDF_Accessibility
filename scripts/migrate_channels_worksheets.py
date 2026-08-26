@@ -39,7 +39,13 @@ from lib.figure_to_table_sweep import repair_figure_to_table  # noqa: E402
 from lib.inline_formula_sweep import repair_inline_formula_figures  # noqa: E402
 from lib.layout_table_sweep import repair_layout_tables  # noqa: E402
 from lib.character_encoding_sweep import repair_character_encoding  # noqa: E402
+from lib.heading_nesting_sweep import repair_heading_nesting  # noqa: E402
 from lib.marked_content_actualtext_sweep import repair_marked_content_actualtext  # noqa: E402
+from lib.tab_order_sweep import repair_tab_order  # noqa: E402
+from lib.tagged_annotation_sweep import repair_tagged_annotations  # noqa: E402
+from lib.tagged_content_sweep import repair_tagged_content  # noqa: E402
+from lib.bookmark_sweep import repair_bookmarks  # noqa: E402
+from lib.adobe_residual_report import load_adobe_residual_telemetry  # noqa: E402
 from lib.migration_progress import (  # noqa: E402
     clear_topic_failed,
     completed_topic_ids,
@@ -109,12 +115,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-missing-figure-alt",
         action="store_true",
-        help="Write preview even when figures lack /Alt (reported in migration JSON)",
+        help="Deprecated compatibility flag; publication is always nonblocking (reported in migration JSON)",
     )
     parser.add_argument(
         "--allow-suspicious-figure-alt",
         action="store_true",
-        help="Write preview even when figure /Alt looks truncated or mis-tagged",
+        help="Deprecated compatibility flag; publication is always nonblocking (reported in migration JSON)",
     )
     parser.add_argument(
         "--no-repair-missing-figure-alt",
@@ -216,15 +222,33 @@ def remediate_single_topic(
                 "Body"
             ].read()
 
-        if args.skip_if_audited and is_likely_remediated(preview_bytes):
-            audit = audit_pdf_bytes(preview_bytes)
-            print("    SKIP already remediated (local audit)")
-            return TopicRunResult(
-                topic_id=topic.topic_id,
-                status="skipped-audited",
-                audit=audit.to_dict(),
-                preview_key=topic.preview_key,
-            )
+        if args.skip_if_audited:
+            try:
+                already_remediated = is_likely_remediated(preview_bytes)
+            except Exception as error:
+                already_remediated = False
+                print(
+                    "    WARN: skip-if-audited check failed; "
+                    f"continuing with remediation: {error}",
+                    flush=True,
+                )
+            if already_remediated:
+                audit = audit_pdf_bytes(preview_bytes)
+                adobe_telemetry = load_adobe_residual_telemetry(
+                    s3, a11y, topic.topic_id
+                ).to_dict()
+                print("    SKIP already remediated (local audit)")
+                return TopicRunResult(
+                    topic_id=topic.topic_id,
+                    status="skipped-audited",
+                    audit={
+                        **audit.to_dict(),
+                        "adobeResidualTelemetry": adobe_telemetry,
+                        "publicationBlocked": False,
+                        "publicationPolicy": "best-effort-nonblocking",
+                    },
+                    preview_key=topic.preview_key,
+                )
 
         remediated = remediate_preview_pdf(
             s3,
@@ -236,96 +260,349 @@ def remediate_single_topic(
             topic.topic_id,
             topic.title,
         )
-        audit_before = audit_pdf_bytes(remediated)
+        tab_order_repair = None
+        tab_order_sweep_error = None
+        try:
+            remediated, tab_order_repair = repair_tab_order(remediated)
+            if tab_order_repair.actions:
+                for action in tab_order_repair.actions:
+                    print(f"    {action}")
+        except Exception as error:
+            tab_order_sweep_error = str(error)
+            print(
+                f"    WARN: tab-order sweep failed; continuing with pre-sweep bytes: {error}",
+                flush=True,
+            )
+        tagged_content_repair = None
+        tagged_content_sweep_error = None
+        tagged_content_before = remediated
+        try:
+            remediated, tagged_content_repair = repair_tagged_content(remediated)
+            if tagged_content_repair.actions:
+                for action in tagged_content_repair.actions:
+                    print(f"    {action}")
+        except Exception as error:
+            remediated = tagged_content_before
+            tagged_content_sweep_error = str(error)
+            print(
+                f"    WARN: tagged-content sweep failed; continuing with pre-sweep bytes: {error}",
+                flush=True,
+            )
+        tagged_annotation_repair = None
+        tagged_annotation_sweep_error = None
+        tagged_annotation_before = remediated
+        try:
+            remediated, tagged_annotation_repair = repair_tagged_annotations(remediated)
+            if tagged_annotation_repair.actions:
+                for action in tagged_annotation_repair.actions:
+                    print(f"    {action}")
+            if tagged_annotation_repair.conflicts or tagged_annotation_repair.unresolved:
+                print(
+                    "    tagged-annotation sweep diagnostics: "
+                    f"{len(tagged_annotation_repair.conflicts)} conflict(s), "
+                    f"{len(tagged_annotation_repair.unresolved)} unresolved",
+                    flush=True,
+                )
+        except Exception as error:
+            remediated = tagged_annotation_before
+            tagged_annotation_sweep_error = str(error)
+            print(
+                "    WARN: tagged-annotation sweep failed; "
+                f"continuing with pre-sweep bytes: {error}",
+                flush=True,
+            )
+        audit_before = None
+        audit_before_error = None
+        try:
+            audit_before = audit_pdf_bytes(remediated)
+        except Exception as error:
+            audit_before_error = str(error)
+            print(
+                f"    WARN: pre-sweep local audit failed; continuing: {error}",
+                flush=True,
+            )
         repaired_figures: list[int] = []
-        if audit_before.figures_missing_alt and not args.no_repair_missing_figure_alt:
-            remediated, repaired_figures = repair_missing_figure_alt(remediated)
-            if repaired_figures:
-                print(f"    repaired figure alt: {repaired_figures}")
+        figure_alt_sweep_error = None
+        if (
+            audit_before
+            and audit_before.figures_missing_alt
+            and not args.no_repair_missing_figure_alt
+        ):
+            figure_alt_before = remediated
+            try:
+                remediated, repaired_figures = repair_missing_figure_alt(remediated)
+                if repaired_figures:
+                    print(f"    repaired figure alt: {repaired_figures}")
+            except Exception as error:
+                remediated = figure_alt_before
+                figure_alt_sweep_error = str(error)
+                print(
+                    "    WARN: figure-alt sweep failed; "
+                    f"continuing with pre-sweep bytes: {error}",
+                    flush=True,
+                )
 
         table_repair = None
+        table_sweep_error = None
         figure_to_table_repair = None
+        figure_to_table_sweep_error = None
         inline_formula_repair = None
+        inline_formula_sweep_error = None
         marked_content_repair = None
+        marked_content_sweep_error = None
         character_encoding_repair = None
         if args.repair_figure_to_table and not args.no_repair_figure_to_table:
-            remediated, figure_to_table_repair = repair_figure_to_table(remediated)
-            if figure_to_table_repair.actions:
-                for action in figure_to_table_repair.actions:
-                    print(f"    {action}")
+            figure_to_table_before = remediated
+            try:
+                remediated, figure_to_table_repair = repair_figure_to_table(remediated)
+                if figure_to_table_repair.actions:
+                    for action in figure_to_table_repair.actions:
+                        print(f"    {action}")
+            except Exception as error:
+                remediated = figure_to_table_before
+                figure_to_table_sweep_error = str(error)
+                print(
+                    "    WARN: figure-to-table sweep failed; "
+                    f"continuing with pre-sweep bytes: {error}",
+                    flush=True,
+                )
 
         if not args.no_repair_inline_formula:
-            remediated, inline_formula_repair = repair_inline_formula_figures(remediated)
-            if inline_formula_repair.actions:
-                for action in inline_formula_repair.actions:
-                    print(f"    {action}")
+            inline_formula_before = remediated
+            try:
+                remediated, inline_formula_repair = repair_inline_formula_figures(
+                    remediated
+                )
+                if inline_formula_repair.actions:
+                    for action in inline_formula_repair.actions:
+                        print(f"    {action}")
+            except Exception as error:
+                remediated = inline_formula_before
+                inline_formula_sweep_error = str(error)
+                print(
+                    "    WARN: inline-formula sweep failed; "
+                    f"continuing with pre-sweep bytes: {error}",
+                    flush=True,
+                )
 
         if not args.no_repair_layout_tables:
-            remediated, table_repair = repair_layout_tables(remediated)
-            if table_repair.actions:
-                for action in table_repair.actions:
-                    print(f"    {action}")
+            table_before = remediated
+            try:
+                remediated, table_repair = repair_layout_tables(remediated)
+                if table_repair.actions:
+                    for action in table_repair.actions:
+                        print(f"    {action}")
+                if table_repair.conflicts or table_repair.unresolved:
+                    print(
+                        f"    table sweep diagnostics: "
+                        f"{len(table_repair.conflicts)} conflict(s), "
+                        f"{len(table_repair.unresolved)} unresolved",
+                        flush=True,
+                    )
+            except Exception as error:
+                remediated = table_before
+                table_sweep_error = str(error)
+                print(
+                    f"    WARN: table sweep failed; continuing with pre-sweep bytes: {error}",
+                    flush=True,
+                )
 
         if not args.no_repair_marked_content_actualtext:
-            remediated, marked_content_repair = repair_marked_content_actualtext(remediated)
-            if marked_content_repair.actions:
-                for action in marked_content_repair.actions:
-                    print(f"    {action}")
+            marked_content_before = remediated
+            try:
+                remediated, marked_content_repair = repair_marked_content_actualtext(
+                    remediated
+                )
+                if marked_content_repair.actions:
+                    for action in marked_content_repair.actions:
+                        print(f"    {action}")
+            except Exception as error:
+                remediated = marked_content_before
+                marked_content_sweep_error = str(error)
+                print(
+                    "    WARN: marked-content /ActualText sweep failed; "
+                    f"continuing with pre-sweep bytes: {error}",
+                    flush=True,
+                )
 
+        character_encoding_sweep_error = None
         if not args.no_repair_character_encoding:
-            remediated, character_encoding_repair = repair_character_encoding(remediated)
-            if character_encoding_repair.actions:
-                for action in character_encoding_repair.actions:
-                    print(f"    {action}")
+            character_encoding_before = remediated
+            try:
+                remediated, character_encoding_repair = repair_character_encoding(
+                    remediated
+                )
+                if character_encoding_repair.actions:
+                    for action in character_encoding_repair.actions:
+                        print(f"    {action}")
+                if character_encoding_repair.diagnostics:
+                    print(
+                        "    encoding sweep diagnostics: "
+                        f"{len(character_encoding_repair.diagnostics)} item(s)",
+                        flush=True,
+                    )
+            except Exception as error:
+                remediated = character_encoding_before
+                character_encoding_sweep_error = str(error)
+                print(
+                    "    WARN: character-encoding sweep failed; "
+                    f"continuing with pre-sweep bytes: {error}",
+                    flush=True,
+                )
 
-        audit = audit_pdf_bytes(remediated)
-        blocking_suspicious = filter_blocking_suspicious_figure_alts(
-            audit.figures_suspicious_alt,
-            marked_content_actions=(
-                marked_content_repair.actions if marked_content_repair else None
-            ),
+        heading_nesting_repair = None
+        heading_nesting_sweep_error = None
+        heading_nesting_before = remediated
+        try:
+            remediated, heading_nesting_repair = repair_heading_nesting(remediated)
+            if heading_nesting_repair.actions:
+                for action in heading_nesting_repair.actions:
+                    print(f"    {action}")
+            if heading_nesting_repair.diagnostics:
+                print(
+                    "    heading-nesting sweep diagnostics: "
+                    f"{len(heading_nesting_repair.diagnostics)} item(s)",
+                    flush=True,
+                )
+        except Exception as error:
+            remediated = heading_nesting_before
+            heading_nesting_sweep_error = str(error)
+            print(
+                "    WARN: heading-nesting sweep failed; "
+                f"continuing with pre-sweep bytes: {error}",
+                flush=True,
+            )
+
+        bookmark_repair = None
+        bookmark_sweep_error = None
+        bookmark_before = remediated
+        try:
+            remediated, bookmark_repair = repair_bookmarks(remediated)
+            if bookmark_repair.actions:
+                for action in bookmark_repair.actions:
+                    print(f"    {action}")
+            if bookmark_repair.conflicts:
+                print(
+                    "    bookmark sweep diagnostics: "
+                    f"{len(bookmark_repair.conflicts)} conflict(s)",
+                    flush=True,
+                )
+        except Exception as error:
+            remediated = bookmark_before
+            bookmark_sweep_error = str(error)
+            print(
+                "    WARN: bookmark sweep failed; continuing with pre-sweep bytes: "
+                f"{error}",
+                flush=True,
+            )
+
+        audit = None
+        audit_error = None
+        try:
+            audit = audit_pdf_bytes(remediated)
+        except Exception as error:
+            audit_error = str(error)
+            print(
+                f"    WARN: final local audit failed; publishing anyway: {error}",
+                flush=True,
+            )
+        blocking_suspicious = (
+            filter_blocking_suspicious_figure_alts(
+                audit.figures_suspicious_alt,
+                marked_content_actions=(
+                    marked_content_repair.actions if marked_content_repair else None
+                ),
+            )
+            if audit
+            else []
         )
+        adobe_telemetry = load_adobe_residual_telemetry(
+            s3, a11y, topic.topic_id
+        ).to_dict()
+        publication_warnings: list[str] = []
+        if audit and audit.figures_missing_alt:
+            publication_warnings.append(
+                f"figures missing /Alt: {audit.figures_missing_alt}"
+            )
+        if audit and audit.figures_suspicious_alt:
+            publication_warnings.append(
+                "figures with suspicious /Alt: "
+                f"{[item.figure_index for item in audit.figures_suspicious_alt]}"
+            )
+        if audit_error:
+            publication_warnings.append(f"final local audit failed: {audit_error}")
         audit_payload = {
-            **audit.to_dict(),
-            "beforeRepair": audit_before.to_dict(),
+            **(audit.to_dict() if audit else {}),
+            "beforeRepair": audit_before.to_dict() if audit_before else None,
+            "beforeRepairAuditError": audit_before_error,
+            "finalAuditError": audit_error,
             "blockingSuspiciousFigureAlt": [
                 item.to_dict() for item in blocking_suspicious
             ],
             "repairedFigures": repaired_figures,
+            "figureAltSweepError": figure_alt_sweep_error,
             "figureToTableRepair": (
                 figure_to_table_repair.to_dict() if figure_to_table_repair else None
             ),
+            "figureToTableSweepError": figure_to_table_sweep_error,
             "inlineFormulaRepair": (
                 inline_formula_repair.to_dict() if inline_formula_repair else None
             ),
+            "inlineFormulaSweepError": inline_formula_sweep_error,
             "markedContentRepair": (
                 marked_content_repair.to_dict() if marked_content_repair else None
             ),
+            "markedContentSweepError": marked_content_sweep_error,
             "characterEncodingRepair": (
                 character_encoding_repair.to_dict()
                 if character_encoding_repair
                 else None
             ),
+            "characterEncodingSweepError": character_encoding_sweep_error,
+            "headingNestingRepair": (
+                heading_nesting_repair.to_dict()
+                if heading_nesting_repair
+                else None
+            ),
+            "headingNestingSweepError": heading_nesting_sweep_error,
+            "bookmarkRepair": (
+                bookmark_repair.to_dict() if bookmark_repair else None
+            ),
+            "bookmarkSweepError": bookmark_sweep_error,
             "tableRepair": table_repair.to_dict() if table_repair else None,
+            "tableSweepError": table_sweep_error,
+            "tabOrderRepair": (
+                tab_order_repair.to_dict() if tab_order_repair else None
+            ),
+            "tabOrderSweepError": tab_order_sweep_error,
+            "taggedContentRepair": (
+                tagged_content_repair.to_dict() if tagged_content_repair else None
+            ),
+            "taggedContentSweepError": tagged_content_sweep_error,
+            "taggedAnnotationRepair": (
+                tagged_annotation_repair.to_dict()
+                if tagged_annotation_repair
+                else None
+            ),
+            "taggedAnnotationSweepError": tagged_annotation_sweep_error,
+            "adobeResidualTelemetry": adobe_telemetry,
+            "publicationBlocked": False,
+            "publicationPolicy": "best-effort-nonblocking",
+            "publicationWarnings": publication_warnings,
         }
-        print(
-            f"    audit: {audit.figure_count} figures, "
-            f"{len(audit.figures_missing_alt)} missing alt, "
-            f"{len(audit.figures_suspicious_alt)} suspicious alt, "
-            f"{audit.table_count} tables"
-        )
-        if audit.figures_suspicious_alt:
+        if audit:
+            print(
+                f"    audit: {audit.figure_count} figures, "
+                f"{len(audit.figures_missing_alt)} missing alt, "
+                f"{len(audit.figures_suspicious_alt)} suspicious alt, "
+                f"{audit.table_count} tables"
+            )
+        if audit and audit.figures_suspicious_alt:
             for item in audit.figures_suspicious_alt:
                 print(
                     f"    suspicious figure {item.figure_index}: "
                     f"{', '.join(item.reasons)} — {item.alt_text[:80]!r}"
                 )
-        if blocking_suspicious and not args.allow_suspicious_figure_alt:
-            indices = [item.figure_index for item in blocking_suspicious]
-            raise RuntimeError(f"figures with suspicious /Alt: {indices}")
-        if audit.figures_missing_alt and not args.allow_missing_figure_alt:
-            raise RuntimeError(f"figures missing /Alt: {audit.figures_missing_alt}")
-
         s3.put_object(
             Bucket=channels_bucket(args.env),
             Key=topic.preview_key,

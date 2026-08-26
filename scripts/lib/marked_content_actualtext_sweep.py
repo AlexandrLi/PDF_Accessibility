@@ -386,6 +386,20 @@ def _repair_list_image_labels(
 
     updated = 0
     li_index = 0
+    figure_alt_mcids: set[int] = set()
+
+    def collect_figure_alt_mcids(obj: pikepdf.Dictionary) -> None:
+        if obj.get("/S") == "/Figure" and obj.get("/Alt") is not None:
+            figure_alt_mcids.update(_collect_mcids(obj.get("/K")))
+        kids = obj.get("/K")
+        if isinstance(kids, pikepdf.Array):
+            for kid in kids:
+                if isinstance(kid, pikepdf.Dictionary):
+                    collect_figure_alt_mcids(kid)
+        elif isinstance(kids, pikepdf.Dictionary):
+            collect_figure_alt_mcids(kids)
+
+    collect_figure_alt_mcids(struct_root)
 
     def walk(obj: pikepdf.Dictionary) -> None:
         nonlocal updated, li_index
@@ -413,7 +427,8 @@ def _repair_list_image_labels(
                             continue
                         _tag, body = block
                         if _is_image_only_mcid_body(body):
-                            image_mcids.append(mcid)
+                            if mcid not in figure_alt_mcids:
+                                image_mcids.append(mcid)
                         else:
                             extracted = _extract_tj_text(body)
                             if extracted:
@@ -422,6 +437,7 @@ def _repair_list_image_labels(
                         spoken = _spoken_list_item_text(" ".join(text_parts))
                         if not spoken:
                             spoken = f"List item {li_index}"
+                        updated_mcids: list[int] = []
                         for mcid in image_mcids:
                             if _inject_actualtext_on_page(
                                 pdf,
@@ -430,10 +446,12 @@ def _repair_list_image_labels(
                                 actual_text=spoken,
                             ):
                                 updated += 1
-                        actions.append(
-                            f"list item {li_index}: added /ActualText to image MCIDs "
-                            f"{image_mcids}"
-                        )
+                                updated_mcids.append(mcid)
+                        if updated_mcids:
+                            actions.append(
+                                f"list item {li_index}: added /ActualText to image MCIDs "
+                                f"{updated_mcids}"
+                            )
 
         kids = obj.get("/K")
         if isinstance(kids, pikepdf.Array):
@@ -1006,20 +1024,6 @@ def _retag_mcid_bdc_in_data(
     return new_data, count > 0
 
 
-def _remove_struct_child(parent: pikepdf.Dictionary, child: pikepdf.Dictionary) -> bool:
-    kids = parent.get("/K")
-    if isinstance(kids, pikepdf.Array):
-        filtered = pikepdf.Array([kid for kid in kids if kid != child])
-        if len(filtered) == len(kids):
-            return False
-        parent["/K"] = filtered
-        return True
-    if kids == child:
-        del parent["/K"]
-        return True
-    return False
-
-
 def _figure_content_mcids(data: bytes, mcids: list[int]) -> list[int]:
     linked: list[int] = []
     for mcid in mcids:
@@ -1037,7 +1041,7 @@ def _repair_figure_mcid_linkage_and_tags(
     *,
     actions: list[str],
 ) -> int:
-    """Drop non-image MCIDs from Figure /K and retag stray /Figure labels as /Span."""
+    """Convert wholly non-image Figures without orphaning their tagged content."""
     struct_root = pdf.Root.get("/StructTreeRoot")
     if struct_root is None:
         return 0
@@ -1079,6 +1083,10 @@ def _repair_figure_mcid_linkage_and_tags(
         drop = [mcid for mcid in mcids if mcid not in keep]
         if not drop:
             continue
+        if keep:
+            # Mixed image/text ownership is ambiguous. Splitting it would also
+            # require rewriting ParentTree ownership, so preserve it unchanged.
+            continue
 
         new_data = data
         data_changed = False
@@ -1088,29 +1096,15 @@ def _repair_figure_mcid_linkage_and_tags(
                 new_data, changed = _retag_mcid_bdc_in_data(new_data, mcid, b"Span")
                 data_changed = data_changed or changed
 
-        if keep != mcids:
-            if keep:
-                figure["/K"] = pikepdf.Array(keep)
-            else:
-                parent = figure.get("/P")
-                if isinstance(parent, pikepdf.Dictionary) and _remove_struct_child(
-                    parent, figure
-                ):
-                    actions.append(
-                        "removed orphan Figure struct with mislinked non-image MCIDs"
-                    )
-                else:
-                    del figure["/K"]
-                    if figure.get("/Alt") is not None:
-                        del figure["/Alt"]
-                    if figure.get("/Contents") is not None:
-                        del figure["/Contents"]
-                    actions.append(
-                        "cleared mislinked Figure struct alt after dropping non-image MCIDs"
-                    )
+        if data_changed:
+            figure["/S"] = pikepdf.Name("/Span")
+            if figure.get("/Alt") is not None:
+                del figure["/Alt"]
+            if figure.get("/Contents") is not None:
+                del figure["/Contents"]
             updated += 1
             actions.append(
-                f"figure MCIDs: kept image MCIDs {keep}, dropped {drop}"
+                f"converted non-image Figure to /Span for MCIDs {drop}"
             )
 
         if data_changed:
@@ -1558,11 +1552,18 @@ def repair_marked_content_actualtext(
         _repair_extra_char_span_nested_alt(pdf, actions=actions)
         mcids_updated += _repair_list_image_labels(pdf, actions=actions)
         mcids_updated += _repair_list_item_label_actualtext(pdf, actions=actions)
-        mcids_updated += _repair_orphan_marked_content_actualtext(pdf, actions=actions)
         _repair_figure_mcid_linkage_and_tags(pdf, actions=actions)
+        mcids_updated += _repair_orphan_marked_content_actualtext(pdf, actions=actions)
         _repair_figure_alt_precedence(pdf, actions=actions)
         _repair_figure_duplicate_contents(pdf, actions=actions)
 
+        if not actions:
+            result = MarkedContentActualTextRepairResult(
+                figures_found=figures_found,
+                mcids_updated=mcids_updated,
+                actions=actions,
+            )
+            return pdf_bytes, result
         output = io.BytesIO()
         pdf.save(output)
         result = MarkedContentActualTextRepairResult(

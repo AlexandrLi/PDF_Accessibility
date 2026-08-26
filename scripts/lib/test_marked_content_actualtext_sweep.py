@@ -248,6 +248,7 @@ class TableFigureRepairTests(unittest.TestCase):
         self.assertGreater(first.mcids_updated, 0)
         self.assertEqual(second.mcids_updated, 0)
         self.assertEqual(second.actions, [])
+        self.assertEqual(repaired_twice, repaired_once)
         self.assertEqual(_page_contents_text(repaired_once), _page_contents_text(repaired_twice))
 
 
@@ -417,7 +418,46 @@ class ExtraCharSpanNestedAltRegressionTests(unittest.TestCase):
 
 
 class NestedFigureAltRegressionTests(unittest.TestCase):
-    def test_repair_nested_figure_mcid_and_duplicate_struct_alt(self) -> None:
+    def test_figure_alt_precedence_skips_shared_list_image_mcid(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"q /Figure<</MCID 9 >> BDC /Im0 Do EMC Q"
+        )
+        figure = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Figure"),
+                "/Alt": "Wavelength diagram",
+                "/Pg": page.obj,
+                "/K": 9,
+            }
+        )
+        li = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/LI"),
+                "/Pg": page.obj,
+                "/K": pikepdf.Array([9]),
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([figure, li]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+        original = buf.getvalue()
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        self.assertEqual(repaired, original)
+        self.assertEqual(result.mcids_updated, 0)
+        self.assertEqual(result.actions, [])
+
+    def test_preserves_ambiguous_mixed_figure_linkage(self) -> None:
         pdf = pikepdf.Pdf.new()
         page = pdf.add_blank_page()
         page["/Contents"] = pdf.make_stream(
@@ -453,17 +493,17 @@ class NestedFigureAltRegressionTests(unittest.TestCase):
         repaired, result = repair_marked_content_actualtext(buf.getvalue())
         contents = _page_contents_text(repaired)
 
-        self.assertIn("dropped [11]", "\n".join(result.actions))
+        self.assertNotIn("converted non-image Figure", "\n".join(result.actions))
         self.assertIn("stripped duplicate /ActualText", "\n".join(result.actions))
-        self.assertIn("/Span<< /MCID 11", contents)
-        self.assertNotIn("/Figure<< /MCID 11", contents)
+        self.assertNotIn("/Span<< /MCID 11", contents)
+        self.assertIn("/Figure<</MCID 11", contents)
         self.assertNotIn("/Figure<< /MCID 10 /ActualText", contents)
 
         with pikepdf.open(io.BytesIO(repaired)) as opened:
             root = opened.Root["/StructTreeRoot"]
             figure_elem = root["/K"][0]["/K"][0]
             self.assertEqual(figure_elem.get("/S"), pikepdf.Name("/Figure"))
-            self.assertEqual(list(figure_elem.get("/K", [])), [10])
+            self.assertEqual(list(figure_elem.get("/K", [])), [10, 11])
             self.assertEqual(str(figure_elem.get("/Alt")), "Main diagram")
 
 

@@ -150,11 +150,13 @@ def repair_inline_formula_figures(pdf_bytes: bytes) -> tuple[bytes, InlineFormul
 
         walk(struct_root)
 
-        output = io.BytesIO()
-        pdf.save(output)
         result = InlineFormulaRepairResult(
             figures_found=figures_found,
             converted=converted,
             actions=actions,
         )
+        if not actions:
+            return pdf_bytes, result
+        output = io.BytesIO()
+        pdf.save(output)
         return output.getvalue(), result
