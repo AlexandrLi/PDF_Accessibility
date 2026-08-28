@@ -8,10 +8,40 @@ from pathlib import Path
 
 import pikepdf
 
-from lib.layout_table_sweep import repair_layout_tables
+from lib.layout_table_sweep import (
+    _logical_row_widths,
+    _table_rows_and_cells,
+    repair_layout_tables,
+)
 from lib.pdf_a11y_audit import audit_pdf_bytes
 
 FIXTURE_DIR = Path(__file__).resolve().parents[2] / "tmp" / "fin-acct-ch2"
+MACRO_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "pdfs"
+    / "accessibility-issue-map"
+    / "macroeconomics"
+    / "2026-08-26"
+    / "originals"
+    / "f8690451.pdf"
+)
+MICRO_FIXTURE_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "pdfs"
+    / "accessibility-issue-map"
+    / "microeconomics"
+    / "2026-08-28"
+    / "originals"
+)
+COLLEGE_ALGEBRA_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "pdfs"
+    / "accessibility-issue-map"
+    / "college-algebra"
+    / "2026-08-28"
+    / "originals"
+    / "56d27cf6.pdf"
+)
 
 
 def _make_two_row_table() -> bytes:
@@ -248,6 +278,285 @@ def _make_adobe_layout_table() -> bytes:
     return output.getvalue()
 
 
+def _make_neptune_placeholder_table(*, conflicting_header_index: bool = False) -> bytes:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(400, 400))
+    real_headers = []
+    for header_index, column_index in enumerate((0, 2)):
+        header = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/TH"),
+                "/Scope": pikepdf.Name("/Column"),
+                "/ID": pikepdf.String(f"neptune-header-{header_index * 2}"),
+                "/Headers": pikepdf.Array([pikepdf.String("existing-header")]),
+                "/K": pikepdf.String(f"header-{header_index}"),
+                "/Pg": page.obj,
+                "/A": pikepdf.Array(
+                    [
+                        pikepdf.Dictionary(
+                            {
+                                "/O": pikepdf.Name("/Table"),
+                                "/ColSpan": 2,
+                                "/ADBE_ColIndex": (
+                                    1 if conflicting_header_index and header_index == 1
+                                    else column_index
+                                ),
+                            }
+                        )
+                    ]
+                ),
+            }
+        )
+        pdf.make_indirect(header)
+        real_headers.append(header)
+
+    placeholders = []
+    for column_index in (1, 3):
+        placeholder = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/TH"),
+                "/Scope": pikepdf.Name("/Column"),
+                "/ID": pikepdf.String(f"neptune-header-{column_index}"),
+                "/K": pikepdf.Array([]),
+                "/Pg": page.obj,
+            }
+        )
+        pdf.make_indirect(placeholder)
+        placeholders.append(placeholder)
+
+    header_row = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/TR"),
+            "/K": pikepdf.Array(
+                [real_headers[0], placeholders[0], real_headers[1], placeholders[1]]
+            ),
+            "/Pg": page.obj,
+        }
+    )
+    pdf.make_indirect(header_row)
+
+    data_cells = []
+    for cell_index in range(4):
+        cell = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/TD"),
+                "/K": pikepdf.String(f"data-{cell_index}"),
+                "/Pg": page.obj,
+                "/Headers": pikepdf.Array(
+                [pikepdf.String(f"neptune-header-{cell_index}")]
+                ),
+            }
+        )
+        pdf.make_indirect(cell)
+        data_cells.append(cell)
+    data_row = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/TR"),
+            "/K": pikepdf.Array(data_cells),
+            "/Pg": page.obj,
+        }
+    )
+    pdf.make_indirect(data_row)
+
+    table = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Table"),
+            "/K": pikepdf.Array([header_row, data_row]),
+            "/Pg": page.obj,
+            "/A": pikepdf.Array(
+                [
+                    pikepdf.Dictionary(
+                        {
+                            "/O": pikepdf.Name("/Table"),
+                            "/ADBE_NumCol": 4,
+                            "/ADBE_NumRow": 2,
+                        }
+                    ),
+                    pikepdf.Dictionary(
+                        {
+                            "/O": pikepdf.Name("/ADBE_Table"),
+                            "/ADBE_TableProcess": pikepdf.Name("/Neptune"),
+                        }
+                    ),
+                ]
+            ),
+        }
+    )
+    pdf.make_indirect(table)
+
+    root = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array([table]),
+        }
+    )
+    pdf.make_indirect(root)
+    pdf.Root["/StructTreeRoot"] = root
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    table["/P"] = root
+    header_row["/P"] = table
+    data_row["/P"] = table
+    for cell in real_headers + placeholders:
+        cell["/P"] = header_row
+    for cell in data_cells:
+        cell["/P"] = data_row
+
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
+def _make_word_border_table(
+    row_widths: list[int],
+    *,
+    rich_layout: bool = False,
+) -> bytes:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(400, 400))
+    next_mcid = 0
+    rows: list[pikepdf.Dictionary] = []
+    for row_index, width in enumerate(row_widths):
+        cells: list[pikepdf.Dictionary] = []
+        for cell_index in range(width):
+            mcid_count = (
+                12
+                if rich_layout
+                else 1
+                if row_index == 0 and cell_index == 0
+                else 2
+            )
+            kids = pikepdf.Array(range(next_mcid, next_mcid + mcid_count))
+            next_mcid += mcid_count
+            cells.append(
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/StructElem"),
+                        "/S": pikepdf.Name("/TD"),
+                        "/K": kids,
+                        "/Pg": page.obj,
+                    }
+                )
+            )
+        border = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Span"),
+                "/K": next_mcid,
+                "/Pg": page.obj,
+            }
+        )
+        next_mcid += 1
+        rows.append(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/TR"),
+                    "/K": pikepdf.Array([*cells, border]),
+                    "/Pg": page.obj,
+                }
+            )
+        )
+    table = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Table"),
+            "/K": pikepdf.Array(rows),
+            "/Pg": page.obj,
+        }
+    )
+    root = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array([table]),
+        }
+    )
+    pdf.Root["/StructTreeRoot"] = root
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    pdf.docinfo["/Producer"] = pikepdf.String("Microsoft® Word 2010")
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
+def _make_pdf_lib_overlapping_table(*, valid_indices: bool = True) -> bytes:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(400, 400))
+    roles = (("/TH", "/TH"), ("/TD", "/TD"), ("/TH", "/TD"))
+    indices = ((0, 1), (1, 0), (0, 1 if valid_indices else 0))
+    rows: list[pikepdf.Dictionary] = []
+    mcid = 0
+    for row_index, (row_roles, row_indices) in enumerate(zip(roles, indices)):
+        cells: list[pikepdf.Dictionary] = []
+        for role, column_index in zip(row_roles, row_indices):
+            table_attributes = pikepdf.Dictionary(
+                {
+                    "/O": pikepdf.Name("/Table"),
+                    "/ADBE_ColIndex": column_index,
+                }
+            )
+            if row_index == 0:
+                table_attributes["/RowSpan"] = 3
+            cells.append(
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/StructElem"),
+                        "/S": pikepdf.Name(role),
+                        "/K": mcid,
+                        "/Pg": page.obj,
+                        "/A": pikepdf.Array(
+                            [
+                                table_attributes,
+                                pikepdf.Dictionary(
+                                    {
+                                        "/O": pikepdf.Name("/ADBE_Table"),
+                                        "/ADBE_Confidence": 50,
+                                    }
+                                ),
+                            ]
+                        ),
+                    }
+                )
+            )
+            mcid += 1
+        rows.append(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/TR"),
+                    "/K": pikepdf.Array(cells),
+                    "/Pg": page.obj,
+                }
+            )
+        )
+    table = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Table"),
+            "/K": pikepdf.Array(rows),
+            "/Pg": page.obj,
+        }
+    )
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array([table]),
+        }
+    )
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    pdf.docinfo["/Producer"] = pikepdf.String(
+        "pdf-lib (https://github.com/Hopding/pdf-lib)"
+    )
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
 class LayoutTableSweepTests(unittest.TestCase):
     def test_two_row_header_table_gets_th_scope_and_headers(self) -> None:
         repaired, result = repair_layout_tables(_make_two_row_table())
@@ -269,6 +578,427 @@ class LayoutTableSweepTests(unittest.TestCase):
             self.assertEqual(len(data_cells), 6)
             self.assertEqual(data_cells[0]["/Headers"][0], "tbl1-h0")
             self.assertEqual(data_cells[3]["/Headers"][0], "tbl1-h3")
+
+    def test_singleton_dictionary_row_k_is_processed(self) -> None:
+        original = _make_table_pdf([[1], [1]])
+        output = io.BytesIO()
+        with pikepdf.open(io.BytesIO(original)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            for row in table["/K"]:
+                row["/K"] = row["/K"][0]
+            pdf.save(output)
+
+        repaired, result = repair_layout_tables(output.getvalue())
+
+        self.assertEqual(result.annotated_data_tables, 1)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            header = table["/K"][0]["/K"]
+            data = table["/K"][1]["/K"]
+            self.assertEqual(header["/S"], "/TH")
+            self.assertEqual(data["/Headers"][0], header["/ID"])
+
+    def test_proven_neptune_placeholders_are_removed(self) -> None:
+        original = _make_neptune_placeholder_table()
+        repaired, result = repair_layout_tables(original)
+
+        self.assertTrue(
+            any(
+                "Neptune empty header placeholders" in action
+                for action in result.actions
+            )
+        )
+        self.assertFalse(
+            any("Neptune placeholder canonicalization" in item for item in result.unresolved)
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            header_row, data_row = table["/K"]
+            headers = header_row["/K"]
+            self.assertEqual(len(headers), 2)
+            self.assertEqual(
+                [str(cell["/ID"]) for cell in headers],
+                ["neptune-header-0", "neptune-header-2"],
+            )
+            self.assertEqual([cell["/S"] for cell in headers], ["/TH", "/TH"])
+            self.assertEqual(
+                [cell["/Scope"] for cell in headers],
+                ["/Column", "/Column"],
+            )
+            self.assertEqual(
+                [cell["/Headers"][0] for cell in headers],
+                ["existing-header", "existing-header"],
+            )
+            self.assertTrue(
+                all(cell["/P"].objgen == header_row.objgen for cell in headers)
+            )
+            self.assertEqual(len(data_row["/K"]), 4)
+            self.assertEqual(
+                [cell["/Headers"][0] for cell in data_row["/K"]],
+                [
+                    "neptune-header-0",
+                    "neptune-header-0",
+                    "neptune-header-2",
+                    "neptune-header-2",
+                ],
+            )
+            self.assertEqual(
+                [cell["/A"][0]["/ColSpan"] for cell in headers],
+                [2, 2],
+            )
+            self.assertEqual(
+                [cell["/A"][0]["/ADBE_ColIndex"] for cell in headers],
+                [0, 2],
+            )
+
+        repaired_again, second_result = repair_layout_tables(repaired)
+        self.assertEqual(repaired_again, repaired)
+        self.assertEqual(second_result.actions, [])
+
+    def test_neptune_placeholder_near_miss_is_reported_and_retained(self) -> None:
+        original = _make_neptune_placeholder_table(conflicting_header_index=True)
+        repaired, result = repair_layout_tables(original)
+
+        self.assertTrue(
+            any(
+                "Neptune placeholder canonicalization proof incomplete" in item
+                for item in result.unresolved
+            )
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            self.assertEqual(len(table["/K"][0]["/K"]), 4)
+
+    def test_neptune_out_of_place_placeholder_reference_is_retained(self) -> None:
+        original = _make_neptune_placeholder_table()
+        modified = io.BytesIO()
+        with pikepdf.open(io.BytesIO(original)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            table["/K"][1]["/K"][0]["/Headers"] = pikepdf.Array(
+                [pikepdf.String("neptune-header-1")]
+            )
+            pdf.save(modified)
+
+        repaired, result = repair_layout_tables(modified.getvalue())
+
+        self.assertTrue(
+            any(
+                "Neptune placeholder canonicalization proof incomplete" in item
+                for item in result.unresolved
+            )
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            self.assertEqual(len(table["/K"][0]["/K"]), 4)
+
+    def test_real_neptune_fixture_tables_are_canonicalized(self) -> None:
+        if not MACRO_FIXTURE.exists():
+            self.skipTest("Macroeconomics fixture PDF not available")
+
+        original = MACRO_FIXTURE.read_bytes()
+        repaired, result = repair_layout_tables(original)
+
+        self.assertEqual(result.actions, [
+            "table1: removed proven Neptune empty header placeholders",
+            "table2: removed proven Neptune empty header placeholders",
+        ])
+        self.assertEqual(result.unresolved, [])
+        with pikepdf.open(io.BytesIO(original)) as before, pikepdf.open(
+            io.BytesIO(repaired)
+        ) as after:
+            before_tables = [
+                node
+                for node in _iter_tables(before.Root["/StructTreeRoot"])
+                if node.get("/S") == "/Table"
+            ]
+            after_tables = [
+                node
+                for node in _iter_tables(after.Root["/StructTreeRoot"])
+                if node.get("/S") == "/Table"
+            ]
+            self.assertEqual(len(before_tables), 2)
+            self.assertEqual(len(after_tables), 2)
+            for before_table, after_table in zip(before_tables, after_tables):
+                before_rows, _ = _table_rows_and_cells(before_table)
+                after_rows, _ = _table_rows_and_cells(after_table)
+                self.assertEqual(_logical_row_widths(before_rows), [6, 4])
+                self.assertEqual(_logical_row_widths(after_rows), [4, 4])
+                self.assertEqual(
+                    [str(cell["/ID"]) for cell in after_rows[0]["/K"]],
+                    [str(before_rows[0]["/K"][0]["/ID"]),
+                     str(before_rows[0]["/K"][2]["/ID"])],
+                )
+                self.assertEqual(
+                    [
+                        [str(value) for value in cell["/Headers"]]
+                        for cell in after_rows[1]["/K"]
+                    ],
+                    [
+                        [str(after_rows[0]["/K"][0]["/ID"])],
+                        [str(after_rows[0]["/K"][0]["/ID"])],
+                        [str(after_rows[0]["/K"][1]["/ID"])],
+                        [str(after_rows[0]["/K"][1]["/ID"])],
+                    ],
+                )
+                self.assertEqual(
+                    [str(cell["/ID"]) for cell in before_rows[1]["/K"]],
+                    [str(cell["/ID"]) for cell in after_rows[1]["/K"]],
+                )
+            self.assertEqual(len(before.pages), len(after.pages))
+            self.assertEqual(
+                [
+                    bytes(page.obj["/Contents"])
+                    for page in before.pages
+                ],
+                [
+                    bytes(page.obj["/Contents"])
+                    for page in after.pages
+                ],
+            )
+        self.assertEqual(repair_layout_tables(repaired)[0], repaired)
+        audit = audit_pdf_bytes(repaired)
+        self.assertEqual(audit.logical_row_widths, {"table1": [4, 4], "table2": [4, 4]})
+        self.assertEqual(audit.tables_without_th, 0)
+
+    def test_real_tax_efficiency_layout_tables_are_unwrapped(self) -> None:
+        fixture = MICRO_FIXTURE_DIR / "80ff0853.pdf"
+        if not fixture.exists():
+            self.skipTest("Microeconomics Tax Efficiency fixture PDF not available")
+
+        original = fixture.read_bytes()
+        repaired, result = repair_layout_tables(original)
+        audit = audit_pdf_bytes(repaired)
+
+        self.assertEqual(result.unwrapped_grid, 2)
+        self.assertEqual(audit.table_count, 0)
+        self.assertEqual(audit.tables_without_th, 0)
+        self.assertEqual(audit.invalid_row_child_roles, [])
+        with pikepdf.open(io.BytesIO(original)) as before, pikepdf.open(
+            io.BytesIO(repaired)
+        ) as after:
+            self.assertEqual(len(before.pages), len(after.pages))
+            self.assertEqual(
+                [bytes(page.obj["/Contents"]) for page in before.pages],
+                [bytes(page.obj["/Contents"]) for page in after.pages],
+            )
+        self.assertEqual(repair_layout_tables(repaired)[0], repaired)
+
+    def test_word_one_row_table_without_terminal_border_span_is_retained(self) -> None:
+        original = _make_table_pdf([[2, 2]])
+        tagged_as_word = io.BytesIO()
+        with pikepdf.open(io.BytesIO(original)) as pdf:
+            pdf.docinfo["/Producer"] = pikepdf.String("Microsoft® Word 2010")
+            pdf.save(tagged_as_word)
+
+        repaired, result = repair_layout_tables(tagged_as_word.getvalue())
+
+        self.assertEqual(result.unwrapped_grid, 0)
+        self.assertEqual(result.ambiguous_tables, 1)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            self.assertEqual(
+                pdf.Root["/StructTreeRoot"]["/K"][0]["/S"],
+                "/Table",
+            )
+
+    def test_word_comparison_layout_signatures_are_unwrapped(self) -> None:
+        for row_widths in ([2], [3], [2, 1]):
+            with self.subTest(row_widths=row_widths):
+                repaired, result = repair_layout_tables(
+                    _make_word_border_table(row_widths, rich_layout=True)
+                )
+
+                self.assertEqual(result.unwrapped_grid, 1)
+                self.assertEqual(audit_pdf_bytes(repaired).table_count, 0)
+
+    def test_word_short_single_row_table_is_not_assumed_to_be_layout(self) -> None:
+        repaired, result = repair_layout_tables(_make_word_border_table([2]))
+
+        self.assertEqual(result.unwrapped_grid, 0)
+        self.assertEqual(audit_pdf_bytes(repaired).table_count, 1)
+
+    def test_word_grouped_header_signature_repairs_two_tier_grid(self) -> None:
+        repaired, result = repair_layout_tables(
+            _make_word_border_table([4, 7, 7, 7, 7])
+        )
+        audit = audit_pdf_bytes(repaired)
+
+        self.assertEqual(result.annotated_data_tables, 1)
+        self.assertEqual(audit.tables_without_th, 0)
+        self.assertEqual(audit.invalid_row_child_roles, [])
+        self.assertEqual(audit.logical_row_widths, {"table1": [7, 7, 7, 7, 7]})
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            self.assertEqual(
+                [cell["/S"] for cell in table["/K"][0]["/K"]],
+                ["/TH"] * 4,
+            )
+            grouped_headers = list(table["/K"][0]["/K"])[1:]
+            self.assertTrue(
+                all(
+                    "/ColSpan" not in cell
+                    and cell["/A"]["/O"] == "/Table"
+                    and cell["/A"]["/ColSpan"] == 2
+                    for cell in grouped_headers
+                )
+            )
+            self.assertEqual(
+                [cell["/S"] for cell in table["/K"][1]["/K"]],
+                ["/TH"] * 7,
+            )
+        self.assertEqual(repair_layout_tables(repaired)[0], repaired)
+
+    def test_real_tax_equity_layouts_and_grouped_headers_are_repaired(self) -> None:
+        fixture = MICRO_FIXTURE_DIR / "64e45033.pdf"
+        if not fixture.exists():
+            self.skipTest("Microeconomics Tax Equity fixture PDF not available")
+
+        original = fixture.read_bytes()
+        repaired, result = repair_layout_tables(original)
+        audit = audit_pdf_bytes(repaired)
+
+        self.assertEqual(result.unwrapped_grid, 3)
+        self.assertEqual(result.annotated_data_tables, 1)
+        self.assertEqual(audit.table_count, 1)
+        self.assertEqual(audit.tables_without_th, 0)
+        self.assertEqual(audit.invalid_row_child_roles, [])
+        self.assertEqual(audit.tables_with_inconsistent_row_widths, [])
+        self.assertEqual(audit.logical_row_widths, {"table1": [7, 7, 7, 7, 7]})
+        with pikepdf.open(io.BytesIO(original)) as before, pikepdf.open(
+            io.BytesIO(repaired)
+        ) as after:
+            tables = [
+                node
+                for node in _iter_tables(after.Root["/StructTreeRoot"])
+                if node.get("/S") == "/Table"
+            ]
+            self.assertEqual(len(tables), 1)
+            rows = tables[0]["/K"]
+            self.assertEqual(
+                [cell["/S"] for cell in rows[0]["/K"]],
+                ["/TH"] * 4,
+            )
+            self.assertEqual(
+                [
+                    int(cell["/A"].get("/ColSpan", 1))
+                    if isinstance(cell.get("/A"), pikepdf.Dictionary)
+                    else 1
+                    for cell in rows[0]["/K"]
+                ],
+                [1, 2, 2, 2],
+            )
+            self.assertTrue(
+                all(
+                    "/ColSpan" not in cell
+                    and cell["/A"]["/O"] == "/Table"
+                    for cell in list(rows[0]["/K"])[1:]
+                )
+            )
+            self.assertEqual(
+                [cell["/S"] for cell in rows[1]["/K"]],
+                ["/TH"] * 7,
+            )
+            self.assertTrue(
+                all(
+                    cell["/S"] == "/TD" and len(cell["/Headers"]) == 2
+                    for row in list(rows)[2:]
+                    for cell in row["/K"]
+                )
+            )
+            self.assertEqual(len(before.pages), len(after.pages))
+            self.assertEqual(
+                [bytes(page.obj["/Contents"]) for page in before.pages],
+                [bytes(page.obj["/Contents"]) for page in after.pages],
+            )
+        self.assertEqual(repair_layout_tables(repaired)[0], repaired)
+
+    def test_word_grouped_header_near_miss_is_retained(self) -> None:
+        fixture = MICRO_FIXTURE_DIR / "64e45033.pdf"
+        if not fixture.exists():
+            self.skipTest("Microeconomics Tax Equity fixture PDF not available")
+
+        modified = io.BytesIO()
+        with pikepdf.open(fixture) as pdf:
+            tables = [
+                node
+                for node in _iter_tables(pdf.Root["/StructTreeRoot"])
+                if node.get("/S") == "/Table"
+            ]
+            first_header = tables[3]["/K"][0]["/K"][0]
+            first_header["/K"] = pikepdf.Array([first_header["/K"][0], 999])
+            pdf.save(modified)
+
+        repaired, result = repair_layout_tables(modified.getvalue())
+
+        self.assertFalse(
+            any("Word grouped headers" in action for action in result.actions)
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            tables = [
+                node
+                for node in _iter_tables(pdf.Root["/StructTreeRoot"])
+                if node.get("/S") == "/Table"
+            ]
+            self.assertEqual(len(tables), 1)
+            self.assertEqual(
+                [len(row["/K"]) for row in tables[0]["/K"]],
+                [5, 8, 8, 8, 8],
+            )
+
+    def test_real_pdf_lib_overlapping_layout_tables_are_unwrapped(self) -> None:
+        if not COLLEGE_ALGEBRA_FIXTURE.exists():
+            self.skipTest("College Algebra Graphing Polynomial Functions fixture unavailable")
+
+        original = COLLEGE_ALGEBRA_FIXTURE.read_bytes()
+        repaired, result = repair_layout_tables(original)
+        audit = audit_pdf_bytes(repaired)
+
+        self.assertEqual(result.unwrapped_grid, 2)
+        self.assertEqual(result.ambiguous_tables, 0)
+        self.assertTrue(
+            all(
+                f"table{index}: unwrapped overlapping pdf-lib layout to /Sect"
+                in result.actions
+                for index in (1, 2)
+            )
+        )
+        self.assertEqual(audit.tables_with_inconsistent_row_widths, [])
+        self.assertEqual(
+            audit.logical_row_widths,
+            {
+                "table1": [11] * 11,
+            },
+        )
+        with pikepdf.open(io.BytesIO(original)) as before, pikepdf.open(
+            io.BytesIO(repaired)
+        ) as after:
+            tables = [
+                node
+                for node in _iter_tables(after.Root["/StructTreeRoot"])
+                if node.get("/S") == "/Table"
+            ]
+            self.assertEqual(len(tables), 1)
+            self.assertEqual(_logical_row_widths(_table_rows_and_cells(tables[0])[0]), [11] * 11)
+            self.assertEqual(
+                [bytes(page.obj["/Contents"]) for page in before.pages],
+                [bytes(page.obj["/Contents"]) for page in after.pages],
+            )
+        self.assertEqual(repair_layout_tables(repaired)[0], repaired)
+
+    def test_pdf_lib_overlapping_layout_signature_is_unwrapped(self) -> None:
+        repaired, result = repair_layout_tables(_make_pdf_lib_overlapping_table())
+
+        self.assertEqual(result.unwrapped_grid, 1)
+        self.assertEqual(audit_pdf_bytes(repaired).table_count, 0)
+        self.assertEqual(repair_layout_tables(repaired)[0], repaired)
+
+    def test_pdf_lib_overlapping_layout_near_miss_is_retained(self) -> None:
+        repaired, result = repair_layout_tables(
+            _make_pdf_lib_overlapping_table(valid_indices=False)
+        )
+
+        self.assertEqual(result.unwrapped_grid, 0)
+        self.assertEqual(result.ambiguous_tables, 1)
+        self.assertEqual(audit_pdf_bytes(repaired).table_count, 1)
 
     def test_financial_accounting_ch2_previews_get_headers(self) -> None:
         if not FIXTURE_DIR.exists():

@@ -268,6 +268,144 @@ def serialize(value: Any) -> Any:
     return str(value)
 
 
+def _category_keys(value: object) -> set[str]:
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = re.split(r"[;,]", str(value or ""))
+    return {
+        re.sub(r"[^a-z0-9]", "", normalized(item))
+        for item in values
+        if normalized(item)
+    }
+
+
+def _audit_category_diagnostics(
+    audit: dict[str, Any] | None,
+    category: str,
+) -> dict[str, Any]:
+    if not audit:
+        return {"status": "unverifiable", "reason": "post-sweep audit unavailable"}
+    if not audit.get("table_count"):
+        return {
+            "status": "unverifiable",
+            "reason": "post-sweep structure contains no /Table",
+        }
+    if category == "tablesheaders":
+        lacking_headers = audit.get("tables_without_th", 0)
+        explicit_headers = bool(audit.get("data_cells_with_explicit_headers"))
+        id_residuals = (
+            (audit.get("tables_th_missing_id") or [])
+            + (audit.get("tables_th_duplicate_id") or [])
+            if explicit_headers
+            else []
+        )
+        header_residuals = {
+            "tablesWithoutTh": lacking_headers,
+            "thMissingScope": audit.get("tables_th_missing_scope") or [],
+            "thInvalidScope": audit.get("tables_th_invalid_scope") or [],
+            "thMissingId": audit.get("tables_th_missing_id") or [],
+            "thDuplicateId": audit.get("tables_th_duplicate_id") or [],
+            "dataCellsMissingHeaders": audit.get("data_cells_missing_headers") or [],
+            "dataCellsMalformedHeaders": audit.get("data_cells_malformed_headers")
+            or [],
+            "dataCellsUnresolvedHeaders": audit.get(
+                "data_cells_unresolved_headers"
+            )
+            or [],
+        }
+        residual_values = {
+            **header_residuals,
+            "idsRequiredButInvalid": id_residuals,
+        }
+        return {
+            "status": (
+                "residual"
+                if any(
+                    value
+                    for key, value in residual_values.items()
+                    if key
+                    not in {"dataCellsMissingHeaders", "thMissingId", "thDuplicateId"}
+                )
+                or bool(id_residuals)
+                else "resolved"
+            ),
+            **header_residuals,
+            "idsRequiredForAssociations": explicit_headers,
+            "criterion": (
+                "no /Table lacks /TH; usable TH scope; explicit /Headers resolve; "
+                "TH IDs are required only for explicit associations"
+            ),
+        }
+    if category == "tablesregularity":
+        invalid_roles = audit.get("invalid_row_child_roles") or []
+        inconsistent_widths = audit.get("tables_with_inconsistent_row_widths") or []
+        residual = bool(invalid_roles or inconsistent_widths)
+        return {
+            "status": "residual" if residual else "resolved",
+            "invalidRowChildRoles": invalid_roles,
+            "tablesWithInconsistentRowWidths": inconsistent_widths,
+            "logicalRowWidths": audit.get("logical_row_widths") or {},
+            "criterion": "derivable rows have valid direct roles and consistent widths",
+        }
+    return {"status": "untracked"}
+
+
+def build_residual_diagnostics(
+    sweep_result: dict[str, Any],
+    failed_categories: object,
+) -> dict[str, Any]:
+    """Return nonblocking, per-PDF residual telemetry for issue-map sweeps."""
+    repairs = sweep_result.get("repairs") or {}
+    layout = repairs.get("layoutTable")
+    layout = layout if isinstance(layout, dict) else {}
+    audit = repairs.get("auditAfterRepairs")
+    audit = audit if isinstance(audit, dict) else None
+    categories = _category_keys(failed_categories)
+    tracked_categories: dict[str, dict[str, Any]] = {}
+    if "tablesheaders" in categories:
+        tracked_categories["Tables Headers"] = _audit_category_diagnostics(
+            audit, "tablesheaders"
+        )
+    if "tablesregularity" in categories:
+        tracked_categories["Tables Regularity"] = _audit_category_diagnostics(
+            audit, "tablesregularity"
+        )
+    return {
+        "layoutTable": {
+            "unresolved": layout.get("unresolved") or [],
+            "conflicts": layout.get("conflicts") or [],
+        },
+        "postSweepAudit": audit,
+        "categories": tracked_categories,
+    }
+
+
+def classify_residual_status(
+    diagnostics: dict[str, Any],
+    warnings: list[str] | None = None,
+) -> tuple[str, str]:
+    """Classify execution separately from whether residuals remain."""
+    layout = diagnostics.get("layoutTable") or {}
+    layout_residual = bool(layout.get("unresolved") or layout.get("conflicts"))
+    category_values = (diagnostics.get("categories") or {}).values()
+    has_residual = layout_residual or any(
+        value.get("status") == "residual"
+        for value in category_values
+        if isinstance(value, dict)
+    )
+    has_unverifiable = any(
+        value.get("status") == "unverifiable"
+        for value in category_values
+        if isinstance(value, dict)
+    )
+    if has_residual:
+        return "residual", "swept-with-residuals"
+    if has_unverifiable:
+        return "unverifiable", "swept-unverifiable"
+    return "resolved", "swept-with-warnings" if warnings else "swept"
+
+
 def validate_pdf(pdf_bytes: bytes) -> dict[str, Any]:
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
         return {"open": True, "pages": len(pdf.pages)}
@@ -371,6 +509,9 @@ def main() -> int:
         "matched": len(matched),
         "downloaded": 0,
         "swept": 0,
+        "resolved": 0,
+        "residual": 0,
+        "unverifiable": 0,
         "failed": 0,
         "unmatched": len(unmatched),
     }
@@ -404,9 +545,15 @@ def main() -> int:
                 entry["secondPass"] = {"error": str(error)}
                 entry["warnings"].append(f"second pass validation failed: {error}")
             counts["swept"] += 1
-            entry["status"] = (
-                "swept-with-warnings" if entry["warnings"] else "swept"
+            entry["residualDiagnostics"] = build_residual_diagnostics(
+                sweep_result,
+                item["sourceIssueRow"].get("failed_categories"),
             )
+            result_kind, entry["status"] = classify_residual_status(
+                entry["residualDiagnostics"],
+                entry["warnings"],
+            )
+            counts[result_kind] += 1
         except Exception as error:
             counts["failed"] += 1
             entry["status"] = "failed"

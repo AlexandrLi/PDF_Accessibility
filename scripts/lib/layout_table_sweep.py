@@ -78,6 +78,12 @@ def _table_rows_and_cells(
 
 def _row_direct_cells(row: pikepdf.Dictionary) -> list[pikepdf.Dictionary]:
     kids = row.get("/K")
+    if isinstance(kids, pikepdf.Dictionary):
+        return (
+            [kids]
+            if kids.get("/S") in ("/TD", "/TH", "/Span")
+            else []
+        )
     if not isinstance(kids, pikepdf.Array):
         return []
     return [
@@ -240,6 +246,443 @@ def _logical_row_widths(rows: list[pikepdf.Dictionary]) -> list[int] | None:
     return widths
 
 
+def _has_exact_span(
+    cell: pikepdf.Dictionary,
+    key: str,
+    expected: int,
+) -> bool:
+    values = list(_attribute_values(cell, key))
+    if not values:
+        return expected == 1
+    parsed = [_as_positive_int(value) for value in values]
+    return (
+        all(value is not None for value in parsed)
+        and len(set(parsed)) == 1
+        and parsed[0] == expected
+    )
+
+
+def _is_empty_cell(cell: pikepdf.Dictionary) -> bool:
+    kids = cell.get("/K")
+    return kids is None or isinstance(kids, pikepdf.Array) and len(kids) == 0
+
+
+def _strict_header_references(cell: pikepdf.Dictionary) -> list[str] | None:
+    value = cell.get("/Headers")
+    if value is None:
+        return []
+    if not isinstance(value, pikepdf.Array):
+        return None
+    references = [str(item).strip() for item in value]
+    if any(not reference for reference in references):
+        return None
+    if len(set(references)) != len(references):
+        return None
+    return references
+
+
+def _neptune_process_present(table: pikepdf.Dictionary) -> bool:
+    processes = {
+        str(value).lstrip("/")
+        for value in _owner_attribute_values(table, "/ADBE_TableProcess", "/ADBE_Table")
+    }
+    return "Neptune" in processes
+
+
+def _word_row_cells_and_border(
+    row: pikepdf.Dictionary,
+) -> tuple[list[pikepdf.Dictionary], pikepdf.Dictionary] | None:
+    kids = row.get("/K")
+    if not isinstance(kids, pikepdf.Array) or len(kids) < 2:
+        return None
+    children = list(kids)
+    if not all(isinstance(child, pikepdf.Dictionary) for child in children):
+        return None
+    cells = children[:-1]
+    border = children[-1]
+    if (
+        not cells
+        or any(cell.get("/S") != "/TD" for cell in cells)
+        or border.get("/S") != "/Span"
+        or not isinstance(border.get("/K"), Integral)
+        or any(
+            key not in {"/Type", "/S", "/K", "/Pg", "/P"}
+            for key in border
+        )
+    ):
+        return None
+    return cells, border
+
+
+def _has_table_semantics(obj: pikepdf.Dictionary) -> bool:
+    return any(
+        obj.get(key) is not None
+        for key in (
+            "/A",
+            "/Attributes",
+            "/C",
+            "/Headers",
+            "/Scope",
+            "/RowSpan",
+            "/ColSpan",
+            "/Alt",
+            "/ActualText",
+        )
+    )
+
+
+def _is_word_layout_wrapper(
+    table: pikepdf.Dictionary,
+    rows: list[pikepdf.Dictionary],
+) -> bool:
+    if not rows or len(rows) > 2 or _has_table_semantics(table):
+        return False
+    row_parts = [_word_row_cells_and_border(row) for row in rows]
+    if any(parts is None for parts in row_parts):
+        return False
+    cell_rows = [parts[0] for parts in row_parts if parts is not None]
+    if any(_has_table_semantics(cell) for cells in cell_rows for cell in cells):
+        return False
+    if sum(
+        _descendant_mcid_count(cell)
+        for cells in cell_rows
+        for cell in cells
+    ) < 20:
+        return False
+    if len(cell_rows) == 1:
+        return len(cell_rows[0]) in {2, 3}
+    return [len(cells) for cells in cell_rows] == [2, 1]
+
+
+def _descendant_mcid_count(obj: pikepdf.Object) -> int:
+    if isinstance(obj, Integral):
+        return 1
+    if not isinstance(obj, pikepdf.Dictionary):
+        return 0
+    count = 1 if obj.get("/MCID") is not None else 0
+    kids = obj.get("/K")
+    values = list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+    return count + sum(
+        _descendant_mcid_count(value)
+        for value in values
+        if value is not None
+    )
+
+
+def _prepare_word_grouped_header_table(
+    table: pikepdf.Dictionary,
+    rows: list[pikepdf.Dictionary],
+    *,
+    conflicts: list[str],
+) -> bool:
+    if len(rows) < 4 or _has_table_semantics(table):
+        return False
+    row_parts = [_word_row_cells_and_border(row) for row in rows]
+    if any(parts is None for parts in row_parts):
+        return False
+    cell_rows = [parts[0] for parts in row_parts if parts is not None]
+    if any(_has_table_semantics(cell) for cells in cell_rows for cell in cells):
+        return False
+
+    header_width = len(cell_rows[0])
+    body_widths = [len(cells) for cells in cell_rows[1:]]
+    if (
+        header_width < 3
+        or len(set(body_widths)) != 1
+        or body_widths[0] <= header_width
+        or (body_widths[0] - 1) % (header_width - 1)
+    ):
+        return False
+    group_span = (body_widths[0] - 1) // (header_width - 1)
+    if group_span < 2:
+        return False
+    header_mcid_counts = [
+        _descendant_mcid_count(cell)
+        for cell in cell_rows[0]
+    ]
+    if header_mcid_counts[0] != 1 or any(
+        count <= 1 for count in header_mcid_counts[1:]
+    ):
+        return False
+
+    for row, (cells, border) in zip(
+        rows,
+        (parts for parts in row_parts if parts is not None),
+    ):
+        last_cell = cells[-1]
+        last_kid = last_cell.get("/K")
+        if isinstance(last_kid, pikepdf.Array):
+            last_cell["/K"] = pikepdf.Array([*last_kid, border])
+        elif last_kid is None:
+            last_cell["/K"] = pikepdf.Array([border])
+        else:
+            last_cell["/K"] = pikepdf.Array([last_kid, border])
+        last_objgen = getattr(last_cell, "objgen", None)
+        if isinstance(last_objgen, tuple) and last_objgen != (0, 0):
+            border["/P"] = last_cell
+        row["/K"] = pikepdf.Array(cells)
+
+    first_row = cell_rows[0]
+    for cell_index, cell in enumerate(first_row):
+        desired_span = 1 if cell_index == 0 else group_span
+        if desired_span > 1:
+            cell["/A"] = pikepdf.Dictionary(
+                {
+                    "/O": pikepdf.Name("/Table"),
+                    "/ColSpan": desired_span,
+                }
+            )
+        _promote_to_th(
+            cell,
+            scope="Column",
+            conflicts=conflicts,
+            changed=[False],
+        )
+    for cell in cell_rows[1]:
+        _promote_to_th(
+            cell,
+            scope="Column",
+            conflicts=conflicts,
+            changed=[False],
+        )
+    return True
+
+
+def _canonicalize_neptune_placeholders(
+    table: pikepdf.Dictionary,
+    rows: list[pikepdf.Dictionary],
+    *,
+    index: int,
+    unresolved: list[str],
+) -> bool:
+    """Remove only proven empty header placeholders from one Neptune pattern."""
+    if not _neptune_process_present(table) or len(rows) != 2:
+        return False
+
+    first_row = _row_direct_cells(rows[0])
+    data_row = _row_direct_cells(rows[1])
+    if len(first_row) != 4 or len(data_row) != 4:
+        return False
+    if any(cell.get("/S") != "/TH" for cell in first_row):
+        return False
+    if not (
+        _is_empty_cell(first_row[1])
+        and _is_empty_cell(first_row[3])
+        and not _is_empty_cell(first_row[0])
+        and not _is_empty_cell(first_row[2])
+    ):
+        return False
+
+    declared_columns = _single_nonnegative_attribute(
+        list(_owner_attribute_values(table, "/ADBE_NumCol", "/Table"))
+    )
+    if declared_columns != 4:
+        return False
+
+    proof_failed = False
+    declared_rows = _single_nonnegative_attribute(
+        list(_owner_attribute_values(table, "/ADBE_NumRow", "/Table"))
+    )
+    if declared_rows is not None and declared_rows != len(rows):
+        proof_failed = True
+
+    real_headers = (first_row[0], first_row[2])
+    expected_indices = (0, 2)
+    for cell, expected_index in zip(real_headers, expected_indices):
+        if not _has_exact_span(cell, "/ColSpan", 2) or not _has_exact_span(
+            cell, "/RowSpan", 1
+        ):
+            proof_failed = True
+        values = list(_owner_attribute_values(cell, "/ADBE_ColIndex", "/Table"))
+        if _single_nonnegative_attribute(values) != expected_index:
+            proof_failed = True
+
+    real_indices = [
+        _single_nonnegative_attribute(
+            list(_owner_attribute_values(cell, "/ADBE_ColIndex", "/Table"))
+        )
+        for cell in real_headers
+    ]
+    if (
+        any(index_value is None for index_value in real_indices)
+        or len(set(real_indices)) != len(real_indices)
+        or any(
+            index_value < 0 or index_value + 2 > declared_columns
+            for index_value in real_indices
+            if index_value is not None
+        )
+        or {
+            column
+            for index_value in real_indices
+            if index_value is not None
+            for column in range(index_value, index_value + 2)
+        }
+        != set(range(declared_columns))
+    ):
+        proof_failed = True
+
+    placeholder_indices: list[int] = []
+    placeholder_ids: list[str] = []
+    for placeholder in (first_row[1], first_row[3]):
+        if not _has_exact_span(placeholder, "/ColSpan", 1) or not _has_exact_span(
+            placeholder, "/RowSpan", 1
+        ):
+            proof_failed = True
+        placeholder_id = str(placeholder.get("/ID") or "").strip()
+        if not placeholder_id or str(placeholder.get("/Scope") or "").lstrip(
+            "/"
+        ) != "Column":
+            proof_failed = True
+        else:
+            placeholder_ids.append(placeholder_id)
+        if any(
+            key not in {"/Type", "/S", "/K", "/Pg", "/P", "/ID", "/Scope"}
+            for key in placeholder
+        ):
+            proof_failed = True
+        values = list(_owner_attribute_values(placeholder, "/ADBE_ColIndex", "/Table"))
+        if values:
+            placeholder_index = _single_nonnegative_attribute(values)
+            if placeholder_index is None:
+                proof_failed = True
+            else:
+                placeholder_indices.append(placeholder_index)
+
+    if len(set(placeholder_indices)) != len(placeholder_indices) or any(
+        placeholder_index not in set(range(declared_columns))
+        for placeholder_index in placeholder_indices
+    ):
+        proof_failed = True
+    if any(
+        placeholder_index in set(expected_indices)
+        for placeholder_index in placeholder_indices
+    ):
+        proof_failed = True
+
+    if any(
+        not _has_exact_span(cell, "/ColSpan", 1)
+        or not _has_exact_span(cell, "/RowSpan", 1)
+        for cell in data_row
+    ):
+        proof_failed = True
+
+    if len(set(placeholder_ids)) != len(placeholder_ids):
+        proof_failed = True
+
+    placeholder_replacements = dict(zip(placeholder_ids, ("", "")))
+    if len(placeholder_replacements) == 2:
+        real_ids = [
+            str(cell.get("/ID") or "").strip()
+            for cell in real_headers
+        ]
+        if any(not cell_id for cell_id in real_ids) or len(set(real_ids)) != 2:
+            proof_failed = True
+        else:
+            placeholder_replacements = dict(
+                zip(placeholder_ids, real_ids)
+            )
+            planned_headers: dict[int, list[str]] = {}
+            all_cells = _table_rows_and_cells(table)[1]
+            data_cell_indices = {
+                getattr(cell, "objgen", None): data_index
+                for data_index, cell in enumerate(data_row)
+                if isinstance(getattr(cell, "objgen", None), tuple)
+                and getattr(cell, "objgen", None) != (0, 0)
+            }
+            for cell in all_cells:
+                raw_headers = cell.get("/Headers")
+                if raw_headers is None:
+                    continue
+                references = _strict_header_references(cell)
+                if references is None:
+                    proof_failed = True
+                    continue
+                for reference in references:
+                    if reference not in placeholder_replacements:
+                        continue
+                    matching_data_index = data_cell_indices.get(
+                        getattr(cell, "objgen", None)
+                    )
+                    if matching_data_index is None:
+                        matching_data_index = next(
+                            (
+                                data_index
+                                for data_index, data_cell in enumerate(data_row)
+                                if data_cell is cell
+                            ),
+                            None,
+                        )
+                    expected_placeholder = (
+                        placeholder_ids[0]
+                        if matching_data_index == 1
+                        else placeholder_ids[1]
+                        if matching_data_index == 3
+                        else None
+                    )
+                    if reference != expected_placeholder:
+                        proof_failed = True
+
+            for data_index, cell in enumerate(data_row):
+                references = _strict_header_references(cell)
+                if references is None:
+                    proof_failed = True
+                    continue
+                expected_placeholder = (
+                    placeholder_ids[0]
+                    if data_index == 1
+                    else placeholder_ids[1]
+                    if data_index == 3
+                    else None
+                )
+                if expected_placeholder is not None and expected_placeholder not in references:
+                    proof_failed = True
+                if expected_placeholder is None and any(
+                    reference in placeholder_replacements
+                    for reference in references
+                ):
+                    proof_failed = True
+                rewritten = [
+                    placeholder_replacements.get(reference, reference)
+                    for reference in references
+                ]
+                if len(set(rewritten)) != len(rewritten):
+                    proof_failed = True
+                planned_headers[id(cell)] = rewritten
+    else:
+        planned_headers = {}
+
+    if proof_failed:
+        unresolved.append(
+            f"table{index}: Neptune placeholder canonicalization proof incomplete or conflicting; retained"
+        )
+        return False
+
+    canonical_rows = [
+        [first_row[0], first_row[2]],
+        data_row,
+    ]
+    logical_widths = _logical_row_widths(
+        [
+            pikepdf.Dictionary({"/K": pikepdf.Array(cells)})
+            for cells in canonical_rows
+        ]
+    )
+    if logical_widths != [declared_columns, declared_columns]:
+        unresolved.append(
+            f"table{index}: Neptune placeholder removal did not produce one regular grid; retained"
+        )
+        return False
+
+    rows[0]["/K"] = pikepdf.Array(canonical_rows[0])
+    for cell in data_row:
+        references = planned_headers.get(id(cell))
+        if references is not None:
+            cell["/Headers"] = pikepdf.Array(
+                [pikepdf.String(reference) for reference in references]
+            )
+    return True
+
+
 def _is_adobe_layout_table(
     table: pikepdf.Dictionary,
     rows: list[pikepdf.Dictionary],
@@ -321,6 +764,60 @@ def _is_adobe_layout_table(
         )
         for item in grid
     )
+
+
+def _is_pdf_lib_overlapping_layout_table(
+    rows: list[pikepdf.Dictionary],
+) -> bool:
+    if len(rows) != 3 or _logical_row_widths(rows) != [2, 4, 4]:
+        return False
+    cell_rows = [_row_direct_cells(row) for row in rows]
+    if [len(cells) for cells in cell_rows] != [2, 2, 2]:
+        return False
+    if [
+        [str(cell.get("/S")) for cell in cells]
+        for cells in cell_rows
+    ] != [["/TH", "/TH"], ["/TD", "/TD"], ["/TH", "/TD"]]:
+        return False
+
+    top_row_spans = [
+        _span(cell, "/RowSpan", conflicts=[], label="pdf-lib top header")
+        for cell in cell_rows[0]
+    ]
+    if (
+        len(set(top_row_spans)) != 1
+        or top_row_spans[0] < len(rows)
+        or any(
+            _span(cell, "/RowSpan", conflicts=[], label="pdf-lib body cell") != 1
+            for cells in cell_rows[1:]
+            for cell in cells
+        )
+        or any(
+            _span(cell, "/ColSpan", conflicts=[], label="pdf-lib cell") != 1
+            for cells in cell_rows
+            for cell in cells
+        )
+    ):
+        return False
+
+    column_indices: list[list[int]] = []
+    for cells in cell_rows:
+        row_indices: list[int] = []
+        for cell in cells:
+            index = _single_nonnegative_attribute(
+                list(_owner_attribute_values(cell, "/ADBE_ColIndex", "/Table"))
+            )
+            if index is None or not list(
+                _owner_attribute_values(
+                    cell,
+                    "/ADBE_Confidence",
+                    "/ADBE_Table",
+                )
+            ):
+                return False
+            row_indices.append(index)
+        column_indices.append(row_indices)
+    return column_indices == [[0, 1], [1, 0], [0, 1]]
 
 
 def _remove_key(obj: pikepdf.Dictionary, key: str) -> None:
@@ -706,6 +1203,9 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
         struct_root = pdf.Root.get("/StructTreeRoot")
         if not isinstance(struct_root, pikepdf.Dictionary):
             return pdf_bytes, LayoutTableRepairResult(0, 0, 0, 0, [], [], [], 0)
+        producer = str(pdf.docinfo.get("/Producer") or "")
+        is_word_2010 = producer == "Microsoft® Word 2010"
+        is_pdf_lib = producer.startswith("pdf-lib ")
         tables = [
             node for node in _iter_dict_nodes(struct_root) if node.get("/S") == "/Table"
         ]
@@ -727,6 +1227,24 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                     unresolved.append(f"table{index}: marked layout has no cells; retained")
                 continue
 
+            if is_word_2010 and _is_word_layout_wrapper(table, rows):
+                _unwrap_grid_table(table, rows, cells)
+                unwrapped_grid += 1
+                changed = True
+                actions.append(
+                    f"table{index}: unwrapped proven Word comparison layout to /Sect"
+                )
+                continue
+
+            if is_pdf_lib and _is_pdf_lib_overlapping_layout_table(rows):
+                _unwrap_grid_table(table, rows, cells)
+                unwrapped_grid += 1
+                changed = True
+                actions.append(
+                    f"table{index}: unwrapped overlapping pdf-lib layout to /Sect"
+                )
+                continue
+
             if _is_adobe_layout_table(table, rows, cells):
                 _unwrap_grid_table(table, rows, cells)
                 unwrapped_grid += 1
@@ -735,6 +1253,29 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                     f"table{index}: unwrapped Adobe auto-tagged layout to /Sect"
                 )
                 continue
+
+            if _canonicalize_neptune_placeholders(
+                table,
+                rows,
+                index=index,
+                unresolved=unresolved,
+            ):
+                changed = True
+                actions.append(
+                    f"table{index}: removed proven Neptune empty header placeholders"
+                )
+                rows, cells = _table_rows_and_cells(table)
+
+            if is_word_2010 and _prepare_word_grouped_header_table(
+                table,
+                rows,
+                conflicts=conflicts,
+            ):
+                changed = True
+                actions.append(
+                    f"table{index}: normalized Word grouped headers and border spans"
+                )
+                rows, cells = _table_rows_and_cells(table)
 
             table_changed = [False]
             _ensure_summary(table, index, table_changed)

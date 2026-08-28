@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import asdict, dataclass, field
+from numbers import Integral
 
 import pikepdf
 
@@ -20,6 +21,17 @@ class PdfA11yAudit:
     table_count: int
     tables_without_summary: int
     tables_without_th: int
+    tables_th_missing_scope: list[str] = field(default_factory=list)
+    tables_th_invalid_scope: list[str] = field(default_factory=list)
+    tables_th_missing_id: list[str] = field(default_factory=list)
+    tables_th_duplicate_id: list[str] = field(default_factory=list)
+    data_cells_missing_headers: list[str] = field(default_factory=list)
+    data_cells_with_explicit_headers: list[str] = field(default_factory=list)
+    data_cells_malformed_headers: list[str] = field(default_factory=list)
+    data_cells_unresolved_headers: list[str] = field(default_factory=list)
+    invalid_row_child_roles: list[str] = field(default_factory=list)
+    tables_with_inconsistent_row_widths: list[str] = field(default_factory=list)
+    logical_row_widths: dict[str, list[int]] = field(default_factory=dict)
     struct_tree_root_present: bool = False
     parent_tree_present: bool = False
     pages_with_struct_parents: int = 0
@@ -55,6 +67,109 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
     table_count = 0
     tables_without_summary = 0
     tables_without_th = 0
+    tables_th_missing_scope: list[str] = []
+    tables_th_invalid_scope: list[str] = []
+    tables_th_missing_id: list[str] = []
+    tables_th_duplicate_id: list[str] = []
+    th_ids: list[tuple[str, str]] = []
+    data_cells_missing_headers: list[str] = []
+    data_cells_with_explicit_headers: list[str] = []
+    data_cells_malformed_headers: list[str] = []
+    data_cells_unresolved_headers: list[str] = []
+    data_cells_for_headers: list[tuple[str, object]] = []
+    invalid_row_child_roles: list[str] = []
+    tables_with_inconsistent_row_widths: list[str] = []
+    logical_row_widths: dict[str, list[int]] = {}
+
+    def direct_kids(obj: pikepdf.Dictionary) -> list[pikepdf.Object]:
+        kids = obj.get("/K")
+        if isinstance(kids, pikepdf.Array):
+            return list(kids)
+        return [kids] if kids is not None else []
+
+    def descendant_dicts(obj: pikepdf.Object) -> list[pikepdf.Dictionary]:
+        if not isinstance(obj, pikepdf.Dictionary):
+            return []
+        descendants = [obj]
+        for kid in direct_kids(obj):
+            descendants.extend(descendant_dicts(kid))
+        return descendants
+
+    def pdf_string(value: object) -> str | None:
+        if isinstance(value, pikepdf.String):
+            return str(value).strip()
+        if isinstance(value, str):
+            return value.strip()
+        return None
+
+    def pdf_name(value: object) -> str | None:
+        if isinstance(value, pikepdf.Name):
+            return str(value).lstrip("/").strip()
+        return None
+
+    def span_value(cell: pikepdf.Dictionary, key: str) -> int | None:
+        values: list[object] = []
+        for container_key in (key, "/Attributes", "/A"):
+            value = cell.get(container_key)
+            candidates = list(value) if isinstance(value, pikepdf.Array) else [value]
+            for candidate in candidates:
+                if container_key == key and candidate is not None:
+                    values.append(candidate)
+                elif isinstance(candidate, pikepdf.Dictionary):
+                    nested = candidate.get(key)
+                    if nested is not None:
+                        values.append(nested)
+        if not values:
+            return 1
+        parsed: list[int] = []
+        for value in values:
+            if isinstance(value, Integral):
+                number = int(value)
+            else:
+                try:
+                    number = int(str(value))
+                except (TypeError, ValueError):
+                    return None
+            if number < 1:
+                return None
+            parsed.append(number)
+        return parsed[0] if len(set(parsed)) == 1 else None
+
+    def derive_row_widths(
+        rows: list[pikepdf.Dictionary],
+    ) -> list[int] | None:
+        if not rows:
+            return None
+        occupied: dict[int, int] = {}
+        widths = [0] * len(rows)
+        for row_index, row in enumerate(rows):
+            cells = [
+                kid
+                for kid in direct_kids(row)
+                if isinstance(kid, pikepdf.Dictionary)
+                and kid.get("/S") in ("/TD", "/TH")
+            ]
+            if not cells or len(cells) != len(direct_kids(row)):
+                return None
+            column = 0
+            for cell in cells:
+                while occupied.get(column, -1) >= row_index:
+                    column += 1
+                col_span = span_value(cell, "/ColSpan")
+                row_span = span_value(cell, "/RowSpan")
+                if col_span is None or row_span is None:
+                    return None
+                while any(
+                    occupied.get(candidate, -1) >= row_index
+                    for candidate in range(column, column + col_span)
+                ):
+                    column += 1
+                last_row = row_index + row_span - 1
+                for candidate in range(column, column + col_span):
+                    occupied[candidate] = max(occupied.get(candidate, -1), last_row)
+                column += col_span
+                widths[row_index] = max(widths[row_index], column)
+        return widths
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
         mark_info = pdf.Root.get("/MarkInfo")
@@ -103,28 +218,101 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
                 return
             if obj.get("/S") == "/Table":
                 table_count += 1
+                table_label = f"table{table_count}"
                 summary = obj.get("/Summary")
                 if summary is None or not str(summary).strip():
                     tables_without_summary += 1
-                th_count = 0
-
-                def count_cells(node: pikepdf.Object) -> None:
-                    nonlocal th_count
-                    if not isinstance(node, pikepdf.Dictionary):
-                        return
-                    if node.get("/S") == "/TH":
-                        th_count += 1
-                    kids = node.get("/K")
-                    if isinstance(kids, pikepdf.Array):
-                        for kid in kids:
-                            if isinstance(kid, pikepdf.Dictionary):
-                                count_cells(kid)
-                    elif isinstance(kids, pikepdf.Dictionary):
-                        count_cells(kids)
-
-                count_cells(obj)
+                descendants = descendant_dicts(obj)
+                th_nodes = [
+                    node for node in descendants if node.get("/S") == "/TH"
+                ]
+                th_count = len(th_nodes)
                 if th_count == 0:
                     tables_without_th += 1
+
+                for th_index, cell in enumerate(th_nodes, start=1):
+                    label = f"{table_label} TH {th_index}"
+                    raw_scope = cell.get("/Scope")
+                    scope = pdf_string(raw_scope) or pdf_name(raw_scope)
+                    if scope is None:
+                        if raw_scope is None:
+                            tables_th_missing_scope.append(label)
+                        else:
+                            tables_th_invalid_scope.append(label)
+                    elif scope.lstrip("/") not in {"Column", "Row"}:
+                        tables_th_invalid_scope.append(label)
+                    cell_id = pdf_string(cell.get("/ID"))
+                    if cell_id is None:
+                        tables_th_missing_id.append(label)
+                    else:
+                        th_ids.append((label, cell_id))
+
+                rows = [
+                    node
+                    for node in descendants
+                    if node.get("/S") == "/TR"
+                ]
+                direct_table_kids = direct_kids(obj)
+                for child_index, child in enumerate(direct_table_kids, start=1):
+                    if not isinstance(child, pikepdf.Dictionary) or child.get(
+                        "/S"
+                    ) != "/TR":
+                        role = (
+                            str(child.get("/S"))
+                            if isinstance(child, pikepdf.Dictionary)
+                            else str(child)
+                        )
+                        invalid_row_child_roles.append(
+                            f"{table_label} direct child {child_index}: "
+                            f"{role} (expected /TR)"
+                        )
+
+                for row_index, row in enumerate(rows, start=1):
+                    direct_children = direct_kids(row)
+                    for child_index, child in enumerate(direct_children, start=1):
+                        if not isinstance(child, pikepdf.Dictionary) or child.get(
+                            "/S"
+                        ) not in ("/TD", "/TH"):
+                            role = (
+                                str(child.get("/S"))
+                                if isinstance(child, pikepdf.Dictionary)
+                                else str(child)
+                            )
+                            invalid_row_child_roles.append(
+                                f"{table_label} row {row_index} child {child_index}: "
+                                f"{role} (expected /TD or /TH)"
+                            )
+
+                    for cell_index, cell in enumerate(direct_children, start=1):
+                        if not isinstance(cell, pikepdf.Dictionary) or cell.get(
+                            "/S"
+                        ) != "/TD":
+                            continue
+                        label = f"{table_label} row {row_index} TD {cell_index}"
+                        headers = cell.get("/Headers")
+                        data_cells_for_headers.append((label, headers))
+                        if headers is None:
+                            data_cells_missing_headers.append(label)
+                            continue
+                        data_cells_with_explicit_headers.append(label)
+                        if not isinstance(headers, pikepdf.Array) or not headers:
+                            data_cells_malformed_headers.append(label)
+                            continue
+                        malformed = False
+                        for reference in headers:
+                            if pdf_string(reference) is None or not pdf_string(
+                                reference
+                            ):
+                                malformed = True
+                                break
+                        if malformed:
+                            data_cells_malformed_headers.append(label)
+
+                widths = derive_row_widths(rows)
+                if widths is not None:
+                    logical_row_widths[table_label] = widths
+                    if len(set(widths)) > 1:
+                        tables_with_inconsistent_row_widths.append(table_label)
             kids = obj.get("/K")
             if isinstance(kids, pikepdf.Array):
                 for kid in kids:
@@ -137,6 +325,26 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
             walk_figures(struct_root)
             walk_tables(struct_root)
 
+    th_id_counts: dict[str, int] = {}
+    for _label, cell_id in th_ids:
+        th_id_counts[cell_id] = th_id_counts.get(cell_id, 0) + 1
+    for label, cell_id in th_ids:
+        if th_id_counts[cell_id] > 1:
+            tables_th_duplicate_id.append(f"{label}: {cell_id}")
+
+    valid_header_ids = {
+        cell_id for cell_id, count in th_id_counts.items() if count == 1
+    }
+    for label, headers in data_cells_for_headers:
+        if not isinstance(headers, pikepdf.Array):
+            continue
+        for reference in headers:
+            reference_text = pdf_string(reference)
+            if reference_text is not None and reference_text not in valid_header_ids:
+                data_cells_unresolved_headers.append(
+                    f"{label}: {reference_text or str(reference)}"
+                )
+
     return PdfA11yAudit(
         marked=marked,
         figure_count=figure_index,
@@ -145,6 +353,17 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         table_count=table_count,
         tables_without_summary=tables_without_summary,
         tables_without_th=tables_without_th,
+        tables_th_missing_scope=tables_th_missing_scope,
+        tables_th_invalid_scope=tables_th_invalid_scope,
+        tables_th_missing_id=tables_th_missing_id,
+        tables_th_duplicate_id=tables_th_duplicate_id,
+        data_cells_missing_headers=data_cells_missing_headers,
+        data_cells_with_explicit_headers=data_cells_with_explicit_headers,
+        data_cells_malformed_headers=data_cells_malformed_headers,
+        data_cells_unresolved_headers=data_cells_unresolved_headers,
+        invalid_row_child_roles=invalid_row_child_roles,
+        tables_with_inconsistent_row_widths=tables_with_inconsistent_row_widths,
+        logical_row_widths=logical_row_widths,
         struct_tree_root_present=tagged_content.struct_tree_root_present,
         parent_tree_present=tagged_content.parent_tree_present,
         pages_with_struct_parents=tagged_content.pages_with_struct_parents,

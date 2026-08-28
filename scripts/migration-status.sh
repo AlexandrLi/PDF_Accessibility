@@ -22,11 +22,8 @@ if [ -f ".env.migrate" ]; then
   source .env.migrate
 fi
 
-if [ ! -d ".venv" ]; then
-  python3 -m venv .venv
-fi
-# shellcheck disable=SC1091
-source .venv/bin/activate
-pip install -q -r scripts/requirements-migrate.txt
-
-exec python3 scripts/migration_status.py --course-id "$COURSE_ID" --env "$ENV" "${@:3}"
+exec "$ROOT/scripts/with-a11y-python.sh" \
+  "$ROOT/scripts/migration_status.py" \
+  --course-id "$COURSE_ID" \
+  --env "$ENV" \
+  "${@:3}"
