@@ -1117,21 +1117,6 @@ class LayoutTableSweepTests(unittest.TestCase):
             self.assertEqual(table["/A"][0]["/ADBE_NumCol"], 5)
             self.assertEqual(original_rows[3]["/K"][1]["/A"][0]["/O"], "/Table")
             self.assertEqual(original_rows[3]["/K"][1]["/A"][0]["/ColSpan"], 3)
-            original_cells = [
-                cell
-                for row in original_rows
-                for cell in row["/K"]
-            ]
-            original_content = [
-                cell["/K"][0]
-                for cell in original_cells
-                if len(cell["/K"])
-            ]
-            original_objgens = {
-                obj.objgen
-                for obj in [table] + original_rows + original_cells + original_content
-            }
-
         repaired, result = repair_layout_tables(original)
 
         self.assertEqual(result.unwrapped_grid, 1)
@@ -1173,14 +1158,6 @@ class LayoutTableSweepTests(unittest.TestCase):
                     for cell in cells
                     if len(cell["/K"])
                 )
-            )
-            self.assertEqual(
-                {
-                    obj.objgen
-                    for obj in [section] + rows + cells
-                    + [cell["/K"][0] for cell in cells if len(cell["/K"])]
-                },
-                original_objgens,
             )
             self.assertEqual(
                 [

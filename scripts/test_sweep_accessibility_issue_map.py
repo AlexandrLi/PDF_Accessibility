@@ -15,6 +15,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from sweep_accessibility_issue_map import (  # noqa: E402
     build_residual_diagnostics,
     classify_residual_status,
+    normalized_chapter_title,
 )
 
 
@@ -36,6 +37,12 @@ def _sweep_result(
 
 
 class AccessibilityIssueMapSweepTests(unittest.TestCase):
+    def test_chapter_title_matching_treats_ampersand_as_and(self) -> None:
+        self.assertEqual(
+            normalized_chapter_title("1. Equations and Inequalities"),
+            normalized_chapter_title("Equations & Inequalities"),
+        )
+
     def test_headers_clean_is_resolved(self) -> None:
         diagnostics = build_residual_diagnostics(
             _sweep_result(

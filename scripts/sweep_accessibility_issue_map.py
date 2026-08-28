@@ -10,37 +10,32 @@ from __future__ import annotations
 
 import argparse
 import csv
-import io
 import json
 import re
 import sys
 import unicodedata
-from dataclasses import asdict, is_dataclass
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import boto3
-import pikepdf
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from lib.bookmark_sweep import repair_bookmarks  # noqa: E402
-from lib.character_encoding_sweep import repair_character_encoding  # noqa: E402
-from lib.config import channels_bucket  # noqa: E402
-from lib.figure_alt_sweep import repair_missing_figure_alt  # noqa: E402
-from lib.heading_nesting_sweep import repair_heading_nesting  # noqa: E402
-from lib.inline_formula_sweep import repair_inline_formula_figures  # noqa: E402
-from lib.layout_table_sweep import repair_layout_tables  # noqa: E402
-from lib.marked_content_actualtext_sweep import (  # noqa: E402
-    repair_marked_content_actualtext,
+from lib.accessibility_course_workflow import (  # noqa: E402
+    pipeline_fingerprint,
+    prepare_pdf,
+    run_sweeps,
+    serialize,
+    sha256_bytes,
+    validate_pdf,
 )
-from lib.pdf_a11y_audit import audit_pdf_bytes  # noqa: E402
-from lib.tab_order_sweep import repair_tab_order  # noqa: E402
-from lib.tagged_annotation_sweep import repair_tagged_annotations  # noqa: E402
-from lib.tagged_content_sweep import repair_tagged_content  # noqa: E402
+from lib.channels_paths import load_course_json, preview_key  # noqa: E402
+from lib.config import channels_bucket  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +60,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--original-dir", help="Override the grouped originals directory")
     parser.add_argument("--swept-dir", help="Override the grouped re-swept directory")
     parser.add_argument("--report", help="Override the generated JSON report path")
+    parser.add_argument("--manifest", help="Override the compact manifest path")
+    parser.add_argument("--diagnostics-dir", help="Override per-topic diagnostics directory")
+    parser.add_argument("--review-queue", help="Override the compact review queue path")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Maximum parallel downloads and PDF preparations",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse verified outputs when source and pipeline fingerprints match",
+    )
     return parser.parse_args()
 
 
@@ -81,6 +90,7 @@ def normalized_chapter_title(value: object) -> str:
     text = normalized(value)
     text = re.sub(r"^\d+\.\s*", "", text)
     text = re.sub(r"^review\s+\d+\s*[:\-]?\s*", "", text)
+    text = text.replace("&", "and")
     return re.sub(r"[^a-z0-9]+", "", text)
 
 
@@ -173,28 +183,31 @@ def resolve_topics(
             topic_id = reference.get("id")
             if topic_id:
                 toc_topic_chapters.setdefault(topic_id, []).append(chapter)
+    topics_by_title: dict[str, list[str]] = {}
+    for topic_id, topic in topics.items():
+        topics_by_title.setdefault(normalized(topic.get("title")), []).append(topic_id)
+    chapter_titles_by_topic = {
+        topic_id: {
+            normalized_chapter_title(chapter.get("title"))
+            for chapter in chapters
+        }
+        for topic_id, chapters in toc_topic_chapters.items()
+    }
 
     matched: list[dict[str, Any]] = []
     unmatched: list[dict[str, Any]] = []
     for row in issue_rows:
         title = row.get("topic_title") or ""
-        title_matches = [
-            topic_id
-            for topic_id, topic in topics.items()
-            if normalized(topic.get("title")) == normalized(title)
-        ]
+        title_matches = topics_by_title.get(normalized(title), [])
         candidates = [
             topic_id for topic_id in title_matches if topic_id in toc_topic_chapters
         ]
         context_title = row.get("chapter_title") or ""
+        normalized_context = normalized_chapter_title(context_title)
         context_matches = [
             topic_id
             for topic_id in candidates
-            if any(
-                normalized_chapter_title(chapter.get("title"))
-                == normalized_chapter_title(context_title)
-                for chapter in toc_topic_chapters[topic_id]
-            )
+            if normalized_context in chapter_titles_by_topic[topic_id]
         ]
         if len(context_matches) != 1:
             options = []
@@ -238,8 +251,7 @@ def resolve_topics(
         chapter = next(
             chapter
             for chapter in toc_topic_chapters[topic_id]
-            if normalized_chapter_title(chapter.get("title"))
-            == normalized_chapter_title(context_title)
+            if normalized_chapter_title(chapter.get("title")) == normalized_context
         )
         matched.append(
             {
@@ -248,24 +260,10 @@ def resolve_topics(
                 "topicTitle": topic.get("title") or title,
                 "chapterId": chapter.get("id"),
                 "chapterTitle": chapter.get("title"),
-                "pdfKey": f"courses/{course_id}/topic_pdfs/{topic_id}.pdf",
+                "pdfKey": preview_key(course_id, topic_id),
             }
         )
     return matched, unmatched, toc_id
-
-
-def serialize(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        return value.to_dict()
-    if is_dataclass(value):
-        return asdict(value)
-    if isinstance(value, (list, tuple)):
-        return [serialize(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): serialize(item) for key, item in value.items()}
-    return str(value)
 
 
 def _category_keys(value: object) -> set[str]:
@@ -376,7 +374,6 @@ def build_residual_diagnostics(
             "unresolved": layout.get("unresolved") or [],
             "conflicts": layout.get("conflicts") or [],
         },
-        "postSweepAudit": audit,
         "categories": tracked_categories,
     }
 
@@ -406,75 +403,153 @@ def classify_residual_status(
     return "resolved", "swept-with-warnings" if warnings else "swept"
 
 
-def validate_pdf(pdf_bytes: bytes) -> dict[str, Any]:
-    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
-        return {"open": True, "pages": len(pdf.pages)}
-
-
-def run_sweeps(pdf_bytes: bytes) -> tuple[bytes, dict[str, Any]]:
-    current = pdf_bytes
-    repairs: dict[str, Any] = {}
-    warnings: list[str] = []
-    applied: list[str] = []
-    audit_before: dict[str, Any] | None = None
-
-    def run_stage(
-        name: str,
-        repair: Callable[[bytes], tuple[bytes, Any]],
-    ) -> Any | None:
-        nonlocal current
-        before = current
-        try:
-            current, result = repair(current)
-            repairs[name] = serialize(result)
-            if current != before:
-                applied.append(name)
-            return result
-        except Exception as error:
-            current = before
-            repairs[name] = None
-            warnings.append(f"{name} failed: {error}")
-            return None
-
-    run_stage("tabOrder", repair_tab_order)
-    run_stage("taggedContent", repair_tagged_content)
-    run_stage("taggedAnnotations", repair_tagged_annotations)
-
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
     try:
-        audit_before = audit_pdf_bytes(current).to_dict()
-        repairs["auditBeforeRepairs"] = audit_before
-    except Exception as error:
-        warnings.append(f"audit before repairs failed: {error}")
-        repairs["auditBeforeRepairs"] = None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
-    if audit_before and audit_before.get("figures_missing_alt"):
-        run_stage("figureAlt", repair_missing_figure_alt)
-    else:
-        repairs["figureAlt"] = {"skipped": "no missing figure alt reported"}
 
-    run_stage("inlineFormula", repair_inline_formula_figures)
-    run_stage("layoutTable", repair_layout_tables)
-    run_stage("markedContentActualText", repair_marked_content_actualtext)
-    run_stage("characterEncoding", repair_character_encoding)
-    run_stage("headingNesting", repair_heading_nesting)
-    run_stage("bookmarks", repair_bookmarks)
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
-    try:
-        final_audit = audit_pdf_bytes(current)
-        repairs["auditAfterRepairs"] = final_audit.to_dict()
-    except Exception as error:
-        repairs["auditAfterRepairs"] = None
-        warnings.append(f"audit after repairs failed: {error}")
 
-    return current, {
-        "appliedRepairs": applied,
-        "repairs": repairs,
-        "warnings": warnings,
+def _compact_topic(
+    entry: dict[str, Any],
+    *,
+    source_etag: str,
+    diagnostics_path: Path,
+) -> dict[str, Any]:
+    original = entry.get("originalValidation") or {}
+    swept = entry.get("reSweptValidation") or {}
+    render = entry.get("renderValidation") or {}
+    second = entry.get("secondPass") or {}
+    categories = {
+        name: value.get("status")
+        for name, value in (
+            (entry.get("residualDiagnostics") or {}).get("categories") or {}
+        ).items()
+        if isinstance(value, dict)
     }
+    return {
+        "topicId": entry.get("topicId"),
+        "topicTitle": entry.get("topicTitle"),
+        "chapterId": entry.get("chapterId"),
+        "pdfKey": entry.get("pdfKey"),
+        "originalPdf": entry.get("originalPdf"),
+        "reSweptPdf": entry.get("reSweptPdf"),
+        "sourceETag": source_etag,
+        "originalSha256": original.get("sha256"),
+        "reSweptSha256": swept.get("sha256"),
+        "originalBytes": original.get("bytes"),
+        "reSweptBytes": swept.get("bytes"),
+        "pages": swept.get("pages"),
+        "status": entry.get("status"),
+        "resultKind": entry.get("resultKind"),
+        "appliedRepairs": entry.get("appliedRepairs") or [],
+        "warnings": entry.get("warnings") or [],
+        "residualCategories": categories,
+        "renderIdentical": render.get("identical"),
+        "secondPassByteStable": second.get("byteStable"),
+        "secondPassExecuted": second.get("executed"),
+        "diagnostics": str(diagnostics_path),
+    }
+
+
+def _resume_topic(
+    topic: dict[str, Any] | None,
+    *,
+    pipeline: str,
+    manifest_pipeline: str | None,
+    source_etag: str,
+) -> bool:
+    if not topic or manifest_pipeline != pipeline:
+        return False
+    if topic.get("sourceETag") != source_etag:
+        return False
+    if topic.get("status") not in {
+        "swept",
+        "swept-with-warnings",
+        "swept-with-residuals",
+        "swept-unverifiable",
+    }:
+        return False
+    original_path = Path(str(topic.get("originalPdf") or ""))
+    swept_path = Path(str(topic.get("reSweptPdf") or ""))
+    if not original_path.is_file() or not swept_path.is_file():
+        return False
+    return (
+        sha256_bytes(original_path.read_bytes()) == topic.get("originalSha256")
+        and sha256_bytes(swept_path.read_bytes()) == topic.get("reSweptSha256")
+        and topic.get("renderIdentical") is True
+        and topic.get("secondPassByteStable") is True
+    )
+
+
+def _download_topic(
+    s3: Any,
+    bucket: str,
+    item: dict[str, Any],
+) -> tuple[dict[str, Any], str, bytes]:
+    head = s3.head_object(Bucket=bucket, Key=item["pdfKey"])
+    etag = str(head.get("ETag") or "").strip('"')
+    body = s3.get_object(Bucket=bucket, Key=item["pdfKey"])["Body"].read()
+    return item, etag, body
+
+
+def _prepare_downloads(
+    downloads: dict[str, tuple[dict[str, Any], str, bytes]],
+    workers: int,
+) -> tuple[dict[str, tuple[bytes, dict[str, Any]] | Exception], str]:
+    if not downloads:
+        return {}, "resume-only"
+    if workers == 1:
+        results: dict[str, tuple[bytes, dict[str, Any]] | Exception] = {}
+        for topic_id, (_item, _etag, pdf_bytes) in downloads.items():
+            try:
+                results[topic_id] = prepare_pdf(pdf_bytes)
+            except Exception as error:
+                results[topic_id] = error
+        return results, "serial"
+
+    try:
+        process_results: dict[str, tuple[bytes, dict[str, Any]] | Exception] = {}
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(prepare_pdf, pdf_bytes): topic_id
+                for topic_id, (_item, _etag, pdf_bytes) in downloads.items()
+            }
+            for future in as_completed(futures):
+                topic_id = futures[future]
+                try:
+                    process_results[topic_id] = future.result()
+                except Exception as error:
+                    process_results[topic_id] = error
+        return process_results, "process"
+    except (BrokenProcessPool, OSError, PermissionError):
+        thread_results: dict[str, tuple[bytes, dict[str, Any]] | Exception] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(prepare_pdf, pdf_bytes): topic_id
+                for topic_id, (_item, _etag, pdf_bytes) in downloads.items()
+            }
+            for future in as_completed(futures):
+                topic_id = futures[future]
+                try:
+                    thread_results[topic_id] = future.result()
+                except Exception as error:
+                    thread_results[topic_id] = error
+        return thread_results, "thread-fallback"
 
 
 def main() -> int:
     args = parse_args()
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
     run_at = datetime.now(timezone.utc)
     run_date = run_at.strftime("%Y%m%d")
     run_dir = Path(args.output_root) / args.course_id / run_date
@@ -486,16 +561,29 @@ def main() -> int:
         if args.report
         else Path("reports") / f"{args.course_id}-issue-map-sweep-{run_date}.json"
     )
+    manifest_path = (
+        Path(args.manifest)
+        if args.manifest
+        else report_path.with_name(f"{report_path.stem}.manifest.json")
+    )
+    diagnostics_dir = (
+        Path(args.diagnostics_dir)
+        if args.diagnostics_dir
+        else report_path.with_name(f"{report_path.stem}-diagnostics")
+    )
+    review_path = (
+        Path(args.review_queue)
+        if args.review_queue
+        else report_path.with_name(f"{report_path.stem}.review.json")
+    )
     original_dir.mkdir(parents=True, exist_ok=True)
     swept_dir.mkdir(parents=True, exist_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
     s3 = boto3.client("s3")
     bucket = channels_bucket(args.env)
-    metadata_key = f"courses/{args.course_id}/{args.course_id}.json"
-    course = json.loads(
-        s3.get_object(Bucket=bucket, Key=metadata_key)["Body"].read().decode("utf-8")
-    )
+    course = load_course_json(s3, bucket, args.course_id)
     course_title = (course.get("details") or {}).get("title") or args.course_id
     issue_rows, source_workbook, map_topic_rows = load_issue_rows(
         map_path,
@@ -503,11 +591,35 @@ def main() -> int:
         args.map_sheet,
     )
     matched, unmatched, toc_id = resolve_topics(issue_rows, course, args.course_id)
+    pipeline = pipeline_fingerprint()
+    prior_manifest = _read_json(manifest_path) if args.resume else None
+    prior_report = _read_json(report_path) if args.resume else None
+    prior_topics = {
+        item.get("topicId"): item
+        for item in (prior_manifest or {}).get("topics", [])
+        if isinstance(item, dict) and item.get("topicId")
+    }
+    prior_results: dict[str, dict[str, Any]] = {}
+    for topic_id, topic in prior_topics.items():
+        diagnostics_path = Path(str(topic.get("diagnostics") or ""))
+        diagnostics = _read_json(diagnostics_path)
+        details = (diagnostics or {}).get("details")
+        if isinstance(details, dict):
+            prior_results[str(topic_id)] = details
+    if not prior_results:
+        prior_results = {
+            item.get("topicId"): item
+            for item in (prior_report or {}).get("results", [])
+            if isinstance(item, dict) and item.get("topicId")
+        }
+    prior_pipeline = (prior_manifest or {}).get("pipelineFingerprint")
     results: list[dict[str, Any]] = []
+    compact_topics: list[dict[str, Any]] = []
     counts = {
         "requested": len(issue_rows),
         "matched": len(matched),
         "downloaded": 0,
+        "reused": 0,
         "swept": 0,
         "resolved": 0,
         "residual": 0,
@@ -516,34 +628,113 @@ def main() -> int:
         "unmatched": len(unmatched),
     }
 
+    downloads: dict[str, tuple[dict[str, Any], str, bytes]] = {}
+    source_etags: dict[str, str] = {}
+    pending_downloads: list[dict[str, Any]] = []
     for item in matched:
         topic_id = item["topicId"]
         original_path = original_dir / f"{topic_id}.pdf"
         swept_path = swept_dir / f"{topic_id}.pdf"
-        entry = {**item, "originalPdf": str(original_path), "reSweptPdf": str(swept_path)}
+        if not args.resume or prior_manifest is None:
+            pending_downloads.append(item)
+            continue
         try:
-            pdf_bytes = s3.get_object(Bucket=bucket, Key=item["pdfKey"])["Body"].read()
+            head = s3.head_object(Bucket=bucket, Key=item["pdfKey"])
+            etag = str(head.get("ETag") or "").strip('"')
+            source_etags[topic_id] = etag
+        except Exception as error:
+            results.append(
+                {
+                    **item,
+                    "originalPdf": str(original_path),
+                    "reSweptPdf": str(swept_path),
+                    "status": "failed",
+                    "errors": [f"S3 preflight failed: {error}"],
+                }
+            )
+            counts["failed"] += 1
+            continue
+        prior_topic = prior_topics.get(topic_id)
+        if args.resume and _resume_topic(
+            prior_topic,
+            pipeline=pipeline,
+            manifest_pipeline=prior_pipeline,
+            source_etag=etag,
+        ):
+            prior_entry = prior_results.get(topic_id)
+            if prior_entry:
+                entry = dict(prior_entry)
+                entry["reused"] = True
+                results.append(entry)
+                diagnostics_path = diagnostics_dir / f"{topic_id}.json"
+                compact_topics.append(
+                    _compact_topic(
+                        entry,
+                        source_etag=etag,
+                        diagnostics_path=diagnostics_path,
+                    )
+                )
+                counts["reused"] += 1
+                counts["swept"] += 1
+                result_kind = entry.get("resultKind")
+                if result_kind in {"resolved", "residual", "unverifiable"}:
+                    counts[result_kind] += 1
+                continue
+        pending_downloads.append(item)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(_download_topic, s3, bucket, item): item
+            for item in pending_downloads
+        }
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                resolved_item, etag, pdf_bytes = future.result()
+                downloads[resolved_item["topicId"]] = (
+                    resolved_item,
+                    etag,
+                    pdf_bytes,
+                )
+                source_etags[resolved_item["topicId"]] = etag
+            except Exception as error:
+                topic_id = item["topicId"]
+                results.append(
+                    {
+                        **item,
+                        "originalPdf": str(original_dir / f"{topic_id}.pdf"),
+                        "reSweptPdf": str(swept_dir / f"{topic_id}.pdf"),
+                        "status": "failed",
+                        "errors": [f"download failed: {error}"],
+                    }
+                )
+                counts["failed"] += 1
+
+    preparation_results, execution_mode = _prepare_downloads(downloads, args.workers)
+
+    for item in matched:
+        topic_id = item["topicId"]
+        if topic_id not in downloads:
+            continue
+        resolved_item, etag, pdf_bytes = downloads[topic_id]
+        original_path = original_dir / f"{topic_id}.pdf"
+        swept_path = swept_dir / f"{topic_id}.pdf"
+        entry = {
+            **resolved_item,
+            "originalPdf": str(original_path),
+            "reSweptPdf": str(swept_path),
+            "pipelineFingerprint": pipeline,
+            "sourceETag": etag,
+        }
+        try:
             original_path.write_bytes(pdf_bytes)
             counts["downloaded"] += 1
-            entry["originalValidation"] = validate_pdf(pdf_bytes)
-            swept_bytes, sweep_result = run_sweeps(pdf_bytes)
+            prepared = preparation_results[topic_id]
+            if isinstance(prepared, Exception):
+                raise prepared
+            swept_bytes, sweep_result = prepared
             swept_path.write_bytes(swept_bytes)
             entry.update(sweep_result)
-            entry["reSweptValidation"] = validate_pdf(swept_bytes)
-            try:
-                second_pass_bytes, second_pass_result = run_sweeps(swept_bytes)
-                entry["secondPass"] = {
-                    "byteStable": second_pass_bytes == swept_bytes,
-                    "appliedRepairs": second_pass_result["appliedRepairs"],
-                    "warnings": second_pass_result["warnings"],
-                }
-                if second_pass_bytes != swept_bytes:
-                    entry["warnings"].append(
-                        "second pass was not byte-stable; first-pass output preserved"
-                    )
-            except Exception as error:
-                entry["secondPass"] = {"error": str(error)}
-                entry["warnings"].append(f"second pass validation failed: {error}")
             counts["swept"] += 1
             entry["residualDiagnostics"] = build_residual_diagnostics(
                 sweep_result,
@@ -553,13 +744,56 @@ def main() -> int:
                 entry["residualDiagnostics"],
                 entry["warnings"],
             )
+            entry["resultKind"] = result_kind
             counts[result_kind] += 1
+            diagnostics_path = diagnostics_dir / f"{topic_id}.json"
+            _write_json(
+                diagnostics_path,
+                {
+                    "schemaVersion": 1,
+                    "topicId": topic_id,
+                    "pipelineFingerprint": pipeline,
+                    "details": entry,
+                },
+            )
+            compact_topics.append(
+                _compact_topic(
+                    entry,
+                    source_etag=etag,
+                    diagnostics_path=diagnostics_path,
+                )
+            )
         except Exception as error:
             counts["failed"] += 1
             entry["status"] = "failed"
             entry["errors"] = [str(error)]
         results.append(entry)
 
+    compact_ids = {str(item.get("topicId")) for item in compact_topics}
+    for entry in results:
+        topic_id = str(entry.get("topicId") or "")
+        if not topic_id or topic_id in compact_ids:
+            continue
+        diagnostics_path = diagnostics_dir / f"{topic_id}.json"
+        _write_json(
+            diagnostics_path,
+            {
+                "schemaVersion": 1,
+                "topicId": topic_id,
+                "pipelineFingerprint": pipeline,
+                "details": entry,
+            },
+        )
+        compact_topics.append(
+            _compact_topic(
+                entry,
+                source_etag=source_etags.get(topic_id, ""),
+                diagnostics_path=diagnostics_path,
+            )
+        )
+
+    results.sort(key=lambda item: str(item.get("topicId") or ""))
+    compact_topics.sort(key=lambda item: str(item.get("topicId") or ""))
     report = {
         "runAt": run_at.isoformat(),
         "sourceIssueMap": str(map_path.resolve()),
@@ -572,6 +806,11 @@ def main() -> int:
             "bucket": bucket,
             "defaultTocId": toc_id,
         },
+        "pipelineFingerprint": pipeline,
+        "execution": {
+            "workers": args.workers,
+            "mode": execution_mode,
+        },
         "scope": {
             "topicRowsOnly": True,
             "issueMapTopicRows": map_topic_rows,
@@ -580,7 +819,7 @@ def main() -> int:
             "pdfPattern": "courses/{courseId}/topic_pdfs/{topicId}.pdf",
         },
         "counts": counts,
-        "results": results,
+        "results": compact_topics,
         "unmatched": unmatched,
         "notes": [
             "Original PDFs are preserved separately from re-swept PDFs.",
@@ -588,8 +827,58 @@ def main() -> int:
             "Adobe/PDF accessibility conformance remains subject to manual Adobe checking.",
         ],
     }
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-    print(json.dumps({"report": str(report_path), "counts": counts}, indent=2))
+    _write_json(report_path, report)
+    compact_manifest = {
+        "schemaVersion": 2,
+        "runAt": run_at.isoformat(),
+        "pipelineFingerprint": pipeline,
+        "execution": report["execution"],
+        "course": report["course"],
+        "counts": counts,
+        "topics": compact_topics,
+        "unmatched": unmatched,
+        "detailedReport": str(report_path),
+        "diagnosticsDir": str(diagnostics_dir),
+        "reviewQueue": str(review_path),
+    }
+    _write_json(manifest_path, compact_manifest)
+    review_order = {"residual": 0, "unverifiable": 1, "resolved": 2}
+    review_topics = sorted(
+        compact_topics,
+        key=lambda item: (
+            review_order.get(str(item.get("resultKind")), 3),
+            str(item.get("topicTitle") or ""),
+        ),
+    )
+    _write_json(
+        review_path,
+        {
+            "schemaVersion": 1,
+            "courseId": args.course_id,
+            "manifest": str(manifest_path),
+            "topics": [
+                {
+                    "topicId": topic.get("topicId"),
+                    "topicTitle": topic.get("topicTitle"),
+                    "status": topic.get("status"),
+                    "resultKind": topic.get("resultKind"),
+                    "reSweptPdf": topic.get("reSweptPdf"),
+                    "residualCategories": topic.get("residualCategories"),
+                }
+                for topic in review_topics
+            ],
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "manifest": str(manifest_path),
+                "reviewQueue": str(review_path),
+                "counts": counts,
+            },
+            separators=(",", ":"),
+        )
+    )
     return 1 if counts["failed"] or counts["unmatched"] else 0
 
 

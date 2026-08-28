@@ -216,7 +216,7 @@ class TaggedAnnotationSweepTests(unittest.TestCase):
             annotation = checked.pages[0]["/Annots"][0]
             key = int(annotation["/StructParent"])
             values = checked.Root["/StructTreeRoot"]["/ParentTree"]["/Nums"]
-            owner_index = values.index(key) + 1
+            owner_index = list(values).index(key) + 1
             self.assertEqual(
                 values[owner_index].objgen,
                 checked.Root["/StructTreeRoot"]["/K"][0].objgen,

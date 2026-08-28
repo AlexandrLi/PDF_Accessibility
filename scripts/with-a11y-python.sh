@@ -6,10 +6,19 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="${A11Y_VENV:-$ROOT/.venv}"
 PYTHON="$VENV/bin/python"
 REQUIREMENTS="$ROOT/scripts/requirements-migrate.txt"
-LOCK="$VENV/.a11y-deps-install.lock"
+ROOT_KEY="${ROOT//\//_}"
+LOCK="${TMPDIR:-/tmp}/pdf-a11y-deps-install${ROOT_KEY}.lock"
+STAMP="${TMPDIR:-/tmp}/pdf-a11y-deps-ready${ROOT_KEY}"
 
 dependencies_ready() {
-  "$PYTHON" -c 'import boto3, pikepdf, pypdf, pymupdf' >/dev/null 2>&1
+  if [[ -f "$STAMP" && "$STAMP" -nt "$REQUIREMENTS" ]]; then
+    return 0
+  fi
+  if "$PYTHON" -c 'import boto3, pikepdf, pypdf, pymupdf' >/dev/null 2>&1; then
+    touch "$STAMP"
+    return 0
+  fi
+  return 1
 }
 
 if [[ ! -x "$PYTHON" ]]; then
