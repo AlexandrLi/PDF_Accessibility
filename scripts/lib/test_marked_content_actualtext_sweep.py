@@ -1073,6 +1073,66 @@ class UntaggedImageActualTextTests(unittest.TestCase):
         ]
         self.assertEqual(untagged_actions, [])
 
+    def test_repair_covers_link_element_image_content(self) -> None:
+        pdf_bytes = _build_untagged_image_pdf(
+            b"/Link <</MCID 0>> BDC q 50 0 0 50 20 20 cm /Im1 Do Q EMC",
+            struct_role="/Link",
+        )
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="x1 equals 87",
+        ):
+            repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertGreaterEqual(result.mcids_updated, 1)
+        self.assertEqual(
+            _actualtext_for_mcid(_page_contents_text(repaired), 0),
+            "x1 equals 87",
+        )
+
+    def test_repair_covers_orphan_image_mcid(self) -> None:
+        pdf_bytes = _build_untagged_image_pdf(
+            b"/P <</MCID 0>> BDC BT (Intro) Tj ET EMC "
+            b"/P <</MCID 7>> BDC q 50 0 0 50 20 20 cm /Im1 Do Q EMC"
+        )
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="orphan banner",
+        ):
+            repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        contents = _page_contents_text(repaired)
+        self.assertEqual(_actualtext_for_mcid(contents, 7), "orphan banner")
+        orphan_actions = [
+            action for action in result.actions if "orphan image MCID 7" in action
+        ]
+        self.assertEqual(len(orphan_actions), 1)
+
+    def test_orphan_phase_skips_struct_owned_mcid(self) -> None:
+        pdf = pikepdf.open(io.BytesIO(_build_untagged_image_pdf(self._IMAGE_ONLY_STREAM)))
+        element = pdf.Root["/StructTreeRoot"]["/K"][0]["/K"][0]
+        element["/Alt"] = pikepdf.String("Covered")
+        buf = io.BytesIO()
+        pdf.save(buf)
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="unused",
+        ):
+            repaired, result = repair_marked_content_actualtext(buf.getvalue())
+        self.assertIsNone(_actualtext_for_mcid(_page_contents_text(repaired), 0))
+        untagged_actions = [
+            action for action in result.actions if "untagged image" in action
+        ]
+        self.assertEqual(untagged_actions, [])
+
+    def test_list_flags_orphan_image_mcid(self) -> None:
+        pdf_bytes = _build_untagged_image_pdf(
+            b"/P <</MCID 0>> BDC BT (Intro) Tj ET EMC "
+            b"/P <</MCID 7>> BDC q 50 0 0 50 20 20 cm /Im1 Do Q EMC"
+        )
+        self.assertIn(
+            "page1 mcid7 (orphan)",
+            list_untagged_image_mcids_missing_actualtext(pdf_bytes),
+        )
+
     def test_list_untagged_image_mcids_before_and_after_repair(self) -> None:
         for stream in (self._IMAGE_ONLY_STREAM, self._MIXED_STREAM):
             pdf_bytes = _build_untagged_image_pdf(stream)
