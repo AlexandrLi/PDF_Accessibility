@@ -86,6 +86,11 @@ def normalized_course_sheet(value: object) -> str:
     return normalized(value).replace("introduction ", "intro ", 1)
 
 
+def chapter_number(value: object) -> str:
+    match = re.match(r"^\s*0*(\d+)\s*\.", str(value or ""))
+    return match.group(1) if match else ""
+
+
 def normalized_chapter_title(value: object) -> str:
     text = normalized(value)
     text = re.sub(r"^\d+\.\s*", "", text)
@@ -209,7 +214,29 @@ def resolve_topics(
             for topic_id in candidates
             if normalized_context in chapter_titles_by_topic[topic_id]
         ]
-        if len(context_matches) != 1:
+        chosen: tuple[str, dict[str, Any], str] | None = None
+        if len(context_matches) == 1:
+            topic_id = context_matches[0]
+            chapter = next(
+                chapter
+                for chapter in toc_topic_chapters[topic_id]
+                if normalized_chapter_title(chapter.get("title")) == normalized_context
+            )
+            chosen = (topic_id, chapter, "chapterTitle")
+        elif len(candidates) == 1:
+            # The topic title is unique in the TOC but the workbook chapter
+            # title drifted from course metadata. Accept the sole candidate
+            # only when the workbook chapter number corroborates its chapter.
+            row_chapter_number = str(row.get("chapter_id") or "").strip().lstrip("0")
+            numbered_chapters = [
+                chapter
+                for chapter in toc_topic_chapters[candidates[0]]
+                if row_chapter_number
+                and chapter_number(chapter.get("title")) == row_chapter_number
+            ]
+            if len(numbered_chapters) == 1:
+                chosen = (candidates[0], numbered_chapters[0], "uniqueTitleChapterNumber")
+        if chosen is None:
             options = []
             for topic_id in candidates:
                 options.append(
@@ -237,7 +264,7 @@ def resolve_topics(
             )
             continue
 
-        topic_id = context_matches[0]
+        topic_id, chapter, match_strategy = chosen
         topic = topics[topic_id]
         if not topic.get("pdfAvailable"):
             unmatched.append(
@@ -248,11 +275,6 @@ def resolve_topics(
                 }
             )
             continue
-        chapter = next(
-            chapter
-            for chapter in toc_topic_chapters[topic_id]
-            if normalized_chapter_title(chapter.get("title")) == normalized_context
-        )
         matched.append(
             {
                 "sourceIssueRow": row,
@@ -260,6 +282,7 @@ def resolve_topics(
                 "topicTitle": topic.get("title") or title,
                 "chapterId": chapter.get("id"),
                 "chapterTitle": chapter.get("title"),
+                "matchStrategy": match_strategy,
                 "pdfKey": preview_key(course_id, topic_id),
             }
         )

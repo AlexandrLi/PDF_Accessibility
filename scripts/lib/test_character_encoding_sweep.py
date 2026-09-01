@@ -6,7 +6,7 @@ import pikepdf
 
 from lib.character_encoding_sweep import (
     _decode_mcid_text,
-    _dedupe_font_tounicode,
+    _replace_unreliable_font_tounicode,
     _load_tounicode_map,
     _needs_character_encoding_repair,
     _parse_bfchar_pairs,
@@ -125,7 +125,56 @@ endbfrange"""
         self.assertEqual(len(result.missing_tounicode_fonts), 1)
         self.assertFalse(result.invalid_tounicode_fonts)
 
-    def test_dedupe_preserves_codespacerange(self) -> None:
+    def test_used_codes_track_q_state_and_show_operators(self) -> None:
+        from lib.character_encoding_sweep import _used_codes_for_font
+
+        data = (
+            b"/TT1 10 Tf (AB) Tj "
+            b"q /C2_7 10 Tf <0003> Tj Q "
+            b"[(CD) 5 (E)] TJ "
+            b"/BDC-noise << /ActualText (ZZ) >> BDC EMC"
+        )
+        self.assertEqual(
+            _used_codes_for_font(data, {"/C2_7"}, two_byte=True), {0x0003}
+        )
+        self.assertEqual(
+            _used_codes_for_font(data, {"/TT1"}, two_byte=False),
+            {ord("A"), ord("B"), ord("C"), ord("D"), ord("E")},
+        )
+
+    def test_build_tounicode_cmap_round_trips(self) -> None:
+        from lib.character_encoding_sweep import (
+            _build_tounicode_cmap,
+            _parse_tounicode_entries,
+        )
+
+        cmap = _build_tounicode_cmap({3: " ", 0x636: "✓"}, two_byte=True)
+        pairs, diagnostics = _parse_tounicode_entries(
+            cmap.decode("latin1", errors="replace")
+        )
+        self.assertEqual(diagnostics, [])
+        mapping = {int(src, 16): dst for src, dst in pairs}
+        self.assertEqual(mapping[3], "0020")
+        self.assertEqual(mapping[0x636], "2713")
+
+    def test_missing_tounicode_borrows_sibling_map(self) -> None:
+        beginning_algebra = Path(
+            "pdfs/accessibility-issue-map/beginning-algebra/20260901/originals/9d9dcb9c.pdf"
+        )
+        if not beginning_algebra.is_file():
+            self.skipTest("beginning-algebra 9d9dcb9c original not available")
+        repaired, result = repair_character_encoding(beginning_algebra.read_bytes())
+        self.assertEqual(result.missing_tounicode_fonts, [])
+        borrow_actions = [
+            action for action in result.actions if "added missing /ToUnicode" in action
+        ]
+        self.assertEqual(len(borrow_actions), 3)
+        repaired_again, second = repair_character_encoding(repaired)
+        self.assertEqual(
+            [a for a in second.actions if "added missing /ToUnicode" in a], []
+        )
+
+    def test_duplicate_destinations_are_preserved(self) -> None:
         cmap = """begincmap
 begincodespacerange
 <00> <FF>
@@ -144,20 +193,43 @@ endcmap"""
                     ToUnicode=pdf.make_stream(cmap.encode("latin1")),
                 )
             )
-            changed = _dedupe_font_tounicode(pdf, font)
+            changed = _replace_unreliable_font_tounicode(pdf, font)
+            self.assertFalse(changed)
+            mapping = _load_tounicode_map(font)
+            self.assertEqual(mapping.get(0x41), "A")
+            self.assertEqual(mapping.get(0x42), "A")
+
+    def test_unreliable_replacement_preserves_codespacerange(self) -> None:
+        cmap = """begincmap
+begincodespacerange
+<00> <FF>
+endcodespacerange
+2 beginbfchar
+<41> <0041>
+<42> <FFFD>
+endbfchar
+endcmap"""
+        with pikepdf.new() as pdf:
+            font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Test"),
+                    ToUnicode=pdf.make_stream(cmap.encode("latin1")),
+                )
+            )
+            changed = _replace_unreliable_font_tounicode(pdf, font)
             self.assertTrue(changed)
             new_data = font["/ToUnicode"].read_bytes().decode("latin1")
             self.assertIn("<00> <FF>", new_data)
             mapping = _load_tounicode_map(font)
             self.assertEqual(mapping.get(0x41), "A")
-            dup_char = mapping.get(0x42)
-            self.assertIsNotNone(dup_char)
-            assert dup_char is not None
-            self.assertEqual(len(dup_char), 1)
-            self.assertGreaterEqual(ord(dup_char), 0x2500)
-            self.assertLessEqual(ord(dup_char), 0x257F)
-            self.assertNotEqual(dup_char, "A")
-            self.assertFalse(dup_char.startswith("U+"))
+            replaced = mapping.get(0x42)
+            self.assertIsNotNone(replaced)
+            assert replaced is not None
+            self.assertEqual(len(replaced), 1)
+            self.assertGreaterEqual(ord(replaced), 0x2500)
+            self.assertLessEqual(ord(replaced), 0x257F)
 
     def test_dedupe_replaces_unreliable_unicode_destinations(self) -> None:
         cmap = """begincmap
@@ -180,14 +252,14 @@ endcmap"""
                 )
             )
 
-            self.assertTrue(_dedupe_font_tounicode(pdf, font))
+            self.assertTrue(_replace_unreliable_font_tounicode(pdf, font))
             mapping = _load_tounicode_map(font)
             self.assertEqual(len(set(mapping.values())), 3)
             for value in mapping.values():
                 self.assertGreaterEqual(ord(value), 0x2500)
                 self.assertLessEqual(ord(value), 0x257F)
 
-    def test_dedupe_bfchar_does_not_corrupt_adjacent_newline_pairs(self) -> None:
+    def test_replacement_does_not_corrupt_adjacent_newline_pairs(self) -> None:
         """Regression: regex must not treat dst/src on adjacent lines as one pair."""
         cmap = """begincmap
 begincodespacerange
@@ -195,7 +267,7 @@ begincodespacerange
 endcodespacerange
 2 beginbfchar
 <0054> <0055>
-<0055> <0055>
+<0055> <FFFD>
 endbfchar
 endcmap"""
         with pikepdf.new() as pdf:
@@ -207,7 +279,7 @@ endcmap"""
                     ToUnicode=pdf.make_stream(cmap.encode("latin1")),
                 )
             )
-            changed = _dedupe_font_tounicode(pdf, font)
+            changed = _replace_unreliable_font_tounicode(pdf, font)
             self.assertTrue(changed)
 
             new_data = font["/ToUnicode"].read_bytes().decode("latin1")
@@ -216,17 +288,13 @@ endcmap"""
 
             mapping = _load_tounicode_map(font)
             self.assertEqual(mapping.get(0x0054), "U")
-            dup_char = mapping.get(0x0055)
-            self.assertIsNotNone(dup_char)
-            assert dup_char is not None
-            self.assertNotEqual(dup_char, "U")
-            self.assertEqual(len(dup_char), 1)
-            self.assertGreaterEqual(ord(dup_char), 0x2500)
-            self.assertLessEqual(ord(dup_char), 0x257F)
-
-            buf = io.BytesIO()
-            pdf.save(buf)
-            self.assertEqual(count_ambiguous_tounicode_fonts(buf.getvalue()), 0)
+            replaced = mapping.get(0x0055)
+            self.assertIsNotNone(replaced)
+            assert replaced is not None
+            self.assertNotEqual(replaced, "�")
+            self.assertEqual(len(replaced), 1)
+            self.assertGreaterEqual(ord(replaced), 0x2500)
+            self.assertLessEqual(ord(replaced), 0x257F)
 
     def test_repair_character_encoding_idempotent_for_biochemistry_topics(self) -> None:
         for topic_id in _ENCODING_FIX_TOPIC_IDS:

@@ -16,7 +16,37 @@ from sweep_accessibility_issue_map import (  # noqa: E402
     build_residual_diagnostics,
     classify_residual_status,
     normalized_chapter_title,
+    resolve_topics,
 )
+
+
+def _course_with_chapter(chapter_title: str, extra_chapters: list | None = None) -> dict:
+    chapters = [
+        {"id": "ch10", "title": chapter_title, "topics": [{"id": "topic-1"}]}
+    ] + (extra_chapters or [])
+    return {
+        "details": {"title": "Course", "defaultToc": "toc"},
+        "tocs": {"toc": {"chapters": chapters}},
+        "topics": {
+            "topic-1": {"title": "The Quadratic Formula", "pdfAvailable": True},
+        },
+    }
+
+
+def _issue_row(chapter_id: str = "10") -> dict:
+    return {
+        "sheet": "Course",
+        "row": "68",
+        "topic_title": "The Quadratic Formula",
+        "chapter_id": chapter_id,
+        "chapter_title": "Quadratic Equations & Applications",
+        "chapter_row": "65",
+        "failed_columns": "Z",
+        "failed_categories": "Tables Headers",
+        "failure_count": "1",
+        "topic_id": "",
+        "pdf_key": "",
+    }
 
 
 def _sweep_result(
@@ -42,6 +72,26 @@ class AccessibilityIssueMapSweepTests(unittest.TestCase):
             normalized_chapter_title("1. Equations and Inequalities"),
             normalized_chapter_title("Equations & Inequalities"),
         )
+
+    def test_unique_title_with_matching_chapter_number_is_accepted(self) -> None:
+        course = _course_with_chapter("10. Quadratic Equations")
+        matched, unmatched, _ = resolve_topics([_issue_row()], course, "course")
+        self.assertEqual(unmatched, [])
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["topicId"], "topic-1")
+        self.assertEqual(matched[0]["matchStrategy"], "uniqueTitleChapterNumber")
+
+    def test_unique_title_with_wrong_chapter_number_stays_unmatched(self) -> None:
+        course = _course_with_chapter("9. Quadratic Equations")
+        matched, unmatched, _ = resolve_topics([_issue_row()], course, "course")
+        self.assertEqual(matched, [])
+        self.assertEqual(len(unmatched), 1)
+
+    def test_exact_chapter_title_match_keeps_priority(self) -> None:
+        course = _course_with_chapter("10. Quadratic Equations and Applications")
+        matched, unmatched, _ = resolve_topics([_issue_row()], course, "course")
+        self.assertEqual(unmatched, [])
+        self.assertEqual(matched[0]["matchStrategy"], "chapterTitle")
 
     def test_headers_clean_is_resolved(self) -> None:
         diagnostics = build_residual_diagnostics(

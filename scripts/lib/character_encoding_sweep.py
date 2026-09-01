@@ -7,6 +7,7 @@ import re
 from dataclasses import asdict, dataclass, field
 
 import pikepdf
+import pymupdf
 
 from lib.marked_content_actualtext_sweep import (
     _get_mcid_block,
@@ -365,14 +366,6 @@ def _font_label(name: str, font: pikepdf.Dictionary) -> str:
     return f"{name} ({base if base is not None else 'font'})"
 
 
-def _font_is_established_composite_case(font: pikepdf.Dictionary) -> bool:
-    """Keep the legacy repair for generated Identity-H composite fonts."""
-    return (
-        font.get("/Subtype") == "/Type0"
-        and str(font.get("/Encoding", "")).endswith("Identity-H")
-    )
-
-
 def _inspect_page_fonts(
     pdf: pikepdf.Pdf,
 ) -> tuple[int, list[str], list[str], list[str], dict[tuple[int, int] | tuple[str, int], pikepdf.Dictionary]]:
@@ -411,7 +404,16 @@ def _inspect_page_fonts(
     return inspected, missing, invalid, diagnostics, fonts_by_key
 
 
-def _dedupe_font_tounicode(pdf: pikepdf.Pdf, font: pikepdf.Dictionary) -> bool:
+def _replace_unreliable_font_tounicode(
+    pdf: pikepdf.Pdf,
+    font: pikepdf.Dictionary,
+) -> bool:
+    """Remap only unreliable /ToUnicode destinations to placeholder characters.
+
+    Duplicate destinations are valid PDF (several glyph variants may map to
+    the same character) and must be preserved: remapping them destroys real
+    extracted text.
+    """
     stream = font.get("/ToUnicode")
     if stream is None:
         return False
@@ -421,19 +423,19 @@ def _dedupe_font_tounicode(pdf: pikepdf.Pdf, font: pikepdf.Dictionary) -> bool:
     if not pairs:
         return False
 
-    seen_unicode: dict[str, str] = {}
     used_dst: set[str] = set()
     replacements: list[tuple[int, str, str, str]] = []
     next_fallback = 0x2500
     bfchar_pairs = _parse_bfchar_pairs(data)
+    for _index, (src, dst) in enumerate(bfchar_pairs):
+        if len(src) > 4:
+            continue
+        used_dst.add(_unicode_from_tounicode_dst(dst))
     for index, (src, dst) in enumerate(bfchar_pairs):
         if len(src) > 4:
             continue
         unicode_char = _unicode_from_tounicode_dst(dst)
-        used_dst.add(unicode_char)
-        if unicode_char in seen_unicode or _is_unreliable_tounicode_text(
-            unicode_char
-        ):
+        if _is_unreliable_tounicode_text(unicode_char):
             fallback_codepoint = next_fallback
             while chr(fallback_codepoint) in used_dst:
                 fallback_codepoint += 1
@@ -446,8 +448,6 @@ def _dedupe_font_tounicode(pdf: pikepdf.Pdf, font: pikepdf.Dictionary) -> bool:
             used_dst.add(fallback_char)
             fallback_hex = fallback_char.encode("utf-16-be").hex().upper()
             replacements.append((index, src, dst, fallback_hex))
-        else:
-            seen_unicode[unicode_char] = src
 
     if not replacements:
         return False
@@ -504,11 +504,309 @@ def count_ambiguous_tounicode_fonts(pdf_bytes: bytes) -> int:
     return duplicates
 
 
-def _repair_font_tounicode_ambiguity(
+def _font_file_stream(font: pikepdf.Dictionary) -> pikepdf.Object | None:
+    descriptor = font.get("/FontDescriptor")
+    descendants = font.get("/DescendantFonts")
+    if descriptor is None and isinstance(descendants, pikepdf.Array):
+        first = descendants[0] if len(descendants) else None
+        if isinstance(first, pikepdf.Dictionary):
+            descriptor = first.get("/FontDescriptor")
+    if not isinstance(descriptor, pikepdf.Dictionary):
+        return None
+    for key in ("/FontFile2", "/FontFile3", "/FontFile"):
+        stream = descriptor.get(key)
+        if stream is not None:
+            return stream
+    return None
+
+
+def _font_is_identity_cid(font: pikepdf.Dictionary) -> bool:
+    if font.get("/Subtype") != "/Type0":
+        return False
+    if not str(font.get("/Encoding", "")).endswith("Identity-H"):
+        return False
+    descendants = font.get("/DescendantFonts")
+    if not isinstance(descendants, pikepdf.Array) or not len(descendants):
+        return False
+    first = descendants[0]
+    if not isinstance(first, pikepdf.Dictionary):
+        return False
+    cid_to_gid = first.get("/CIDToGIDMap")
+    return cid_to_gid is None or cid_to_gid == "/Identity"
+
+
+def _truetype_glyph_has_no_outline(font_buffer: bytes, gid: int) -> bool | None:
+    """Return True when a TrueType glyph has an empty outline, None if unknown."""
+    try:
+        if len(font_buffer) < 12:
+            return None
+        num_tables = int.from_bytes(font_buffer[4:6], "big")
+        tables: dict[bytes, tuple[int, int]] = {}
+        for index in range(num_tables):
+            record = font_buffer[12 + index * 16 : 28 + index * 16]
+            if len(record) < 16:
+                return None
+            tag = record[0:4]
+            offset = int.from_bytes(record[8:12], "big")
+            length = int.from_bytes(record[12:16], "big")
+            tables[tag] = (offset, length)
+        if b"head" not in tables or b"loca" not in tables or b"maxp" not in tables:
+            return None
+        head_offset = tables[b"head"][0]
+        loca_format = int.from_bytes(
+            font_buffer[head_offset + 50 : head_offset + 52], "big"
+        )
+        maxp_offset = tables[b"maxp"][0]
+        num_glyphs = int.from_bytes(
+            font_buffer[maxp_offset + 4 : maxp_offset + 6], "big"
+        )
+        if gid >= num_glyphs:
+            return None
+        loca_offset, loca_length = tables[b"loca"]
+        if loca_format == 0:
+            entry_size = 2
+            scale = 2
+        else:
+            entry_size = 4
+            scale = 1
+        start_at = loca_offset + gid * entry_size
+        end_at = loca_offset + (gid + 1) * entry_size
+        if end_at + entry_size > loca_offset + loca_length + entry_size:
+            return None
+        start = int.from_bytes(font_buffer[start_at : start_at + entry_size], "big")
+        end = int.from_bytes(font_buffer[end_at : end_at + entry_size], "big")
+        return (end - start) * scale == 0
+    except (IndexError, ValueError):
+        return None
+
+
+_STRING_TOKEN = rb"\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>"
+_CONTENT_SCANNER = re.compile(
+    rb"/(?P<font>[A-Za-z0-9_.]+)\s+[\d.]+\s+Tf"
+    rb"|(?P<show>" + _STRING_TOKEN + rb")\s*(?:Tj|')"
+    rb"|(?P<arr>\[(?:" + _STRING_TOKEN + rb"|[^\[\]()<>])*\])\s*TJ"
+    rb"|(?P<skipstr>" + _STRING_TOKEN + rb")"
+    rb"|(?P<push>\bq\b)"
+    rb"|(?P<pop>\bQ\b)",
+    re.DOTALL,
+)
+_STRING_PATTERN = re.compile(
+    rb"<([0-9A-Fa-f\s]*)>|\(((?:\\.|[^\\()])*)\)",
+    re.DOTALL,
+)
+
+
+def _decode_literal_bytes(literal: bytes) -> bytes:
+    out = bytearray()
+    index = 0
+    while index < len(literal):
+        char = literal[index : index + 1]
+        if char != b"\\":
+            out += char
+            index += 1
+            continue
+        escape = literal[index + 1 : index + 2]
+        if escape in (b"n", b"r", b"t", b"b", b"f"):
+            out += {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}[
+                escape
+            ]
+            index += 2
+        elif escape.isdigit():
+            digits = literal[index + 1 : index + 4]
+            octal = b""
+            for digit in digits:
+                if chr(digit).isdigit():
+                    octal += bytes([digit])
+                else:
+                    break
+            out.append(int(octal, 8) & 0xFF)
+            index += 1 + len(octal)
+        else:
+            out += escape
+            index += 2
+    return bytes(out)
+
+
+def _shown_bytes(token: bytes) -> bytes:
+    raw = b""
+    for match in _STRING_PATTERN.finditer(token):
+        if match.group(1) is not None:
+            cleaned = re.sub(rb"\s+", rb"", match.group(1))
+            if len(cleaned) % 2:
+                cleaned += b"0"
+            raw += bytes.fromhex(cleaned.decode("ascii"))
+        else:
+            raw += _decode_literal_bytes(match.group(2))
+    return raw
+
+
+def _used_codes_for_font(
+    data: bytes,
+    resource_names: set[str],
+    *,
+    two_byte: bool,
+) -> set[int]:
+    """Collect character codes shown with the named fonts, tracking q/Q state."""
+    codes: set[int] = set()
+    current: str | None = None
+    stack: list[str | None] = []
+    for match in _CONTENT_SCANNER.finditer(data):
+        if match.group("font") is not None:
+            current = "/" + match.group("font").decode("latin1", errors="replace")
+            continue
+        if match.group("push") is not None:
+            stack.append(current)
+            continue
+        if match.group("pop") is not None:
+            if stack:
+                current = stack.pop()
+            continue
+        if match.group("skipstr") is not None:
+            continue
+        if current not in resource_names:
+            continue
+        token = match.group("show")
+        if token is None:
+            token = match.group("arr")
+        raw = _shown_bytes(token)
+        if two_byte:
+            for offset in range(0, len(raw) - 1, 2):
+                codes.add(int.from_bytes(raw[offset : offset + 2], "big"))
+        else:
+            codes.update(raw)
+    return codes
+
+
+def _build_tounicode_cmap(entries: dict[int, str], *, two_byte: bool) -> bytes:
+    width = 4 if two_byte else 2
+    space_end = "FFFF" if two_byte else "FF"
+    lines = [
+        "/CIDInit /ProcSet findresource begin",
+        "12 dict begin",
+        "begincmap",
+        "/CMapName /Adobe-Identity-UCS def",
+        "/CMapType 2 def",
+        "1 begincodespacerange",
+        f"<{'0' * width}> <{space_end}>",
+        "endcodespacerange",
+        f"{len(entries)} beginbfchar",
+    ]
+    for code in sorted(entries):
+        destination = entries[code].encode("utf-16-be").hex().upper()
+        lines.append(f"<{code:0{width}X}> <{destination}>")
+    lines.extend(["endbfchar", "endcmap", "end", "end"])
+    return "\r\n".join(lines).encode("latin1")
+
+
+def _repair_missing_tounicode(
     pdf: pikepdf.Pdf,
     *,
     actions: list[str],
-    eligible_keys: set[tuple[int, int] | tuple[str, int]] | None = None,
+) -> int:
+    """Give ToUnicode maps to fonts that lack one.
+
+    A sibling font instance sharing the same embedded font program donates its
+    map (identical glyph space). Codes still unmapped are resolved from
+    evidence: a used TrueType glyph with an empty outline is whitespace, a
+    simple-font code that names a valid codepoint in the font program maps to
+    itself, and anything else gets a reliable placeholder character.
+    """
+    fonts_by_key: dict[tuple[int, int] | tuple[str, int], pikepdf.Dictionary] = {}
+    names_by_key: dict[tuple[int, int] | tuple[str, int], set[str]] = {}
+    pages_by_key: dict[tuple[int, int] | tuple[str, int], list[pikepdf.Page]] = {}
+    for page in pdf.pages:
+        for name, font in _effective_page_fonts(page):
+            key = _font_key(font)
+            fonts_by_key[key] = font
+            names_by_key.setdefault(key, set()).add(name)
+            pages_by_key.setdefault(key, []).append(page)
+
+    donors: dict[tuple[int, int], pikepdf.Object] = {}
+    for font in fonts_by_key.values():
+        stream = _font_tounicode_stream(font)
+        file_stream = _font_file_stream(font)
+        if stream is not None and file_stream is not None:
+            donors.setdefault(file_stream.objgen, stream)
+
+    updated = 0
+    for key, font in fonts_by_key.items():
+        if _font_tounicode_stream(font) is not None:
+            continue
+        is_cid = font.get("/Subtype") == "/Type0"
+        if is_cid and not _font_is_identity_cid(font):
+            continue
+        file_stream = _font_file_stream(font)
+        donor = donors.get(file_stream.objgen) if file_stream is not None else None
+
+        entries: dict[int, str] = {}
+        donor_data = ""
+        if donor is not None:
+            donor_data = donor.read_bytes().decode("latin1", errors="replace")
+            pairs, _diagnostics = _parse_tounicode_entries(donor_data)
+            for src, dst in pairs:
+                entries.setdefault(int(src, 16), _unicode_from_tounicode_dst(dst))
+
+        used: set[int] = set()
+        for page in pages_by_key.get(key, []):
+            data = _read_page_contents(page.get("/Contents"))
+            if data:
+                used.update(
+                    _used_codes_for_font(data, names_by_key[key], two_byte=is_cid)
+                )
+
+        font_buffer = (
+            file_stream.read_bytes() if file_stream is not None else b""
+        )
+        valid_codepoints: set[int] = set()
+        if font_buffer and not is_cid:
+            try:
+                probe = pymupdf.Font(fontbuffer=font_buffer)
+                valid_codepoints = set(probe.valid_codepoints())
+            except (RuntimeError, ValueError):
+                valid_codepoints = set()
+
+        used_dst = set(entries.values())
+        next_fallback = 0x2500
+        added: dict[int, str] = {}
+        for code in sorted(used - set(entries)):
+            if is_cid and font_buffer and _truetype_glyph_has_no_outline(
+                font_buffer, code
+            ):
+                added[code] = " "
+            elif not is_cid and 0x20 <= code <= 0x7E and code in valid_codepoints:
+                added[code] = chr(code)
+            else:
+                fallback = next_fallback
+                while chr(fallback) in used_dst:
+                    fallback += 1
+                    if fallback > 0x257F:
+                        fallback = 0x2500
+                next_fallback = fallback + 1
+                if next_fallback > 0x257F:
+                    next_fallback = 0x2500
+                added[code] = chr(fallback)
+                used_dst.add(chr(fallback))
+
+        if not entries and not added:
+            continue
+
+        entries.update(added)
+        font["/ToUnicode"] = pdf.make_stream(
+            _build_tounicode_cmap(entries, two_byte=is_cid)
+        )
+        updated += 1
+        label = str(font.get("/BaseFont", "font"))
+        detail = "borrowed sibling map" if donor is not None else "synthesized map"
+        if added:
+            detail += f", derived {len(added)} used codes"
+        actions.append(f"added missing /ToUnicode to {label} ({detail})")
+    return updated
+
+
+def _repair_font_tounicode_reliability(
+    pdf: pikepdf.Pdf,
+    *,
+    actions: list[str],
 ) -> int:
     updated = 0
     seen: set[tuple[int, int] | tuple[str, int]] = set()
@@ -518,12 +816,11 @@ def _repair_font_tounicode_ambiguity(
             if key in seen:
                 continue
             seen.add(key)
-            if eligible_keys is not None and key not in eligible_keys:
-                continue
-            if _dedupe_font_tounicode(pdf, font):
+            if _replace_unreliable_font_tounicode(pdf, font):
                 updated += 1
                 actions.append(
-                    f"deduped ambiguous /ToUnicode mappings in {font.get('/BaseFont', 'font')}"
+                    "replaced unreliable /ToUnicode destinations in "
+                    f"{font.get('/BaseFont', 'font')}"
                 )
     return updated
 
@@ -580,67 +877,13 @@ def _repair_orphan_symbol_mcids(
     return updated
 
 
-def _font_keys_with_actualtext_fallback(
-    pdf: pikepdf.Pdf,
-) -> set[tuple[int, int] | tuple[str, int]]:
-    """Find fonts whose ambiguous extraction is protected by /ActualText."""
-    protected: set[tuple[int, int] | tuple[str, int]] = set()
-    page_fonts = {
-        page.objgen: {name: _font_key(font) for name, font in _effective_page_fonts(page)}
-        for page in pdf.pages
-    }
-
-    def collect_from_body(page: pikepdf.Page, body: bytes) -> None:
-        fonts = page_fonts.get(page.objgen, {})
-        for match in re.finditer(rb"/([A-Za-z0-9_]+)\s+[\d.]+\s+Tf", body):
-            key = fonts.get("/" + match.group(1).decode("ascii"))
-            if key is not None:
-                protected.add(key)
-
-    for page in pdf.pages:
-        data = _read_page_contents(page.get("/Contents"))
-        if not data:
-            continue
-        mcids = sorted(
-            {int(match.group(1)) for match in _CONTENT_MCID_PATTERN.finditer(data)}
-        )
-        for mcid in mcids:
-            block = _get_mcid_block(data, mcid)
-            if block is None:
-                continue
-            if _mcid_bdc_has_actualtext(data, mcid):
-                collect_from_body(page, block[1])
-
-    struct_root = pdf.Root.get("/StructTreeRoot")
-    if struct_root is None:
-        return protected
-
-    def walk(obj: pikepdf.Dictionary) -> None:
-        if obj.get("/ActualText") is not None:
-            page = _resolve_struct_page(pdf, obj)
-            if page is not None:
-                contents = page.get("/Contents")
-                if contents is None:
-                    data = b""
-                else:
-                    data = _read_page_contents(contents)
-                for mcid in _struct_element_mcids(obj):
-                    block = _get_mcid_block(data, mcid)
-                    if block is not None:
-                        collect_from_body(page, block[1])
-        for child in _struct_child_dicts(obj):
-            walk(child)
-
-    walk(struct_root)
-    return protected
-
-
 def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodingRepairResult]:
     struct_updated = 0
     mcids_updated = 0
     actions: list[str] = []
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        fonts_updated = _repair_missing_tounicode(pdf, actions=actions)
         (
             fonts_inspected,
             missing_tounicode_fonts,
@@ -648,7 +891,6 @@ def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodin
             diagnostics,
             fonts_by_key,
         ) = _inspect_page_fonts(pdf)
-        fonts_updated = 0
 
         struct_root = pdf.Root.get("/StructTreeRoot")
         if struct_root is not None:
@@ -733,17 +975,7 @@ def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodin
             walk(struct_root)
 
         mcids_updated += _repair_orphan_symbol_mcids(pdf, actions=actions)
-        eligible_font_keys = _font_keys_with_actualtext_fallback(pdf)
-        eligible_font_keys.update(
-            key
-            for key, font in fonts_by_key.items()
-            if _font_is_established_composite_case(font)
-        )
-        fonts_updated = _repair_font_tounicode_ambiguity(
-            pdf,
-            actions=actions,
-            eligible_keys=eligible_font_keys,
-        )
+        fonts_updated += _repair_font_tounicode_reliability(pdf, actions=actions)
 
         result = CharacterEncodingRepairResult(
             struct_updated=struct_updated,
