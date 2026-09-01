@@ -13,6 +13,7 @@ from lib.accessibility_course_workflow import (
     validate_pdf,
 )
 from lib.adobe_autotag import (
+    apply_document_title,
     autotag_pdf_from_secret,
     normalize_pdf_for_autotag,
     ocr_pdf_for_autotag,
@@ -45,6 +46,10 @@ def parse_args() -> argparse.Namespace:
         "--ocr",
         action="store_true",
         help="Rasterize and OCR complex input before Adobe Auto-Tag",
+    )
+    parser.add_argument(
+        "--title",
+        help="Set this document title (docinfo, XMP, DisplayDocTitle) on the output",
     )
     return parser.parse_args()
 
@@ -80,6 +85,8 @@ def main() -> int:
         raise ValueError("Adobe auto-tag changed rendered page output")
 
     repaired, sweep = prepare_pdf(tagged)
+    if args.title:
+        repaired = apply_document_title(repaired, args.title)
     repaired_validation = validate_pdf(repaired)
     repaired_audit = audit_pdf_bytes(repaired).to_dict()
     if repaired_validation["pages"] != original_validation["pages"]:

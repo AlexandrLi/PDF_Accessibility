@@ -7,6 +7,7 @@ import json
 from typing import Any
 
 import boto3
+import pikepdf
 import pymupdf
 from adobe.pdfservices.operation.auth.service_principal_credentials import (
     ServicePrincipalCredentials,
@@ -76,6 +77,25 @@ def ocr_pdf_for_autotag(pdf_bytes: bytes, *, dpi: int = 300) -> bytes:
     output.close()
     source.close()
     return result
+
+
+def apply_document_title(pdf_bytes: bytes, title: str) -> bytes:
+    """Set docinfo /Title, XMP dc:title, and DisplayDocTitle on a PDF."""
+    text = title.strip()
+    if not text:
+        raise ValueError("Document title must not be empty")
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        pdf.docinfo["/Title"] = pikepdf.String(text)
+        with pdf.open_metadata() as metadata:
+            metadata["dc:title"] = text
+        preferences = pdf.Root.get("/ViewerPreferences")
+        if not isinstance(preferences, pikepdf.Dictionary):
+            preferences = pikepdf.Dictionary()
+            pdf.Root["/ViewerPreferences"] = preferences
+        preferences["/DisplayDocTitle"] = True
+        output = io.BytesIO()
+        pdf.save(output)
+        return output.getvalue()
 
 
 def load_adobe_credentials(

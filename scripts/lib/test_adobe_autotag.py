@@ -9,7 +9,11 @@ import unittest
 import pikepdf
 
 from lib.accessibility_course_workflow import render_hashes, validate_pdf
-from lib.adobe_autotag import load_adobe_credentials, normalize_pdf_for_autotag
+from lib.adobe_autotag import (
+    apply_document_title,
+    load_adobe_credentials,
+    normalize_pdf_for_autotag,
+)
 
 
 class FakeSecretsClient:
@@ -37,6 +41,32 @@ class AdobeAutotagTests(unittest.TestCase):
             validate_pdf(original)["pages"],
         )
         self.assertEqual(render_hashes(normalized), render_hashes(original))
+
+    def test_apply_document_title_sets_all_title_surfaces(self) -> None:
+        pdf = pikepdf.new()
+        pdf.add_blank_page(page_size=(200, 300))
+        source = io.BytesIO()
+        pdf.save(source)
+        original = source.getvalue()
+
+        titled = apply_document_title(original, "Two Means")
+
+        self.assertEqual(render_hashes(titled), render_hashes(original))
+        with pikepdf.open(io.BytesIO(titled)) as result:
+            self.assertEqual(str(result.docinfo["/Title"]), "Two Means")
+            self.assertEqual(
+                result.Root["/ViewerPreferences"]["/DisplayDocTitle"], True
+            )
+            with result.open_metadata() as metadata:
+                self.assertEqual(metadata.get("dc:title"), "Two Means")
+
+    def test_apply_document_title_rejects_blank_title(self) -> None:
+        pdf = pikepdf.new()
+        pdf.add_blank_page(page_size=(200, 300))
+        source = io.BytesIO()
+        pdf.save(source)
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            apply_document_title(source.getvalue(), "   ")
 
     def test_loads_existing_pdf_services_credentials(self) -> None:
         client = FakeSecretsClient(
