@@ -183,6 +183,16 @@ def _unicode_from_tounicode_dst(dst: str) -> str:
     return bytes.fromhex(dst).decode("utf-16-be", errors="replace")
 
 
+def _is_unreliable_tounicode_text(text: str) -> bool:
+    return any(
+        char == "\ufffd"
+        or ord(char) < 0x20
+        or 0x7F <= ord(char) <= 0x9F
+        or 0xE000 <= ord(char) <= 0xF8FF
+        for char in text
+    )
+
+
 @dataclass
 class CharacterEncodingRepairResult:
     struct_updated: int
@@ -414,26 +424,28 @@ def _dedupe_font_tounicode(pdf: pikepdf.Pdf, font: pikepdf.Dictionary) -> bool:
     seen_unicode: dict[str, str] = {}
     used_dst: set[str] = set()
     replacements: list[tuple[int, str, str, str]] = []
-    next_pua = 0xF000
+    next_fallback = 0x2500
     bfchar_pairs = _parse_bfchar_pairs(data)
     for index, (src, dst) in enumerate(bfchar_pairs):
         if len(src) > 4:
             continue
         unicode_char = _unicode_from_tounicode_dst(dst)
         used_dst.add(unicode_char)
-        if unicode_char in seen_unicode:
-            pua_codepoint = next_pua
-            while chr(pua_codepoint) in used_dst:
-                pua_codepoint += 1
-                if pua_codepoint > 0xF8FF:
-                    pua_codepoint = 0xF000
-            next_pua = pua_codepoint + 1
-            if next_pua > 0xF8FF:
-                next_pua = 0xF000
-            pua_char = chr(pua_codepoint)
-            used_dst.add(pua_char)
-            pua_hex = pua_char.encode("utf-16-be").hex().upper()
-            replacements.append((index, src, dst, pua_hex))
+        if unicode_char in seen_unicode or _is_unreliable_tounicode_text(
+            unicode_char
+        ):
+            fallback_codepoint = next_fallback
+            while chr(fallback_codepoint) in used_dst:
+                fallback_codepoint += 1
+                if fallback_codepoint > 0x257F:
+                    fallback_codepoint = 0x2500
+            next_fallback = fallback_codepoint + 1
+            if next_fallback > 0x257F:
+                next_fallback = 0x2500
+            fallback_char = chr(fallback_codepoint)
+            used_dst.add(fallback_char)
+            fallback_hex = fallback_char.encode("utf-16-be").hex().upper()
+            replacements.append((index, src, dst, fallback_hex))
         else:
             seen_unicode[unicode_char] = src
 

@@ -10,6 +10,7 @@ import pikepdf
 
 from lib.layout_table_sweep import (
     _logical_row_widths,
+    _owner_attribute_values,
     _table_rows_and_cells,
     repair_layout_tables,
 )
@@ -700,7 +701,9 @@ class LayoutTableSweepTests(unittest.TestCase):
 
         self.assertEqual(result.actions, [
             "table1: removed proven Neptune empty header placeholders",
+            "table1: normalized /Summary attribute",
             "table2: removed proven Neptune empty header placeholders",
+            "table2: normalized /Summary attribute",
         ])
         self.assertEqual(result.unresolved, [])
         with pikepdf.open(io.BytesIO(original)) as before, pikepdf.open(
@@ -716,6 +719,11 @@ class LayoutTableSweepTests(unittest.TestCase):
                 for node in _iter_tables(after.Root["/StructTreeRoot"])
                 if node.get("/S") == "/Table"
             ]
+            for table in after_tables:
+                self.assertNotIn("/Summary", table)
+                self.assertTrue(
+                    list(_owner_attribute_values(table, "/Summary", "/Table"))
+                )
             self.assertEqual(len(before_tables), 2)
             self.assertEqual(len(after_tables), 2)
             for before_table, after_table in zip(before_tables, after_tables):

@@ -9,6 +9,9 @@ from numbers import Integral
 import pikepdf
 
 from lib.figure_alt_quality import SuspiciousFigureAlt, classify_figure_alt, struct_class_names
+from lib.marked_content_actualtext_sweep import (
+    list_untagged_image_mcids_missing_actualtext,
+)
 from lib.tagged_content_sweep import collect_tagged_content_diagnostics
 
 
@@ -39,6 +42,7 @@ class PdfA11yAudit:
     mapped_mcid_count: int = 0
     unresolved_mcids: list[str] = field(default_factory=list)
     parent_tree_keys: list[int] = field(default_factory=list)
+    nonfigure_image_mcids_missing_alt: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -106,6 +110,28 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         if isinstance(value, pikepdf.Name):
             return str(value).lstrip("/").strip()
         return None
+
+    def owner_attribute_values(
+        obj: pikepdf.Dictionary,
+        key: str,
+        owner: str,
+    ) -> list[object]:
+        values: list[object] = []
+        for container_key in ("/A", "/Attributes"):
+            attributes = obj.get(container_key)
+            candidates = (
+                list(attributes)
+                if isinstance(attributes, pikepdf.Array)
+                else [attributes]
+            )
+            for candidate in candidates:
+                if (
+                    isinstance(candidate, pikepdf.Dictionary)
+                    and candidate.get("/O") == owner
+                    and candidate.get(key) is not None
+                ):
+                    values.append(candidate[key])
+        return values
 
     def span_value(cell: pikepdf.Dictionary, key: str) -> int | None:
         values: list[object] = []
@@ -219,8 +245,8 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
             if obj.get("/S") == "/Table":
                 table_count += 1
                 table_label = f"table{table_count}"
-                summary = obj.get("/Summary")
-                if summary is None or not str(summary).strip():
+                summaries = owner_attribute_values(obj, "/Summary", "/Table")
+                if not any(str(summary).strip() for summary in summaries):
                     tables_without_summary += 1
                 descendants = descendant_dicts(obj)
                 th_nodes = [
@@ -371,4 +397,7 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         mapped_mcid_count=tagged_content.mapped_mcid_count,
         unresolved_mcids=tagged_content.unresolved_mcids,
         parent_tree_keys=tagged_content.parent_tree_keys,
+        nonfigure_image_mcids_missing_alt=(
+            list_untagged_image_mcids_missing_actualtext(pdf_bytes)
+        ),
     )

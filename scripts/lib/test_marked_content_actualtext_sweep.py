@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import re
 import unittest
+import unittest.mock
 
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from lib.marked_content_actualtext_sweep import (
     _set_struct_page_if_missing,
     count_li_lbl_missing_actualtext,
     count_orphan_marked_missing_actualtext,
+    list_untagged_image_mcids_missing_actualtext,
     repair_marked_content_actualtext,
 )
 
@@ -418,6 +420,36 @@ class ExtraCharSpanNestedAltRegressionTests(unittest.TestCase):
 
 
 class NestedFigureAltRegressionTests(unittest.TestCase):
+    def test_preserves_figure_backed_by_form_xobject(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"q /Figure<</MCID 4 >> BDC /Fm0 Do EMC Q"
+        )
+        figure = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Figure"),
+                "/Alt": "Derivative graph",
+                "/Pg": page.obj,
+                "/K": 4,
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([figure]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+        original = buf.getvalue()
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        self.assertEqual(repaired, original)
+        self.assertNotIn("converted non-image Figure", "\n".join(result.actions))
+
     def test_figure_alt_precedence_skips_shared_list_image_mcid(self) -> None:
         pdf = pikepdf.Pdf.new()
         page = pdf.add_blank_page()
@@ -923,6 +955,139 @@ class NucleicAcidsRegressionTests(unittest.TestCase):
             after_len = len(_read_page_contents(after.pages[0]["/Contents"]))
         self.assertGreater(result.mcids_updated, 0)
         self.assertLess(after_len, before_len * 1.05)
+
+
+def _build_untagged_image_pdf(page_stream: bytes, *, struct_role: str = "/P") -> bytes:
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    image = pikepdf.Stream(pdf, b"\xff")
+    image["/Type"] = pikepdf.Name("/XObject")
+    image["/Subtype"] = pikepdf.Name("/Image")
+    image["/Width"] = 1
+    image["/Height"] = 1
+    image["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+    image["/BitsPerComponent"] = 8
+    page["/Resources"] = pikepdf.Dictionary(
+        {"/XObject": pikepdf.Dictionary({"/Im1": image})}
+    )
+    page["/Contents"] = pdf.make_stream(page_stream)
+
+    element = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name(struct_role),
+            "/K": pikepdf.Array([0]),
+            "/Pg": page.obj,
+        }
+    )
+    document = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Document"),
+            "/K": pikepdf.Array([element]),
+        }
+    )
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array([document]),
+        }
+    )
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+class UntaggedImageActualTextTests(unittest.TestCase):
+    _IMAGE_ONLY_STREAM = (
+        b"/P <</MCID 0>> BDC q 50 0 0 50 20 20 cm /Im1 Do Q EMC"
+    )
+    _MIXED_STREAM = (
+        b"/P <</MCID 0>> BDC BT (Hello there) Tj ET "
+        b"q 50 0 0 50 20 100 cm /Im1 Do Q EMC"
+    )
+
+    def test_repair_injects_actualtext_for_image_only_p_mcid(self) -> None:
+        pdf_bytes = _build_untagged_image_pdf(self._IMAGE_ONLY_STREAM)
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="x equals one",
+        ):
+            repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertGreaterEqual(result.mcids_updated, 1)
+        contents = _page_contents_text(repaired)
+        self.assertEqual(_actualtext_for_mcid(contents, 0), "x equals one")
+
+    def test_repair_wraps_image_inside_mixed_text_mcid(self) -> None:
+        pdf_bytes = _build_untagged_image_pdf(self._MIXED_STREAM)
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="y axis label",
+        ):
+            repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertGreaterEqual(result.mcids_updated, 1)
+        contents = _page_contents_text(repaired)
+        self.assertIn("(Hello there) Tj", contents)
+        self.assertIsNone(_actualtext_for_mcid(contents, 0))
+        self.assertRegex(
+            contents,
+            r"/Span << /ActualText \(y axis label\) >> BDC /Im1 Do EMC",
+        )
+
+    def test_repair_is_idempotent(self) -> None:
+        for stream in (self._IMAGE_ONLY_STREAM, self._MIXED_STREAM):
+            pdf_bytes = _build_untagged_image_pdf(stream)
+            with unittest.mock.patch(
+                "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+                return_value="stable text",
+            ):
+                repaired, first = repair_marked_content_actualtext(pdf_bytes)
+                again, second = repair_marked_content_actualtext(repaired)
+            self.assertGreaterEqual(first.mcids_updated, 1)
+            untagged_actions = [
+                action for action in second.actions if "untagged image" in action
+            ]
+            self.assertEqual(untagged_actions, [])
+            self.assertEqual(
+                _page_contents_text(again).count("stable text"),
+                _page_contents_text(repaired).count("stable text"),
+            )
+
+    def test_repair_skips_element_with_alt(self) -> None:
+        pdf_bytes = _build_untagged_image_pdf(self._IMAGE_ONLY_STREAM)
+        with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+            document = pdf.Root["/StructTreeRoot"]["/K"][0]
+            element = document["/K"][0]
+            element["/Alt"] = pikepdf.String("Already described")
+            buf = io.BytesIO()
+            pdf.save(buf)
+            pdf_bytes = buf.getvalue()
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="unused",
+        ):
+            repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertIsNone(_actualtext_for_mcid(_page_contents_text(repaired), 0))
+        untagged_actions = [
+            action for action in result.actions if "untagged image" in action
+        ]
+        self.assertEqual(untagged_actions, [])
+
+    def test_list_untagged_image_mcids_before_and_after_repair(self) -> None:
+        for stream in (self._IMAGE_ONLY_STREAM, self._MIXED_STREAM):
+            pdf_bytes = _build_untagged_image_pdf(stream)
+            self.assertEqual(
+                list_untagged_image_mcids_missing_actualtext(pdf_bytes),
+                ["page1 mcid0"],
+            )
+            with unittest.mock.patch(
+                "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+                return_value="spoken text",
+            ):
+                repaired, _ = repair_marked_content_actualtext(pdf_bytes)
+            self.assertEqual(
+                list_untagged_image_mcids_missing_actualtext(repaired), []
+            )
 
 
 if __name__ == "__main__":

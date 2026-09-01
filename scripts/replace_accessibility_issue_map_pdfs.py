@@ -37,6 +37,16 @@ def parse_args() -> argparse.Namespace:
             metavar="TOPIC_ID",
             help="Explicitly allow one manually verified non-resolved topic",
         )
+        subparser.add_argument(
+            "--approved-render-exception",
+            action="append",
+            default=[],
+            metavar="TOPIC_ID",
+            help=(
+                "Explicitly allow one visually reviewed topic whose repaired "
+                "PDF renders differently from the original"
+            ),
+        )
         if command == "apply":
             subparser.add_argument("--approved-sha", required=True)
 
@@ -110,6 +120,7 @@ def main() -> int:
             args.approved_sha if args.command == "apply" else None
         ),
         approved_exceptions=set(args.approved_exception),
+        approved_render_exceptions=set(args.approved_render_exception),
         invalidate=invalidate if args.command == "apply" else None,
     )
     print(

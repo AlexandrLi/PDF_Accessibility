@@ -29,6 +29,14 @@ If Adobe manually passes a topic that the local checker marked residual or
 unverifiable, add that exact topic explicitly with
 `--approved-exception <topic-id>`. Never apply a course-wide exception.
 
+If a repaired PDF intentionally renders differently from the original (for
+example an Adobe Auto-Tag or OCR rebuild accepted with
+`--allow-render-change`), the manifest must record `renderIdentical: false`
+honestly. Publishing such a topic requires the user to visually review it and
+pass that exact topic with `--approved-render-exception <topic-id>`. Never
+set `renderIdentical: true` for a file whose rendered pages changed, and never
+apply a course-wide render exception.
+
 Never publish before explicit user approval. The publish command is
 fail-closed: it preflights every object, verifies recovery for every object,
 then replaces and reads back each PDF. Use its recorded report for rollback:

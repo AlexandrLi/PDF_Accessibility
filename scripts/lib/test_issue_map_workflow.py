@@ -19,6 +19,22 @@ def _pdf_bytes() -> bytes:
     pdf = pikepdf.new()
     page = pdf.add_blank_page(page_size=(200, 200))
     page.obj["/Tabs"] = pikepdf.Name("/S")
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array(
+                [
+                    pikepdf.Dictionary(
+                        {
+                            "/Type": pikepdf.Name("/StructElem"),
+                            "/S": pikepdf.Name("/Document"),
+                        }
+                    )
+                ]
+            ),
+        }
+    )
     output = io.BytesIO()
     pdf.save(output)
     return output.getvalue()

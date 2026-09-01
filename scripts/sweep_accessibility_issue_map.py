@@ -369,6 +369,22 @@ def build_residual_diagnostics(
         tracked_categories["Tables Regularity"] = _audit_category_diagnostics(
             audit, "tablesregularity"
         )
+    if audit and audit.get("struct_tree_root_present") is False:
+        tracked_categories["Tagged Content"] = {
+            "status": "residual",
+            "evidence": [
+                "PDF has no structure tree after local sweeps; Adobe auto-tagging is required"
+            ],
+        }
+    untagged_images = (audit or {}).get("nonfigure_image_mcids_missing_alt") or []
+    if untagged_images:
+        tracked_categories["Other Elements Alternate Text"] = {
+            "status": "residual",
+            "evidence": [
+                f"image content without alternate text at {label}"
+                for label in untagged_images
+            ],
+        }
     return {
         "layoutTable": {
             "unresolved": layout.get("unresolved") or [],

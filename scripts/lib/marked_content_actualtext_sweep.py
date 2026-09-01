@@ -7,6 +7,7 @@ import re
 from dataclasses import asdict, dataclass
 
 import pikepdf
+import pymupdf
 
 from lib.figure_alt_quality import looks_like_table_figure_alt, struct_class_names
 from lib.figure_to_table_sweep import _parse_column_headers, _parse_table_rows
@@ -142,7 +143,7 @@ def _get_mcid_block(data: bytes, mcid: int) -> tuple[str, bytes] | None:
 
 
 def _mcid_body_has_image(body: bytes) -> bool:
-    return bool(re.search(rb"/Im\d+\s+Do", body))
+    return bool(re.search(rb"/[^\s/<>{}\[\]()]+\s+Do\b", body))
 
 
 def _is_image_only_mcid_body(body: bytes) -> bool:
@@ -1412,6 +1413,306 @@ def _inject_actualtext_batch_on_page(
     return updated
 
 
+_UNTAGGED_IMAGE_FALLBACK_ACTUALTEXT = "Figure"
+
+
+def _element_has_own_alt(obj: pikepdf.Dictionary) -> bool:
+    for key in ("/Alt", "/ActualText"):
+        value = obj.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
+def _page_image_names(page: pikepdf.Page | pikepdf.Dictionary) -> set[str]:
+    resources = page.get("/Resources")
+    if not isinstance(resources, pikepdf.Dictionary):
+        return set()
+    xobjects = resources.get("/XObject")
+    if not isinstance(xobjects, pikepdf.Dictionary):
+        return set()
+    names: set[str] = set()
+    for name, candidate in xobjects.items():
+        subtype = candidate.get("/Subtype") if hasattr(candidate, "get") else None
+        if subtype == "/Image":
+            names.add(str(name).lstrip("/"))
+    return names
+
+
+def _mcid_image_xobject_names(body: bytes) -> list[str]:
+    return [
+        match.group(1).decode("latin1")
+        for match in re.finditer(rb"/([^\s/<>{}\[\]()]+)\s+Do\b", body)
+    ]
+
+
+_MARKED_CONTENT_TOKEN = re.compile(rb"\b(BDC|BMC|EMC)\b")
+
+
+def _get_mcid_block_to_emc(data: bytes, mcid: int) -> tuple[int, int, bytes] | None:
+    """Return the (start, end, body) of an MCID block bounded by its own EMC.
+
+    Unlike _get_mcid_block, this does not stop at an inner ET or at a nested
+    marked-content EMC, so mixed text-and-image bodies keep every operator.
+    """
+    open_pattern = re.compile(
+        rb"/(?P<tag>" + _MCID_BDC_TAG + rb")\s*<<"
+        rb"(?:(?!>>).)*?/MCID\s+"
+        + _mcid_token(mcid)
+        + rb"(?:(?!>>).)*?>>\s*BDC",
+        re.DOTALL,
+    )
+    match = open_pattern.search(data)
+    if match is None:
+        return None
+    depth = 1
+    for token in _MARKED_CONTENT_TOKEN.finditer(data, match.end()):
+        if token.group(1) in (b"BDC", b"BMC"):
+            depth += 1
+        else:
+            depth -= 1
+            if depth == 0:
+                start = match.end()
+                return start, token.start(), data[start : token.start()]
+    return None
+
+
+def _ocr_page_clip_text(fitz_page: pymupdf.Page, rect: pymupdf.Rect) -> str:
+    try:
+        pixmap = fitz_page.get_pixmap(dpi=200, clip=rect)
+        ocr_doc = pymupdf.open(
+            stream=pixmap.pdfocr_tobytes(language="eng", compress=True),
+            filetype="pdf",
+        )
+        text = ocr_doc[0].get_text()
+        ocr_doc.close()
+    except (RuntimeError, ValueError, IndexError):
+        return ""
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip("|").strip()
+
+
+def _wrap_image_do_with_actualtext(
+    data: bytes,
+    *,
+    mcid: int,
+    image_texts: dict[str, str],
+) -> tuple[bytes, bool]:
+    block = _get_mcid_block_to_emc(data, mcid)
+    if block is None:
+        return data, False
+    start, end, body = block
+    changed = False
+    for name, text in image_texts.items():
+        do_pattern = re.compile(
+            rb"/" + re.escape(name.encode("latin1")) + rb"\s+Do\b(?!\s*EMC)"
+        )
+
+        def wrap(do_match: re.Match[bytes]) -> bytes:
+            return (
+                b"/Span << /ActualText "
+                + _pdf_literal_string(text)
+                + b" >> BDC "
+                + do_match.group(0)
+                + b" EMC"
+            )
+
+        body, count = do_pattern.subn(wrap, body)
+        changed = changed or count > 0
+    if not changed:
+        return data, False
+    return data[:start] + body + data[end:], True
+
+
+def _repair_untagged_image_actualtext(
+    pdf: pikepdf.Pdf,
+    *,
+    actions: list[str],
+) -> int:
+    """Add /ActualText for image content owned by non-Figure elements without alt."""
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return 0
+
+    targets: list[pikepdf.Dictionary] = []
+
+    def collect(obj: pikepdf.Dictionary, covered: bool) -> None:
+        tag = obj.get("/S")
+        if tag is not None:
+            covered = covered or _element_has_own_alt(obj)
+            if tag == "/Figure":
+                covered = True
+            elif not covered and _collect_mcids(obj.get("/K")):
+                targets.append(obj)
+        for child in _struct_child_dicts(obj):
+            collect(child, covered)
+
+    collect(struct_root, False)
+    if not targets:
+        return 0
+
+    page_indices = {page.objgen: index for index, page in enumerate(pdf.pages)}
+    page_states: dict[tuple[int, int], tuple[pikepdf.Page, bytes]] = {}
+    dirty_pages: set[tuple[int, int]] = set()
+    fitz_doc: pymupdf.Document | None = None
+    ocr_cache: dict[tuple[tuple[int, int], str], str] = {}
+    updated = 0
+
+    for obj in targets:
+        page = _resolve_struct_page(pdf, obj)
+        if page is None:
+            continue
+        page_key = page.objgen
+        if page_key not in page_states:
+            contents = page.get("/Contents")
+            page_states[page_key] = (
+                page,
+                _read_page_contents(contents) if contents is not None else b"",
+            )
+        page_ref, data = page_states[page_key]
+        if not data:
+            continue
+        image_names = _page_image_names(page_ref)
+        if not image_names:
+            continue
+        for mcid in _collect_mcids(obj.get("/K")):
+            block = _get_mcid_block_to_emc(data, mcid)
+            if block is None:
+                continue
+            body = block[2]
+            names = [
+                name
+                for name in dict.fromkeys(_mcid_image_xobject_names(body))
+                if name in image_names
+                and re.search(
+                    rb"/" + re.escape(name.encode("latin1")) + rb"\s+Do\b(?!\s*EMC)",
+                    body,
+                )
+            ]
+            if not names or _mcid_bdc_has_actualtext(data, mcid):
+                continue
+            if fitz_doc is None:
+                buffer = io.BytesIO()
+                pdf.save(buffer)
+                fitz_doc = pymupdf.open(stream=buffer.getvalue(), filetype="pdf")
+            page_index = page_indices.get(page_key)
+            image_texts: dict[str, str] = {}
+            for name in names:
+                cache_key = (page_key, name)
+                if cache_key not in ocr_cache:
+                    text = ""
+                    if page_index is not None:
+                        fitz_page = fitz_doc[page_index]
+                        rects = fitz_page.get_image_rects(name)
+                        if rects:
+                            text = _ocr_page_clip_text(fitz_page, rects[0])
+                    ocr_cache[cache_key] = text
+                image_texts[name] = (
+                    ocr_cache[cache_key] or _UNTAGGED_IMAGE_FALLBACK_ACTUALTEXT
+                )
+            if _is_image_only_mcid_body(body):
+                combined = " ".join(dict.fromkeys(image_texts.values()))
+                data, changed = _inject_actualtext_in_data(
+                    data,
+                    mcid=mcid,
+                    actual_text=combined,
+                )
+            else:
+                data, changed = _wrap_image_do_with_actualtext(
+                    data,
+                    mcid=mcid,
+                    image_texts=image_texts,
+                )
+            if changed:
+                page_states[page_key] = (page_ref, data)
+                dirty_pages.add(page_key)
+                updated += 1
+                actions.append(
+                    f"mcid {mcid}: added /ActualText to untagged image content"
+                )
+
+    for page_key in dirty_pages:
+        page_ref, data = page_states[page_key]
+        page_ref["/Contents"] = pdf.make_stream(data, compress=True)
+    return updated
+
+
+def list_untagged_image_mcids_missing_actualtext(pdf_bytes: bytes) -> list[str]:
+    """Label image MCIDs owned by alt-less non-Figure elements, e.g. 'page6 mcid25'."""
+    labels: list[str] = []
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        struct_root = pdf.Root.get("/StructTreeRoot")
+        if struct_root is None:
+            return labels
+
+        targets: list[pikepdf.Dictionary] = []
+
+        def collect(obj: pikepdf.Dictionary, covered: bool) -> None:
+            tag = obj.get("/S")
+            if tag is not None:
+                covered = covered or _element_has_own_alt(obj)
+                if tag == "/Figure":
+                    covered = True
+                elif not covered and _collect_mcids(obj.get("/K")):
+                    targets.append(obj)
+            for child in _struct_child_dicts(obj):
+                collect(child, covered)
+
+        collect(struct_root, False)
+
+        page_indices = {page.objgen: index for index, page in enumerate(pdf.pages)}
+        page_cache: dict[tuple[int, int], tuple[pikepdf.Page, bytes]] = {}
+        seen: set[tuple[tuple[int, int], int]] = set()
+        for obj in targets:
+            page = _resolve_struct_page(pdf, obj)
+            if page is None:
+                continue
+            page_key = page.objgen
+            if page_key not in page_cache:
+                contents = page.get("/Contents")
+                page_cache[page_key] = (
+                    page,
+                    _read_page_contents(contents) if contents is not None else b"",
+                )
+            page_ref, data = page_cache[page_key]
+            if not data:
+                continue
+            image_names = _page_image_names(page_ref)
+            if not image_names:
+                continue
+            for mcid in _collect_mcids(obj.get("/K")):
+                if (page_key, mcid) in seen:
+                    continue
+                block = _get_mcid_block_to_emc(data, mcid)
+                if block is None:
+                    continue
+                body = block[2]
+                names = [
+                    name
+                    for name in _mcid_image_xobject_names(body)
+                    if name in image_names
+                ]
+                if not names or _mcid_bdc_has_actualtext(data, mcid):
+                    continue
+                unwrapped = [
+                    name
+                    for name in names
+                    if re.search(
+                        rb"/" + re.escape(name.encode("latin1")) + rb"\s+Do\b(?!\s*EMC)",
+                        body,
+                    )
+                ]
+                if not unwrapped:
+                    continue
+                seen.add((page_key, mcid))
+                page_number = page_indices.get(page_key)
+                page_label = (
+                    f"page{page_number + 1}" if page_number is not None else "page?"
+                )
+                labels.append(f"{page_label} mcid{mcid}")
+    return labels
+
+
 def _struct_page_ref(page: pikepdf.Page | pikepdf.Dictionary) -> pikepdf.Dictionary:
     """Return a page dictionary suitable for struct-tree /Pg entries."""
     if isinstance(page, pikepdf.Page):
@@ -1554,6 +1855,7 @@ def repair_marked_content_actualtext(
         mcids_updated += _repair_list_item_label_actualtext(pdf, actions=actions)
         _repair_figure_mcid_linkage_and_tags(pdf, actions=actions)
         mcids_updated += _repair_orphan_marked_content_actualtext(pdf, actions=actions)
+        mcids_updated += _repair_untagged_image_actualtext(pdf, actions=actions)
         _repair_figure_alt_precedence(pdf, actions=actions)
         _repair_figure_duplicate_contents(pdf, actions=actions)
 

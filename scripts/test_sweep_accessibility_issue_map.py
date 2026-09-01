@@ -61,6 +61,26 @@ class AccessibilityIssueMapSweepTests(unittest.TestCase):
 
         self.assertEqual(classify_residual_status(diagnostics), ("resolved", "swept"))
 
+    def test_untagged_pdf_is_not_classified_as_resolved(self) -> None:
+        diagnostics = build_residual_diagnostics(
+            _sweep_result(
+                audit={
+                    "struct_tree_root_present": False,
+                    "table_count": 0,
+                }
+            ),
+            "Tab Order",
+        )
+
+        self.assertEqual(
+            diagnostics["categories"]["Tagged Content"]["status"],
+            "residual",
+        )
+        self.assertEqual(
+            classify_residual_status(diagnostics),
+            ("residual", "swept-with-residuals"),
+        )
+
     def test_missing_th_or_explicit_header_reference_is_residual(self) -> None:
         for audit in (
             {"table_count": 1, "tables_without_th": 1},

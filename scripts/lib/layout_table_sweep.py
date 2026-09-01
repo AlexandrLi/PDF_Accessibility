@@ -825,14 +825,116 @@ def _remove_key(obj: pikepdf.Dictionary, key: str) -> None:
         del obj[key]
 
 
+def _set_owner_attribute(
+    obj: pikepdf.Dictionary,
+    *,
+    owner: str,
+    key: str,
+    value: object | None,
+) -> bool:
+    attributes = obj.get("/A")
+    items = list(attributes) if isinstance(attributes, pikepdf.Array) else [attributes]
+    owner_items = [
+        item
+        for item in items
+        if isinstance(item, pikepdf.Dictionary) and item.get("/O") == owner
+    ]
+    changed = False
+    if not owner_items:
+        attribute = pikepdf.Dictionary({"/O": pikepdf.Name(owner)})
+        if value is not None:
+            attribute[key] = value
+        if attributes is None:
+            obj["/A"] = attribute
+        elif isinstance(attributes, pikepdf.Array):
+            attributes.append(attribute)
+        else:
+            obj["/A"] = pikepdf.Array([attributes, attribute])
+        return True
+
+    for attribute in owner_items:
+        existing = attribute.get(key)
+        if value is None:
+            if existing is not None:
+                del attribute[key]
+                changed = True
+        elif existing != value:
+            attribute[key] = value
+            changed = True
+    return changed
+
+
+def _reconcile_declared_column_spans(
+    table: pikepdf.Dictionary,
+    rows: list[pikepdf.Dictionary],
+) -> bool:
+    declared_columns = _single_nonnegative_attribute(
+        list(_owner_attribute_values(table, "/ADBE_NumCol", "/Table"))
+    )
+    if declared_columns is None or declared_columns < 1:
+        return False
+
+    row_cells: list[tuple[list[pikepdf.Dictionary], list[int]]] = []
+    for row in rows:
+        cells = _row_direct_cells(row)
+        indices = [
+            _single_nonnegative_attribute(
+                list(_owner_attribute_values(cell, "/ADBE_ColIndex", "/Table"))
+            )
+            for cell in cells
+        ]
+        if (
+            not cells
+            or any(index is None for index in indices)
+            or indices[0] != 0
+            or indices != sorted(set(indices))
+            or indices[-1] >= declared_columns
+        ):
+            return False
+        row_cells.append((cells, [index for index in indices if index is not None]))
+
+    changed = False
+    for cells, indices in row_cells:
+        boundaries = [*indices[1:], declared_columns]
+        for cell, start, end in zip(cells, indices, boundaries):
+            desired_span = end - start
+            if desired_span < 1:
+                return False
+            if "/ColSpan" in cell:
+                del cell["/ColSpan"]
+                changed = True
+            changed |= _set_owner_attribute(
+                cell,
+                owner="/Table",
+                key="/ColSpan",
+                value=desired_span if desired_span > 1 else None,
+            )
+    return changed
+
+
 def _ensure_summary(
     table: pikepdf.Dictionary,
     index: int,
     changed: list[bool],
 ) -> None:
-    summary = str(table.get("/Summary") or "").strip()
+    direct_summary = str(table.get("/Summary") or "").strip()
+    attribute_summaries = [
+        str(value).strip()
+        for value in _owner_attribute_values(table, "/Summary", "/Table")
+        if str(value).strip()
+    ]
+    summary = attribute_summaries[0] if attribute_summaries else direct_summary
     if not summary:
-        table["/Summary"] = pikepdf.String(f"Table {index}")
+        summary = f"Table {index}"
+    if _set_owner_attribute(
+        table,
+        owner="/Table",
+        key="/Summary",
+        value=pikepdf.String(summary),
+    ):
+        changed[0] = True
+    if "/Summary" in table:
+        del table["/Summary"]
         changed[0] = True
 
 
@@ -1278,6 +1380,11 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                 rows, cells = _table_rows_and_cells(table)
 
             table_changed = [False]
+            if _reconcile_declared_column_spans(table, rows):
+                table_changed[0] = True
+                actions.append(
+                    f"table{index}: reconciled spans with declared Adobe column indices"
+                )
             _ensure_summary(table, index, table_changed)
             before_conflicts = len(conflicts)
             compact_two_row_header = (
@@ -1303,7 +1410,9 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                     unresolved.append(f"table{index}: ambiguous structure retained as /Table")
                 if table_changed[0]:
                     changed = True
-                    actions.append(f"table{index}: retained ambiguous /Table with /Summary")
+                    actions.append(
+                        f"table{index}: retained ambiguous /Table with normalized /Summary"
+                    )
                 continue
             if differing_widths:
                 ambiguous_tables += 1
@@ -1323,7 +1432,7 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                 actions.append(f"table{index}: retained existing metadata and reported conflicts")
             if table_changed[0] and not was_changed:
                 changed = True
-                actions.append(f"table{index}: added missing /Summary")
+                actions.append(f"table{index}: normalized /Summary attribute")
 
         result = LayoutTableRepairResult(
             tables_found=len(tables),

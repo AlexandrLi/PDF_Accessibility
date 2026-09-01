@@ -401,6 +401,67 @@ class S3PdfReplacementTests(unittest.TestCase):
         self.assertEqual(report["approvedExceptions"], ["topic"])
         self.assertEqual(report["summary"]["planned"], 1)
 
+    def test_render_changed_topic_is_rejected_without_exception(self) -> None:
+        self.manifest["topics"][0]["renderIdentical"] = False
+        self._write_manifest()
+        s3 = self._s3()
+
+        with self.assertRaisesRegex(ReplacementError, "rendering was not verified"):
+            publish_manifest(
+                self.manifest_path,
+                self.report_path,
+                self.root,
+                s3,
+                apply=False,
+            )
+
+        self.assertEqual(s3.put_count, 0)
+        self.assertEqual(s3.copy_count, 0)
+
+    def test_exact_render_exception_allows_visually_reviewed_topic(self) -> None:
+        self.manifest["topics"][0]["renderIdentical"] = False
+        self._write_manifest()
+
+        report = publish_manifest(
+            self.manifest_path,
+            self.report_path,
+            self.root,
+            self._s3(),
+            apply=False,
+            approved_render_exceptions={"topic"},
+        )
+
+        self.assertEqual(report["approvedRenderExceptions"], ["topic"])
+        self.assertEqual(report["summary"]["planned"], 1)
+
+    def test_unknown_render_exception_topic_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ReplacementError, "render exception topic IDs"
+        ):
+            publish_manifest(
+                self.manifest_path,
+                self.report_path,
+                self.root,
+                self._s3(),
+                apply=False,
+                approved_render_exceptions={"missing-topic"},
+            )
+
+    def test_render_exception_does_not_bypass_resolved_status(self) -> None:
+        self.manifest["topics"][0]["resultKind"] = "residual"
+        self.manifest["topics"][0]["renderIdentical"] = False
+        self._write_manifest()
+
+        with self.assertRaisesRegex(ReplacementError, "requires resolved"):
+            publish_manifest(
+                self.manifest_path,
+                self.report_path,
+                self.root,
+                self._s3(),
+                apply=False,
+                approved_render_exceptions={"topic"},
+            )
+
     def test_legacy_detailed_manifest_is_normalized_safely(self) -> None:
         self.manifest = {
             "course": {

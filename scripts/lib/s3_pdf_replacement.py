@@ -235,7 +235,9 @@ def _validate_manifest_scope(
     manifest: dict[str, Any],
     root: Path,
     approved_exceptions: set[str],
+    approved_render_exceptions: set[str] | None = None,
 ) -> None:
+    render_exceptions = approved_render_exceptions or set()
     course = manifest.get("course") or {}
     course_id = str(course.get("courseId") or "")
     bucket = str(course.get("bucket") or "")
@@ -265,7 +267,10 @@ def _validate_manifest_scope(
             raise ReplacementError(
                 f"{topic_id}: manual publication requires resolved status"
             )
-        if topic.get("renderIdentical") is not True:
+        if (
+            topic.get("renderIdentical") is not True
+            and topic_id not in render_exceptions
+        ):
             raise ReplacementError(f"{topic_id}: rendering was not verified")
         if topic.get("secondPassByteStable") is not True:
             raise ReplacementError(f"{topic_id}: second pass was not stable")
@@ -277,6 +282,12 @@ def _validate_manifest_scope(
     if unknown_exceptions:
         raise ReplacementError(
             f"Approved exception topic IDs are not in the manifest: {sorted(unknown_exceptions)}"
+        )
+    unknown_render_exceptions = render_exceptions - seen_topics
+    if unknown_render_exceptions:
+        raise ReplacementError(
+            "Approved render exception topic IDs are not in the manifest: "
+            f"{sorted(unknown_render_exceptions)}"
         )
 
 
@@ -472,13 +483,15 @@ def publish_manifest(
     apply: bool,
     approved_manifest_sha256: str | None = None,
     approved_exceptions: set[str] | None = None,
+    approved_render_exceptions: set[str] | None = None,
     invalidate: Callable[[list[str]], str | None] | None = None,
 ) -> dict[str, Any]:
     manifest_path = manifest_path.resolve()
     digest = manifest_sha256(manifest_path)
     manifest = _load_manifest(manifest_path, root)
     exceptions = approved_exceptions or set()
-    _validate_manifest_scope(manifest, root, exceptions)
+    render_exceptions = approved_render_exceptions or set()
+    _validate_manifest_scope(manifest, root, exceptions, render_exceptions)
     if apply and approved_manifest_sha256 != digest:
         raise ReplacementError(
             "Approved manifest SHA-256 does not match the current manifest"
@@ -486,6 +499,7 @@ def publish_manifest(
 
     report = _empty_report(manifest_path, digest, manifest, apply=apply)
     report["approvedExceptions"] = sorted(exceptions)
+    report["approvedRenderExceptions"] = sorted(render_exceptions)
     course = report["course"]
     bucket = str(course["bucket"])
     course_id = str(course["courseId"])

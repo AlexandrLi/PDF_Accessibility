@@ -14,7 +14,7 @@ dependencies_ready() {
   if [[ -f "$STAMP" && "$STAMP" -nt "$REQUIREMENTS" ]]; then
     return 0
   fi
-  if "$PYTHON" -c 'import boto3, pikepdf, pypdf, pymupdf' >/dev/null 2>&1; then
+  if "$PYTHON" -c 'import adobe.pdfservices, boto3, pikepdf, pypdf, pymupdf' >/dev/null 2>&1; then
     touch "$STAMP"
     return 0
   fi

@@ -154,9 +154,38 @@ endcmap"""
             self.assertIsNotNone(dup_char)
             assert dup_char is not None
             self.assertEqual(len(dup_char), 1)
-            self.assertGreaterEqual(ord(dup_char), 0xF000)
+            self.assertGreaterEqual(ord(dup_char), 0x2500)
+            self.assertLessEqual(ord(dup_char), 0x257F)
             self.assertNotEqual(dup_char, "A")
             self.assertFalse(dup_char.startswith("U+"))
+
+    def test_dedupe_replaces_unreliable_unicode_destinations(self) -> None:
+        cmap = """begincmap
+begincodespacerange
+<00> <FF>
+endcodespacerange
+3 beginbfchar
+<41> <0008>
+<42> <E003>
+<43> <FFFD>
+endbfchar
+endcmap"""
+        with pikepdf.new() as pdf:
+            font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Test"),
+                    ToUnicode=pdf.make_stream(cmap.encode("latin1")),
+                )
+            )
+
+            self.assertTrue(_dedupe_font_tounicode(pdf, font))
+            mapping = _load_tounicode_map(font)
+            self.assertEqual(len(set(mapping.values())), 3)
+            for value in mapping.values():
+                self.assertGreaterEqual(ord(value), 0x2500)
+                self.assertLessEqual(ord(value), 0x257F)
 
     def test_dedupe_bfchar_does_not_corrupt_adjacent_newline_pairs(self) -> None:
         """Regression: regex must not treat dst/src on adjacent lines as one pair."""
@@ -192,7 +221,8 @@ endcmap"""
             assert dup_char is not None
             self.assertNotEqual(dup_char, "U")
             self.assertEqual(len(dup_char), 1)
-            self.assertGreaterEqual(ord(dup_char), 0xF000)
+            self.assertGreaterEqual(ord(dup_char), 0x2500)
+            self.assertLessEqual(ord(dup_char), 0x257F)
 
             buf = io.BytesIO()
             pdf.save(buf)
