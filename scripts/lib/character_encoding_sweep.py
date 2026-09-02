@@ -293,8 +293,32 @@ def _decode_hex_text(hex_text: str, cmap: dict[int, str]) -> str:
     )
 
 
+_BLANK_GLYPH_SHOW_OPERATOR = re.compile(
+    rb"(?P<token>\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>"
+    rb"|\[(?:\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|[^\[\]])*\])\s*(?:Tj|TJ)\b",
+    re.DOTALL,
+)
+
+
 def _body_has_blank_square_glyph(body: bytes) -> bool:
-    return bool(re.search(rb"<0191", body))
+    """True only when the 0191 glyph is this block's sole rendered content.
+
+    The same glyph also prefixes ordinary bulleted sentences ("[ ] Recall
+    the calculation..."), and when a marked-content block spans a shared
+    text object (BT opened by a sibling MCID), that whole sentence can live
+    in the same block. A bare substring search can't tell the two apart, so
+    require every OTHER show operator in the block to draw nothing but
+    whitespace/underscore filler before calling it a lone blank answer line.
+    """
+    if not re.search(rb"<0191(?!\d)", body):
+        return False
+    for match in _BLANK_GLYPH_SHOW_OPERATOR.finditer(body):
+        token = match.group("token")
+        if b"0191" in token:
+            continue
+        if _shown_bytes(token).strip(b" _"):
+            return False
+    return True
 
 
 def _spoken_for_symbol_block(body: bytes, decoded: str) -> str | None:
@@ -698,6 +722,35 @@ def _build_tounicode_cmap(entries: dict[int, str], *, two_byte: bool) -> bytes:
     return "\r\n".join(lines).encode("latin1")
 
 
+def _winansi_char(code: int) -> str | None:
+    """The character a /WinAnsiEncoding code denotes, or None if undefined."""
+    if code < 0x20:
+        return None
+    try:
+        return bytes([code]).decode("cp1252")
+    except UnicodeDecodeError:
+        return None
+
+
+def _font_code_space_signature(font: pikepdf.Dictionary) -> str:
+    """Identify the code space a font's ToUnicode map is keyed by.
+
+    Maps are only interchangeable between fonts whose codes mean the same
+    thing: a Type0 Identity map is CID/GID-keyed while a simple font's map is
+    byte-code-keyed, so sharing an embedded font program is not enough.
+    """
+    if font.get("/Subtype") == "/Type0":
+        return "cid-identity" if _font_is_identity_cid(font) else "cid-other"
+    encoding = font.get("/Encoding")
+    if encoding is None:
+        return "simple:none"
+    if isinstance(encoding, pikepdf.Dictionary):
+        base = encoding.get("/BaseEncoding")
+        diffs = encoding.get("/Differences")
+        return f"simple:{base}:diffs={'y' if diffs is not None else 'n'}"
+    return f"simple:{encoding}"
+
+
 def _repair_missing_tounicode(
     pdf: pikepdf.Pdf,
     *,
@@ -706,10 +759,12 @@ def _repair_missing_tounicode(
     """Give ToUnicode maps to fonts that lack one.
 
     A sibling font instance sharing the same embedded font program donates its
-    map (identical glyph space). Codes still unmapped are resolved from
-    evidence: a used TrueType glyph with an empty outline is whitespace, a
-    simple-font code that names a valid codepoint in the font program maps to
-    itself, and anything else gets a reliable placeholder character.
+    map only when both fonts key codes the same way (identical code space).
+    Codes still unmapped are resolved from evidence: a /WinAnsiEncoding code
+    means what the WinAnsi table says, a used TrueType glyph with an empty
+    outline is whitespace, a simple-font code that names a valid codepoint in
+    the font program maps to itself, and anything else gets a reliable
+    placeholder character.
     """
     fonts_by_key: dict[tuple[int, int] | tuple[str, int], pikepdf.Dictionary] = {}
     names_by_key: dict[tuple[int, int] | tuple[str, int], set[str]] = {}
@@ -721,12 +776,15 @@ def _repair_missing_tounicode(
             names_by_key.setdefault(key, set()).add(name)
             pages_by_key.setdefault(key, []).append(page)
 
-    donors: dict[tuple[int, int], pikepdf.Object] = {}
+    donors: dict[tuple[tuple[int, int], str], pikepdf.Object] = {}
     for font in fonts_by_key.values():
         stream = _font_tounicode_stream(font)
         file_stream = _font_file_stream(font)
         if stream is not None and file_stream is not None:
-            donors.setdefault(file_stream.objgen, stream)
+            donors.setdefault(
+                (file_stream.objgen, _font_code_space_signature(font)),
+                stream,
+            )
 
     updated = 0
     for key, font in fonts_by_key.items():
@@ -736,7 +794,13 @@ def _repair_missing_tounicode(
         if is_cid and not _font_is_identity_cid(font):
             continue
         file_stream = _font_file_stream(font)
-        donor = donors.get(file_stream.objgen) if file_stream is not None else None
+        donor = (
+            donors.get(
+                (file_stream.objgen, _font_code_space_signature(font))
+            )
+            if file_stream is not None
+            else None
+        )
 
         entries: dict[int, str] = {}
         donor_data = ""
@@ -765,14 +829,20 @@ def _repair_missing_tounicode(
             except (RuntimeError, ValueError):
                 valid_codepoints = set()
 
+        is_winansi = not is_cid and font.get("/Encoding") == pikepdf.Name(
+            "/WinAnsiEncoding"
+        )
         used_dst = set(entries.values())
         next_fallback = 0x2500
         added: dict[int, str] = {}
         for code in sorted(used - set(entries)):
+            winansi_char = _winansi_char(code) if is_winansi else None
             if is_cid and font_buffer and _truetype_glyph_has_no_outline(
                 font_buffer, code
             ):
                 added[code] = " "
+            elif winansi_char is not None:
+                added[code] = winansi_char
             elif not is_cid and 0x20 <= code <= 0x7E and code in valid_codepoints:
                 added[code] = chr(code)
             else:

@@ -5,6 +5,7 @@ from pathlib import Path
 import pikepdf
 
 from lib.character_encoding_sweep import (
+    _body_has_blank_square_glyph,
     _decode_mcid_text,
     _replace_unreliable_font_tounicode,
     _load_tounicode_map,
@@ -20,6 +21,32 @@ from lib.character_encoding_sweep import (
 _TOPIC_PDF = Path("tmp/ch9-a11y/14aa5258-before.pdf")
 _ENCODING_FIX_DIR = Path("tmp/encoding-fix-review")
 _ENCODING_FIX_TOPIC_IDS = ("182549fe", "3ae3bae9", "6f84ffb1")
+
+
+class BlankSquareGlyphDetectionTests(unittest.TestCase):
+    def test_lone_glyph_is_blank(self) -> None:
+        body = b" BT\r\n/F3 14.04 Tf\r\n1 0 0 1 72.024 653.02 Tm\r\n0 g\r\n[<0191>] TJ\r\nET\r\n"
+        self.assertTrue(_body_has_blank_square_glyph(body))
+
+    def test_glyph_with_trailing_underscores_is_blank(self) -> None:
+        self.assertTrue(_body_has_blank_square_glyph(b" <0191>Tj (____) Tj"))
+
+    def test_glyph_used_as_bullet_marker_before_real_sentence_is_not_blank(
+        self,
+    ) -> None:
+        # Regression: a bullet marker sharing this glyph, immediately
+        # followed by a real sentence in the SAME marked-content block
+        # (because the enclosing BT was opened by a sibling MCID), must not
+        # have its whole sentence overwritten with "blank".
+        body = (
+            b" \n/C2_1 14.04 Tf\n72.024 653.02 Td\n<0191>Tj\n/TT1 12 Tf\n"
+            b"11.76 0 Td\n[(Rec)8 (a)-3 (ll)4 ( t)-3 (h)-3 (e)-3 "
+            b"( c)8 (a)-3 (lcula)-3 (ti)10 (o)-3 (n)-3)]TJ\n"
+        )
+        self.assertFalse(_body_has_blank_square_glyph(body))
+
+    def test_no_glyph_is_not_blank(self) -> None:
+        self.assertFalse(_body_has_blank_square_glyph(b"(hello) Tj"))
 
 
 class CharacterEncodingSweepTests(unittest.TestCase):

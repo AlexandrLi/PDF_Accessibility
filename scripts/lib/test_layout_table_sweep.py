@@ -818,10 +818,141 @@ class LayoutTableSweepTests(unittest.TestCase):
                 self.assertEqual(result.unwrapped_grid, 1)
                 self.assertEqual(audit_pdf_bytes(repaired).table_count, 0)
 
-    def test_word_short_single_row_table_is_not_assumed_to_be_layout(self) -> None:
-        repaired, result = repair_layout_tables(_make_word_border_table([2]))
+    def test_word_single_row_callout_boxes_are_unwrapped(self) -> None:
+        # A lone /TR of plain /TD cells can never satisfy the headers rule,
+        # so Word's bordered callout/equation boxes are unwrapped regardless
+        # of how little content they hold.
+        for row_widths in ([1], [2], [5]):
+            with self.subTest(row_widths=row_widths):
+                repaired, result = repair_layout_tables(
+                    _make_word_border_table(row_widths)
+                )
+
+                self.assertEqual(
+                    result.unwrapped_grid + result.unwrapped_1x1, 1
+                )
+                self.assertEqual(audit_pdf_bytes(repaired).table_count, 0)
+
+    def test_word_fillin_box_with_lone_full_width_row_is_unwrapped(self) -> None:
+        for row_widths in ([3, 1], [1, 3, 1]):
+            with self.subTest(row_widths=row_widths):
+                repaired, result = repair_layout_tables(
+                    _make_word_border_table(row_widths)
+                )
+
+                self.assertEqual(result.unwrapped_grid, 1)
+                self.assertEqual(audit_pdf_bytes(repaired).table_count, 0)
+
+    def test_geometric_header_spans_from_text_positions(self) -> None:
+        pdf = pikepdf.new()
+        page = pdf.add_blank_page(page_size=(400, 400))
+        stream = []
+        next_mcid = 0
+        xs_rows = [
+            [10.0, 85.0],  # short header: second cell centered over cols 2-3
+            [10.0, 60.0, 110.0],
+            [10.0, 63.5, 110.0],
+        ]
+        cell_mcids: list[list[int]] = []
+        for xs in xs_rows:
+            row_mcids = []
+            for x in xs:
+                stream.append(
+                    f"/P<</MCID {next_mcid}>> BDC BT 1 0 0 1 {x} 700 Tm (t) Tj ET EMC"
+                )
+                row_mcids.append(next_mcid)
+                next_mcid += 1
+            # trailing Word border span
+            stream.append(f"/Span<</MCID {next_mcid}>> BDC 0 0 m 1 0 l S EMC")
+            row_mcids.append(next_mcid)
+            next_mcid += 1
+            cell_mcids.append(row_mcids)
+        page["/Contents"] = pdf.make_stream(" ".join(stream).encode("ascii"))
+
+        rows = []
+        for row_index, row_mcids in enumerate(cell_mcids):
+            cells = [
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/StructElem"),
+                        "/S": pikepdf.Name("/TD"),
+                        "/K": mcid,
+                        "/Pg": page.obj,
+                    }
+                )
+                for mcid in row_mcids[:-1]
+            ]
+            border = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Span"),
+                    "/K": row_mcids[-1],
+                    "/Pg": page.obj,
+                }
+            )
+            rows.append(
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/StructElem"),
+                        "/S": pikepdf.Name("/TR"),
+                        "/K": pikepdf.Array([*cells, border]),
+                        "/Pg": page.obj,
+                    }
+                )
+            )
+        table = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Table"),
+                "/K": pikepdf.Array(rows),
+                "/Pg": page.obj,
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([pdf.make_indirect(table)]),
+            }
+        )
+        pdf.docinfo["/Producer"] = pikepdf.String("Microsoft® Word 2010")
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        repaired, result = repair_layout_tables(buf.getvalue())
+
+        span_actions = [
+            action for action in result.actions if "text geometry" in action
+        ]
+        self.assertEqual(
+            span_actions,
+            ["table1: derived header column spans [1, 2] from text geometry"],
+        )
+        audit = audit_pdf_bytes(repaired)
+        self.assertEqual(audit.tables_without_th, 0)
+        self.assertEqual(audit.data_cells_missing_headers, [])
+
+    def test_word_stack_with_two_wide_rows_is_not_a_callout_box(self) -> None:
+        repaired, result = repair_layout_tables(_make_word_border_table([5, 5, 1]))
 
         self.assertEqual(result.unwrapped_grid, 0)
+        self.assertEqual(audit_pdf_bytes(repaired).table_count, 1)
+
+    def test_word_two_row_equal_width_table_is_not_a_callout_box(self) -> None:
+        repaired, result = repair_layout_tables(_make_word_border_table([2, 2]))
+
+        self.assertEqual(result.unwrapped_grid, 0)
+        self.assertEqual(audit_pdf_bytes(repaired).table_count, 1)
+
+    def test_non_word_single_row_table_is_retained(self) -> None:
+        original = _make_word_border_table([2])
+        neutral = io.BytesIO()
+        with pikepdf.open(io.BytesIO(original)) as pdf:
+            pdf.docinfo["/Producer"] = pikepdf.String("Neutral Producer")
+            pdf.save(neutral)
+
+        repaired, result = repair_layout_tables(neutral.getvalue())
+
+        self.assertEqual(result.unwrapped_grid + result.unwrapped_1x1, 0)
         self.assertEqual(audit_pdf_bytes(repaired).table_count, 1)
 
     def test_word_grouped_header_signature_repairs_two_tier_grid(self) -> None:

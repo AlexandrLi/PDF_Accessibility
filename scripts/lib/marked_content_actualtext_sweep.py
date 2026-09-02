@@ -25,6 +25,17 @@ class MarkedContentActualTextRepairResult:
 
 
 def _pdf_literal_string(text: str) -> bytes:
+    # A PDF literal string's \ddd escape is at most 3 OCTAL digits, i.e. one
+    # byte (0-255). Any character above that (all astral chars, and BMP
+    # chars above U+00FF) can't survive this form: octal-formatting its full
+    # codepoint overflows 3 digits, and a reader (or our own regex parsers)
+    # then consumes only the first 3 as the escape and leaves the rest as
+    # literal digit characters, e.g. "\352066" for U+1D436 decodes as "ê066"
+    # (0xEA) instead of the intended character. Fall back to a UTF-16BE hex
+    # string, which every ActualText reader in this codebase also accepts.
+    if any(ord(char) > 255 for char in text):
+        utf16 = text.encode("utf-16-be")
+        return b"<FEFF" + utf16.hex().upper().encode("ascii") + b">"
     out = bytearray(b"(")
     for char in text:
         code = ord(char)
@@ -700,6 +711,34 @@ def _table_body_has_paths_only(body: bytes) -> bool:
     return bool(re.search(rb"\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s+m\b", body))
 
 
+def _strip_content_strings(body: bytes) -> bytes:
+    return re.sub(
+        rb"\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>",
+        b"",
+        body,
+    )
+
+
+def _body_shows_undecoded_text(body: bytes) -> bool:
+    """True when the block runs text-showing operators whose text we lost."""
+    if not re.search(rb"\bBT\b", _strip_content_strings(body)):
+        return False
+    return bool(
+        re.search(rb"(?:\)|>|\])\s*(?:Tj|TJ)\b", body)
+        or re.search(rb"\)\s*(?:'|\")", body)
+    )
+
+
+def _body_is_decorative_paths(body: bytes) -> bool:
+    """True when a marked block draws only vector paths: no text, no images."""
+    if _mcid_body_has_image(body):
+        return False
+    stripped = _strip_content_strings(body)
+    if re.search(rb"\bBT\b", stripped):
+        return False
+    return bool(re.search(rb"\b(?:re|m)\b", stripped))
+
+
 def _orphan_marked_spoken_text(
     tag: str,
     body: bytes,
@@ -709,6 +748,10 @@ def _orphan_marked_spoken_text(
 ) -> str | None:
     text = _decode_label_mcid_text(body)
     if tag == "Span":
+        if not text.strip() and _body_shows_undecoded_text(body):
+            # The block shows glyphs we could not decode; injecting a
+            # "blank" label would replace real spoken text with silence.
+            return None
         return _spoken_list_label_text(text)
     if tag != "Table":
         return None
@@ -795,16 +838,21 @@ def _repair_orphan_marked_content_actualtext(
                 table_image_labels=table_image_labels,
             )
             if spoken is None and tag == "Table" and _table_body_has_paths_only(body):
-                new_data, changed = _retag_mcid_bdc_in_data(
-                    new_data,
-                    mcid,
-                    b"Artifact",
-                )
+                new_data, changed = _retag_orphan_bdc_as_artifact(new_data, mcid)
                 if changed:
                     page_changed = True
                     updated += 1
                     actions.append(
                         f"orphan MCID {mcid}: retagged Table to /Artifact"
+                    )
+                continue
+            if tag == "Span" and _body_is_decorative_paths(body):
+                new_data, changed = _retag_orphan_bdc_as_artifact(new_data, mcid)
+                if changed:
+                    page_changed = True
+                    updated += 1
+                    actions.append(
+                        f"orphan MCID {mcid}: retagged decorative Span to /Artifact"
                     )
                 continue
             if not spoken:
@@ -1005,6 +1053,33 @@ def _mcid_bdc_has_actualtext(data: bytes, mcid: int) -> bool:
     return b"/ActualText" in match.group(2)
 
 
+def _retag_orphan_bdc_as_artifact(
+    data: bytes,
+    mcid: int,
+) -> tuple[bytes, bool]:
+    """Retag one orphan marked block as /Artifact, dropping its dead MCID."""
+    pattern = re.compile(
+        rb"/(?P<tag>" + _MCID_BDC_TAG + rb")\s*<<"
+        rb"((?:(?!>>).)*?/MCID\s+"
+        + _mcid_token(mcid)
+        + rb"(?:(?!>>).)*?)>>\s*BDC",
+        re.DOTALL,
+    )
+
+    def repl(match: re.Match[bytes]) -> bytes:
+        props = re.sub(
+            rb"/MCID\s+\d+(?!\d)",
+            b"",
+            match.group(2),
+        ).strip()
+        if not props:
+            return b"/Artifact BMC"
+        return b"/Artifact<< " + props + b" >> BDC"
+
+    new_data, count = pattern.subn(repl, data, count=1)
+    return new_data, count > 0
+
+
 def _retag_mcid_bdc_in_data(
     data: bytes,
     mcid: int,
@@ -1130,10 +1205,13 @@ def _read_actualtext_from_mcid(data: bytes, mcid: int) -> str | None:
     match = pattern.search(data)
     if match is None:
         return None
-    actual = re.search(rb"/ActualText\s+(\((?:\\.|[^\\()])*)\)", match.group(2))
+    actual = re.search(
+        rb"/ActualText\s+((?:\((?:\\.|[^\\()])*\))|(?:<[0-9A-Fa-f\s]*>))",
+        match.group(2),
+    )
     if actual is None:
         return None
-    return _decode_pdf_literal(actual.group(1))
+    return _decode_pdf_actualtext_value(actual.group(1))
 
 
 def _decode_pdf_literal(literal: bytes) -> str:
@@ -1146,6 +1224,22 @@ def _decode_pdf_literal(literal: bytes) -> str:
         .replace(r"\\", "\\")
         .replace(r"\n", "\n")
     )
+
+
+def _decode_pdf_actualtext_value(value: bytes) -> str:
+    """Decode a PDF literal or hex string ActualText value."""
+    if value.startswith(b"<"):
+        hex_digits = re.sub(rb"\s+", b"", value[1:-1])
+        if len(hex_digits) % 2:
+            hex_digits += b"0"
+        try:
+            raw = bytes.fromhex(hex_digits.decode("ascii"))
+        except ValueError:
+            return ""
+        if raw.startswith(b"\xfe\xff"):
+            return raw[2:].decode("utf-16-be", errors="replace")
+        return raw.decode("latin1", errors="replace")
+    return _decode_pdf_literal(value)
 
 
 def _strip_actualtext_from_mcid_in_data(

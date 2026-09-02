@@ -354,6 +354,34 @@ def _is_word_layout_wrapper(
     return [len(cells) for cells in cell_rows] == [2, 1]
 
 
+def _is_word_callout_layout_box(
+    table: pikepdf.Dictionary,
+    rows: list[pikepdf.Dictionary],
+) -> bool:
+    """Recognize Word's bordered callout/fill-in boxes tagged as tables.
+
+    A single /TR of plain /TD cells cannot express a header/data
+    relationship, and a short stack whose rows disagree on width with at
+    most one row wider than a single cell has no column correspondence at
+    all (banner/content/banner boxes), so no /TH promotion can ever satisfy
+    the headers rule; unwrapping the layout box is the only sound repair.
+    """
+    if not rows or len(rows) > 3 or _has_table_semantics(table):
+        return False
+    row_parts = [_word_row_cells_and_border(row) for row in rows]
+    if any(parts is None for parts in row_parts):
+        return False
+    cell_rows = [parts[0] for parts in row_parts if parts is not None]
+    if any(_has_table_semantics(cell) for cells in cell_rows for cell in cells):
+        return False
+    if len(cell_rows) == 1:
+        return True
+    widths = [len(cells) for cells in cell_rows]
+    if len(set(widths)) == 1:
+        return False
+    return min(widths) == 1 and sum(1 for width in widths if width > 1) <= 1
+
+
 def _descendant_mcid_count(obj: pikepdf.Object) -> int:
     if isinstance(obj, Integral):
         return 1
@@ -864,6 +892,179 @@ def _set_owner_attribute(
     return changed
 
 
+_TM_X_PATTERN = re.compile(
+    rb"(?:[-\d.]+\s+){4}([-\d.]+)\s+[-\d.]+\s+Tm\b"
+)
+
+
+def _page_contents_bytes(page: object) -> bytes | None:
+    if not isinstance(page, pikepdf.Dictionary):
+        return None
+    contents = page.get("/Contents")
+    if isinstance(contents, pikepdf.Array):
+        parts = []
+        for item in contents:
+            try:
+                parts.append(item.read_bytes())
+            except Exception:
+                return None
+        return b"".join(parts)
+    try:
+        return contents.read_bytes()
+    except Exception:
+        return None
+
+
+def _cell_mcids(cell: pikepdf.Dictionary) -> list[int]:
+    mcids: list[int] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, pikepdf.Dictionary):
+            if node.get("/MCID") is not None and node.get("/S") is None:
+                try:
+                    mcids.append(int(node.get("/MCID")))
+                except (TypeError, ValueError):
+                    pass
+                return
+            kids = node.get("/K")
+            values = list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+            for value in values:
+                walk(value)
+        elif isinstance(node, Integral):
+            mcids.append(int(node))
+
+    walk(cell)
+    return mcids
+
+
+def _cell_first_text_x(cell: pikepdf.Dictionary, data: bytes) -> float | None:
+    from lib.marked_content_actualtext_sweep import _get_mcid_block
+
+    for mcid in _cell_mcids(cell):
+        block = _get_mcid_block(data, mcid)
+        if block is None:
+            continue
+        match = _TM_X_PATTERN.search(block[1])
+        if match is None:
+            continue
+        try:
+            return float(match.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+_COLUMN_X_TOLERANCE = 3.0
+
+
+def _reconcile_geometric_header_spans(
+    table: pikepdf.Dictionary,
+    rows: list[pikepdf.Dictionary],
+    *,
+    index: int,
+    actions: list[str],
+) -> bool:
+    """Give a short first header row /ColSpan values proven by text geometry.
+
+    Word tags grouped-header tables with a first row of fewer cells than the
+    body without recording the spans. When every header cell's first text
+    x-position aligns with a distinct body column start, the spans between
+    those columns are the producer's own layout evidence.
+    """
+    if _has_table_semantics(table) or len(rows) < 3:
+        return False
+    row_parts = [_word_row_cells_and_border(row) for row in rows]
+    if any(parts is None for parts in row_parts):
+        return False
+    cell_rows = [parts[0] for parts in row_parts if parts is not None]
+    if any(_has_table_semantics(cell) for cells in cell_rows for cell in cells):
+        return False
+    header = cell_rows[0]
+    body_rows = cell_rows[1:]
+    body_widths = {len(cells) for cells in body_rows}
+    if len(body_widths) != 1:
+        return False
+    width = body_widths.pop()
+    if not (1 < len(header) < width):
+        return False
+
+    page = rows[0].get("/Pg") or table.get("/Pg")
+    data = _page_contents_bytes(page)
+    if data is None:
+        return False
+
+    column_xs: list[list[float]] = [[] for _ in range(width)]
+    for cells in body_rows:
+        for position, cell in enumerate(cells):
+            x = _cell_first_text_x(cell, data)
+            if x is not None:
+                column_xs[position].append(x)
+    if any(len(xs) < 2 for xs in column_xs):
+        return False
+    # Left-aligned text starts at the column's left edge; right-aligned or
+    # centered values start further in, so the per-column minimum is the
+    # only stable estimate of where each column begins.
+    columns = [min(xs) for xs in column_xs]
+    if any(
+        later - earlier <= _COLUMN_X_TOLERANCE
+        for earlier, later in zip(columns, columns[1:])
+    ):
+        return False
+
+    header_columns: list[int] = []
+    for cell in header:
+        x = _cell_first_text_x(cell, data)
+        if x is None:
+            return False
+        # A header starts inside the leftmost column of its span (it may be
+        # centered across the span, so it need not start at the edge).
+        boundary = None
+        for position, column_x in enumerate(columns):
+            if column_x <= x + _COLUMN_X_TOLERANCE:
+                boundary = position
+        if boundary is None:
+            return False
+        header_columns.append(boundary)
+    if header_columns[0] != 0 or sorted(set(header_columns)) != header_columns:
+        return False
+
+    boundaries = header_columns + [width]
+    spans = [
+        boundaries[position + 1] - boundaries[position]
+        for position in range(len(header))
+    ]
+    if any(span < 1 for span in spans) or all(span == 1 for span in spans):
+        return False
+
+    for row, parts in zip(rows, row_parts):
+        cells, border = parts  # type: ignore[misc]
+        last_cell = cells[-1]
+        last_kid = last_cell.get("/K")
+        if isinstance(last_kid, pikepdf.Array):
+            last_cell["/K"] = pikepdf.Array([*last_kid, border])
+        elif last_kid is None:
+            last_cell["/K"] = pikepdf.Array([border])
+        else:
+            last_cell["/K"] = pikepdf.Array([last_kid, border])
+        last_objgen = getattr(last_cell, "objgen", None)
+        if isinstance(last_objgen, tuple) and last_objgen != (0, 0):
+            border["/P"] = last_cell
+        row["/K"] = pikepdf.Array(cells)
+
+    for cell, span in zip(header, spans):
+        if span > 1:
+            cell["/A"] = pikepdf.Dictionary(
+                {
+                    "/O": pikepdf.Name("/Table"),
+                    "/ColSpan": span,
+                }
+            )
+    actions.append(
+        f"table{index}: derived header column spans {spans} from text geometry"
+    )
+    return True
+
+
 def _reconcile_declared_column_spans(
     table: pikepdf.Dictionary,
     rows: list[pikepdf.Dictionary],
@@ -1338,6 +1539,25 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                 )
                 continue
 
+            if is_word_2010 and _is_word_callout_layout_box(table, rows):
+                direct_cells = [
+                    cell
+                    for row in rows
+                    for cell in _row_direct_cells(row)
+                    if cell.get("/S") == "/TD"
+                ]
+                if len(rows) == 1 and len(direct_cells) == 1:
+                    _unwrap_single_cell_table(table, rows, direct_cells[0])
+                    unwrapped_1x1 += 1
+                else:
+                    _unwrap_grid_table(table, rows, cells)
+                    unwrapped_grid += 1
+                changed = True
+                actions.append(
+                    f"table{index}: unwrapped Word callout layout box to /Sect"
+                )
+                continue
+
             if is_pdf_lib and _is_pdf_lib_overlapping_layout_table(rows):
                 _unwrap_grid_table(table, rows, cells)
                 unwrapped_grid += 1
@@ -1377,6 +1597,15 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                 actions.append(
                     f"table{index}: normalized Word grouped headers and border spans"
                 )
+                rows, cells = _table_rows_and_cells(table)
+
+            if is_word_2010 and _reconcile_geometric_header_spans(
+                table,
+                rows,
+                index=index,
+                actions=actions,
+            ):
+                changed = True
                 rows, cells = _table_rows_and_cells(table)
 
             table_changed = [False]

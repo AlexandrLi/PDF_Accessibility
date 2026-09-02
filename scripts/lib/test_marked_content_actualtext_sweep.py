@@ -16,10 +16,13 @@ from pathlib import Path
 import pikepdf
 
 from lib.marked_content_actualtext_sweep import (
+    _decode_pdf_actualtext_value,
     _get_mcid_block,
     _inject_actualtext_in_data,
     _inject_actualtext_on_page,
     _mcid_bdc_has_actualtext,
+    _pdf_literal_string,
+    _read_actualtext_from_mcid,
     _read_page_contents,
     _resolve_struct_page,
     _set_struct_page_if_missing,
@@ -886,6 +889,47 @@ class BiosignalingNestedAltRegressionTests(unittest.TestCase):
         )
 
 
+class PdfLiteralStringEncodingTests(unittest.TestCase):
+    def test_astral_character_does_not_overflow_octal_escape(self) -> None:
+        # U+1D436 ('𝐶', mathematical italic capital C) is common in Word
+        # equation-editor formulas. Its codepoint's octal form is 6 digits;
+        # a PDF \ddd escape is only ever 3, so encoding it that way corrupts
+        # the string ("\352066" parses back as "ê066", not "𝐶").
+        encoded = _pdf_literal_string("𝐶")
+        self.assertEqual(encoded, b"<FEFF" + "𝐶".encode("utf-16-be").hex().upper().encode() + b">")
+        self.assertEqual(_decode_pdf_actualtext_value(encoded), "𝐶")
+
+    def test_plain_ascii_still_uses_literal_form(self) -> None:
+        self.assertEqual(_pdf_literal_string("A+B"), b"(A+B)")
+
+    def test_mixed_astral_and_ascii_round_trips(self) -> None:
+        text = "=𝐶+𝐼+𝐺+𝑁"
+        encoded = _pdf_literal_string(text)
+        self.assertTrue(encoded.startswith(b"<FEFF"))
+        self.assertEqual(_decode_pdf_actualtext_value(encoded), text)
+
+    def test_injected_astral_actualtext_round_trips_through_content(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(b"q /P<</MCID 1 >> BDC (x) Tj EMC Q")
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        with pikepdf.open(io.BytesIO(buf.getvalue())) as opened:
+            changed = _inject_actualtext_on_page(
+                opened,
+                opened.pages[0],
+                mcid=1,
+                actual_text="𝐶",
+            )
+            self.assertTrue(changed)
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertEqual(_read_actualtext_from_mcid(data, 1), "𝐶")
+            # No lone byte-0xEA-plus-digits corruption from an overflowed
+            # octal escape.
+            self.assertNotIn(b"\xea", data)
+
+
 class OrphanMarkedContentTests(unittest.TestCase):
     def test_repair_orphan_table_and_span_diagram_labels(self) -> None:
         pdf = pikepdf.Pdf.new()
@@ -923,9 +967,56 @@ class OrphanMarkedContentTests(unittest.TestCase):
             data = _read_page_contents(opened.pages[0]["/Contents"])
             self.assertTrue(_mcid_bdc_has_actualtext(data, 10))
             self.assertTrue(_mcid_bdc_has_actualtext(data, 11))
-            block = _get_mcid_block(data, 12)
+            # The paths-only orphan Table is now true artifact content: its
+            # dead MCID is dropped so tagged-content audits stop flagging it.
+            self.assertIsNone(_get_mcid_block(data, 12))
+            self.assertIn(b"/Artifact BMC", data)
+
+    def test_orphan_decorative_span_becomes_artifact(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"q /Span<</MCID 5 >> BDC 0.5 0.8 0.3 scn 10 10 100 50 re f "
+            b"0 0 m 10 0 l S EMC "
+            b"q /Span<</MCID 6 >> BDC 10 10 100 50 re S BT (Keywords:) Tj ET EMC "
+            b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+        )
+        body = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/P"),
+                "/K": 1,
+                "/Pg": page.obj,
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([body]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        repaired, result = repair_marked_content_actualtext(buf.getvalue())
+
+        artifact_actions = [
+            action
+            for action in result.actions
+            if "retagged decorative Span to /Artifact" in action
+        ]
+        self.assertEqual(artifact_actions, [
+            "orphan MCID 5: retagged decorative Span to /Artifact",
+        ])
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            # Paths-only span became artifact content without an MCID.
+            self.assertIsNone(_get_mcid_block(data, 5))
+            self.assertIn(b"/Artifact BMC", data)
+            # The span that also draws text keeps its marked content.
+            block = _get_mcid_block(data, 6)
             self.assertIsNotNone(block)
-            self.assertEqual(block[0], "Artifact")
+            self.assertEqual(block[0], "Span")
 
 
 class StructPageRefTests(unittest.TestCase):
