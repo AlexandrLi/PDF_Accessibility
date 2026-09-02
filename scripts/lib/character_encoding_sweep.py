@@ -10,9 +10,10 @@ import pikepdf
 import pymupdf
 
 from lib.marked_content_actualtext_sweep import (
-    _get_mcid_block,
+    _get_mcid_block_to_emc,
     _inject_actualtext_on_page,
     _mcid_bdc_has_actualtext,
+    _pdf_literal_string,
     _read_page_contents,
     _resolve_struct_page,
     _struct_child_dicts,
@@ -334,6 +335,103 @@ def _spoken_encoding_text(text: str) -> str:
         spoken = spoken.replace(symbol, replacement)
     spoken = re.sub(r"\s+", " ", spoken).strip()
     return spoken
+
+
+def _block_has_real_text(decoded: str) -> bool:
+    return any(
+        not (char in _SYMBOL_CHARS or char.isspace()) for char in decoded
+    )
+
+
+_FONT_OR_SHOW_PATTERN = re.compile(
+    rb"/(?P<font>[A-Za-z0-9_.]+)\s+[\d.]+\s+Tf"
+    rb"|(?P<show>(?:\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>"
+    rb"|\[(?:\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|[^\[\]])*\])\s*(?:Tj|TJ)\b)",
+    re.DOTALL,
+)
+_SPAN_WRAP_PREFIX = re.compile(
+    rb"/Span\s*<<\s*/ActualText[^>]*>>\s*BDC\s*$", re.DOTALL
+)
+
+
+def _decode_show_operator(segment: bytes, cmap: dict[int, str]) -> str:
+    parts: list[str] = []
+    for token in re.finditer(
+        rb"\(((?:\\.|[^\\()])*)\)|<([0-9A-Fa-f\s]+)>", segment
+    ):
+        if token.group(1) is not None:
+            parts.append(token.group(1).decode("latin1", errors="replace"))
+        else:
+            hex_text = re.sub(rb"\s", b"", token.group(2)).decode()
+            parts.append(_decode_hex_text(hex_text, cmap))
+    return "".join(parts)
+
+
+def _wrap_symbol_show_operators(
+    pdf: pikepdf.Pdf,
+    page: pikepdf.Page,
+    *,
+    mcid: int,
+    actions: list[str],
+) -> int:
+    """Wrap symbol-only show operators in nested /Span ActualText.
+
+    Used when a marked-content block mixes a spoken symbol glyph (bullet,
+    blank square) with real sentence text: block-level ActualText would
+    override the sentence, so only the glyph's own show operator gets the
+    spoken replacement.
+    """
+    contents = page.get("/Contents")
+    if contents is None:
+        return 0
+    data = _read_page_contents(contents)
+    block = _get_mcid_block_to_emc(data, mcid)
+    if block is None:
+        return 0
+    start, end, body = block
+    fontmaps = _page_fontmaps(page)
+    current_font: str | None = None
+    replacements: list[tuple[int, int, bytes]] = []
+    for match in _FONT_OR_SHOW_PATTERN.finditer(body):
+        if match.group("font") is not None:
+            current_font = "/" + match.group("font").decode()
+            continue
+        segment = match.group("show")
+        if _SPAN_WRAP_PREFIX.search(body[: match.start()]):
+            continue
+        decoded = _decode_show_operator(
+            segment, fontmaps.get(current_font or "", {})
+        )
+        stripped = decoded.strip()
+        if not stripped:
+            continue
+        if not all(char in _SYMBOL_CHARS or char.isspace() for char in decoded):
+            continue
+        spoken = _spoken_encoding_text(decoded)
+        if not spoken:
+            continue
+        if decoded[:1].isspace():
+            spoken = " " + spoken
+        if decoded[-1:].isspace():
+            spoken = spoken + " "
+        wrapped = (
+            b"/Span << /ActualText "
+            + _pdf_literal_string(spoken)
+            + b" >> BDC "
+            + segment
+            + b" EMC"
+        )
+        replacements.append((match.start("show"), match.end("show"), wrapped))
+    if not replacements:
+        return 0
+    for rep_start, rep_end, wrapped in reversed(replacements):
+        body = body[:rep_start] + wrapped + body[rep_end:]
+    page["/Contents"] = pdf.make_stream(
+        data[:start] + body + data[end:], compress=True
+    )
+    for _rep_start, _rep_end, _wrapped in replacements:
+        actions.append(f"MCID {mcid}: wrapped symbol show operator in /Span ActualText")
+    return len(replacements)
 
 
 def _needs_character_encoding_repair(text: str) -> bool:
@@ -921,14 +1019,21 @@ def _repair_orphan_symbol_mcids(
             {int(match.group(1)) for match in _CONTENT_MCID_PATTERN.finditer(data)}
         )
         for mcid in mcids:
-            block = _get_mcid_block(data, mcid)
+            block = _get_mcid_block_to_emc(data, mcid)
             if block is None:
                 continue
             if _mcid_bdc_has_actualtext(data, mcid):
                 continue
-            _tag, body = block
+            _start, _end, body = block
             decoded = _decode_mcid_text(body, fontmaps)
             if not _needs_orphan_symbol_repair(body, decoded):
+                continue
+            if _block_has_real_text(decoded) and not _body_has_blank_square_glyph(
+                body
+            ):
+                updated += _wrap_symbol_show_operators(
+                    pdf, page, mcid=mcid, actions=actions
+                )
                 continue
             spoken = _spoken_for_symbol_block(body, decoded)
             if not spoken:
@@ -994,10 +1099,10 @@ def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodin
                 fontmaps = _page_fontmaps(page)
                 decoded_parts: list[str] = []
                 for mcid in mcids:
-                    block = _get_mcid_block(data, mcid)
+                    block = _get_mcid_block_to_emc(data, mcid)
                     if block is None:
                         continue
-                    decoded_parts.append(_decode_mcid_text(block[1], fontmaps))
+                    decoded_parts.append(_decode_mcid_text(block[2], fontmaps))
                 decoded = "".join(decoded_parts)
                 if not _needs_character_encoding_repair(decoded):
                     for child in _struct_child_dicts(obj):
@@ -1010,17 +1115,40 @@ def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodin
                         walk(child)
                     return
 
-                if obj.get("/ActualText") is None:
+                element_mixed = False
+                for mcid in mcids:
+                    block = _get_mcid_block_to_emc(data, mcid)
+                    if block is None:
+                        continue
+                    part = _decode_mcid_text(block[2], fontmaps)
+                    if (
+                        any(char in _SYMBOL_CHARS for char in part)
+                        and _block_has_real_text(part)
+                        and not _body_has_blank_square_glyph(block[2])
+                    ):
+                        element_mixed = True
+                        break
+
+                if not element_mixed and obj.get("/ActualText") is None:
                     obj["/ActualText"] = pikepdf.String(spoken)
                     struct_updated += 1
                     actions.append(f"set struct /ActualText on {tag} for {spoken!r}")
 
                 for mcid in mcids:
-                    block = _get_mcid_block(data, mcid)
+                    block = _get_mcid_block_to_emc(data, mcid)
                     if block is None:
                         continue
-                    part = _decode_mcid_text(block[1], fontmaps)
-                    part_spoken = _spoken_for_symbol_block(block[1], part)
+                    part = _decode_mcid_text(block[2], fontmaps)
+                    if (
+                        any(char in _SYMBOL_CHARS for char in part)
+                        and _block_has_real_text(part)
+                        and not _body_has_blank_square_glyph(block[2])
+                    ):
+                        mcids_updated += _wrap_symbol_show_operators(
+                            pdf, page, mcid=mcid, actions=actions
+                        )
+                        continue
+                    part_spoken = _spoken_for_symbol_block(block[2], part)
                     if part_spoken is None and not _needs_character_encoding_repair(part):
                         continue
                     if part_spoken is None:

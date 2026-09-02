@@ -1,4 +1,5 @@
 import io
+import re
 import unittest
 from pathlib import Path
 
@@ -47,6 +48,98 @@ class BlankSquareGlyphDetectionTests(unittest.TestCase):
 
     def test_no_glyph_is_not_blank(self) -> None:
         self.assertFalse(_body_has_blank_square_glyph(b"(hello) Tj"))
+
+
+class BulletBlockSpansTextObjectsTests(unittest.TestCase):
+    def _build_bullet_sentence_pdf(self) -> bytes:
+        # Genetics-shaped page: one /P MCID block whose BDC..EMC holds the
+        # bullet glyph in its own BT/ET followed by the sentence in another.
+        cmap = """1 beginbfchar
+<0195> <25CF>
+endbfchar"""
+        stream = (
+            b"/P<< /MCID 1 >> BDC BT\r\n/F3 12 Tf\r\n<0195>Tj\r\nET\r\nBT\r\n"
+            b"/F1 12 Tf\r\n[(H)-7(e)-3(ri)7(t)-6(a)-3(bi)9(l)8(i)8(t)-6(y)"
+            b"( is a measurement)] TJ\r\nET\r\n EMC"
+        )
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            symbol_font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type0"),
+                    Encoding=pikepdf.Name("/Identity-H"),
+                    ToUnicode=pdf.make_stream(cmap.encode("latin1")),
+                )
+            )
+            text_font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Helvetica"),
+                    ToUnicode=pdf.make_stream(
+                        b"1 beginbfchar\n<20> <0020>\nendbfchar"
+                    ),
+                )
+            )
+            page["/Resources"] = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(F1=text_font, F3=symbol_font)
+            )
+            page["/Contents"] = pdf.make_stream(stream)
+            paragraph = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/P"),
+                    "/Pg": page.obj,
+                    "/K": pikepdf.Array([1]),
+                }
+            )
+            document = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Document"),
+                    "/K": pikepdf.Array([paragraph]),
+                }
+            )
+            pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructTreeRoot"),
+                    "/K": pikepdf.Array([document]),
+                }
+            )
+            buf = io.BytesIO()
+            pdf.save(buf)
+            return buf.getvalue()
+
+    def test_bullet_actualtext_keeps_sentence_from_sibling_text_object(self) -> None:
+        # Regression: a block mixing a bullet glyph with a real sentence
+        # (sentence in a second BT/ET inside the same BDC..EMC) must wrap
+        # only the glyph's show operator, never override the sentence.
+        repaired, result = repair_character_encoding(
+            self._build_bullet_sentence_pdf()
+        )
+        self.assertTrue(result.mcids_updated)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            data = pdf.pages[0].Contents.read_bytes()
+        actual_texts = [
+            m.group(1).decode("latin1")
+            for m in re.finditer(rb"/ActualText\s*\(((?:\\.|[^\\()])*)\)", data)
+        ]
+        self.assertIn("bullet", actual_texts)
+        for text in actual_texts:
+            self.assertNotIn("Heritability", text)
+        self.assertIn(b"( is a measurement)] TJ", data)
+        wrap = re.search(
+            rb"/Span << /ActualText \(bullet\) >> BDC <0195>Tj EMC", data
+        )
+        self.assertIsNotNone(wrap)
+
+    def test_symbol_wrap_is_idempotent(self) -> None:
+        repaired, _ = repair_character_encoding(self._build_bullet_sentence_pdf())
+        repaired_again, result = repair_character_encoding(repaired)
+        with pikepdf.open(io.BytesIO(repaired_again)) as pdf:
+            data = pdf.pages[0].Contents.read_bytes()
+        self.assertEqual(data.count(b"/ActualText (bullet)"), 1)
 
 
 class CharacterEncodingSweepTests(unittest.TestCase):

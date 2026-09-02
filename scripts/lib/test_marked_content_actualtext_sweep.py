@@ -1089,6 +1089,44 @@ def _build_untagged_image_pdf(page_stream: bytes, *, struct_role: str = "/P") ->
     return buf.getvalue()
 
 
+class OcrTextReliabilityTests(unittest.TestCase):
+    def test_chemical_structure_garble_is_rejected(self) -> None:
+        from lib.marked_content_actualtext_sweep import _ocr_text_is_reliable
+
+        self.assertFalse(_ocr_text_is_reliable("sterols =, R Be - SS HO 'S"))
+
+    def test_stylized_infographic_garble_is_rejected(self) -> None:
+        from lib.marked_content_actualtext_sweep import _ocr_text_is_reliable
+
+        self.assertFalse(
+            _ocr_text_is_reliable(
+                "Sie) r-soluble Oo io) amins |oO absorbed Oye NOT stored "
+                "Oj Excess is in urine"
+            )
+        )
+
+    def test_running_text_is_reliable(self) -> None:
+        from lib.marked_content_actualtext_sweep import _ocr_text_is_reliable
+
+        self.assertTrue(
+            _ocr_text_is_reliable(
+                "Water-soluble vitamins are absorbed directly and not stored"
+            )
+        )
+
+    def test_math_labels_with_variables_are_reliable(self) -> None:
+        from lib.marked_content_actualtext_sweep import _ocr_text_is_reliable
+
+        self.assertTrue(_ocr_text_is_reliable("x equals one"))
+        self.assertTrue(_ocr_text_is_reliable("x1 equals 87"))
+
+    def test_empty_and_wordless_text_is_unreliable(self) -> None:
+        from lib.marked_content_actualtext_sweep import _ocr_text_is_reliable
+
+        self.assertFalse(_ocr_text_is_reliable(""))
+        self.assertFalse(_ocr_text_is_reliable("= - | %"))
+
+
 class UntaggedImageActualTextTests(unittest.TestCase):
     _IMAGE_ONLY_STREAM = (
         b"/P <</MCID 0>> BDC q 50 0 0 50 20 20 cm /Im1 Do Q EMC"

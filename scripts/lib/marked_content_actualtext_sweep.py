@@ -1586,6 +1586,40 @@ def _ocr_page_clip_text(fitz_page: pymupdf.Page, rect: pymupdf.Rect) -> str:
     return text.strip("|").strip()
 
 
+_OCR_COMMON_SHORT_WORDS = frozenset(
+    "am an as at be by do go he if in is it me my no of on or so to up us we".split()
+)
+
+
+def _ocr_text_is_reliable(text: str) -> bool:
+    """Reject garbled OCR (chemical structures, stylized infographics).
+
+    OCR of a diagram with no running text yields stray letter pairs,
+    symbols, and mangled fragments ("=, R Be - SS HO 'S", "Oo io) |oO");
+    injecting that as ActualText is worse than the generic fallback. Count
+    junk tokens: bare symbols, tokens with characters OCR shouldn't emit
+    mid-word, and two-letter non-words.
+    """
+    tokens = text.split()
+    if not tokens or not re.search(r"[A-Za-z]{3,}", text):
+        return False
+    junk = 0
+    for token in tokens:
+        stripped = token.strip(".,;:!?()[]'\"")
+        letters = re.sub(r"[^A-Za-z]", "", stripped)
+        if not re.search(r"[A-Za-z0-9]", token):
+            junk += 1
+        elif re.search(r"[^A-Za-z0-9.,;:!?()\[\]'\"%/&+=-]", token):
+            junk += 1
+        elif (
+            len(letters) == 2
+            and letters.lower() not in _OCR_COMMON_SHORT_WORDS
+            and not re.search(r"\d", stripped)
+        ):
+            junk += 1
+    return junk / len(tokens) <= 0.2
+
+
 def _wrap_image_do_with_actualtext(
     data: bytes,
     *,
@@ -1750,6 +1784,8 @@ def _repair_untagged_image_actualtext(
                     rects = fitz_page.get_image_rects(name)
                     if rects:
                         text = _ocr_page_clip_text(fitz_page, rects[0])
+                if not _ocr_text_is_reliable(text):
+                    text = ""
                 ocr_cache[cache_key] = text
             image_texts[name] = (
                 ocr_cache[cache_key] or _UNTAGGED_IMAGE_FALLBACK_ACTUALTEXT
