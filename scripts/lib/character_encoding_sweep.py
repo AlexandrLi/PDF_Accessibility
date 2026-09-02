@@ -325,6 +325,10 @@ def _body_has_blank_square_glyph(body: bytes) -> bool:
 def _spoken_for_symbol_block(body: bytes, decoded: str) -> str | None:
     if _body_has_blank_square_glyph(body):
         return "blank"
+    if "�" in decoded:
+        # U+FFFD marks glyphs whose text is unknown, not decorative symbols;
+        # a spoken replacement that omits them would misstate rendered words.
+        return None
     spoken = _spoken_encoding_text(decoded)
     return spoken if spoken else None
 
@@ -1129,7 +1133,16 @@ def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodin
                         element_mixed = True
                         break
 
-                if not element_mixed and obj.get("/ActualText") is None:
+                # An element-level /ActualText replaces every descendant glyph
+                # for AT, so it may only be set when the spoken text accounts
+                # for all of them. U+FFFD in the decode means some glyphs'
+                # text is unknown — stripping them would erase real words.
+                undecodable = "�" in decoded
+                if (
+                    not element_mixed
+                    and not undecodable
+                    and obj.get("/ActualText") is None
+                ):
                     obj["/ActualText"] = pikepdf.String(spoken)
                     struct_updated += 1
                     actions.append(f"set struct /ActualText on {tag} for {spoken!r}")
@@ -1149,11 +1162,16 @@ def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodin
                         )
                         continue
                     part_spoken = _spoken_for_symbol_block(block[2], part)
-                    if part_spoken is None and not _needs_character_encoding_repair(part):
-                        continue
-                    if part_spoken is None:
-                        part_spoken = _spoken_encoding_text(part)
                     if not part_spoken:
+                        # Nothing safely speakable: empty, or undecodable
+                        # glyphs whose words an injection would erase.
+                        continue
+                    if part_spoken != "blank" and not _needs_character_encoding_repair(
+                        part
+                    ):
+                        # The block decodes cleanly; stamping it would only
+                        # replace real glyphs (and their exact spacing) with
+                        # a normalized copy.
                         continue
                     if _inject_actualtext_on_page(
                         pdf,

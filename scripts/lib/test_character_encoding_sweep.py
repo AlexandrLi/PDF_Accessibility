@@ -142,6 +142,94 @@ endbfchar"""
         self.assertEqual(data.count(b"/ActualText (bullet)"), 1)
 
 
+class UndecodableGlyphProtectionTests(unittest.TestCase):
+    """Regression: quantitative-reasoning a157eb58 — an LBody where one MCID's
+    font has no ToUnicode entries for its codes (decode → U+FFFD). Stamping the
+    element with FFFD-stripped spoken text erased the words " FIRST.", and the
+    healthy sibling MCIDs were stamped with whitespace-normalized copies."""
+
+    @staticmethod
+    def _build_lbody_with_undecodable_tail() -> bytes:
+        stream = (
+            b"/P<< /MCID 1 >> BDC BT /F1 12 Tf (When performing ) Tj ET EMC\n"
+            b"/P<< /MCID 2 >> BDC BT /F1 12 Tf (multiple) Tj ET EMC\n"
+            b"/P<< /MCID 3 >> BDC BT /F1 12 Tf ( set operations ) Tj ET EMC\n"
+            b"/P<< /MCID 4 >> BDC BT /F2 12 Tf <0029002C0035> Tj ET EMC\n"
+        )
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            text_font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Helvetica"),
+                    ToUnicode=pdf.make_stream(
+                        b"1 beginbfchar\n<20> <0020>\nendbfchar"
+                    ),
+                )
+            )
+            # ToUnicode exists but lacks the codes actually shown, so the
+            # sweep decodes them as U+FFFD.
+            partial_font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type0"),
+                    Encoding=pikepdf.Name("/Identity-H"),
+                    ToUnicode=pdf.make_stream(
+                        b"1 beginbfchar\n<0003> <0020>\nendbfchar"
+                    ),
+                )
+            )
+            page["/Resources"] = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(F1=text_font, F2=partial_font)
+            )
+            page["/Contents"] = pdf.make_stream(stream)
+            lbody = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/LBody"),
+                    "/Pg": page.obj,
+                    "/K": pikepdf.Array([1, 2, 3, 4]),
+                }
+            )
+            document = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Document"),
+                    "/K": pikepdf.Array([lbody]),
+                }
+            )
+            pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructTreeRoot"),
+                    "/K": pikepdf.Array([document]),
+                }
+            )
+            buf = io.BytesIO()
+            pdf.save(buf)
+            return buf.getvalue()
+
+    def test_undecodable_mcid_blocks_element_and_sibling_stamps(self) -> None:
+        repaired, result = repair_character_encoding(
+            self._build_lbody_with_undecodable_tail()
+        )
+        self.assertEqual(result.struct_updated, 0)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            document = pdf.Root["/StructTreeRoot"]["/K"][0]
+            lbody = document["/K"][0]
+            self.assertIsNone(lbody.get("/ActualText"))
+            data = pdf.pages[0].Contents.read_bytes()
+        self.assertNotIn(b"/ActualText", data)
+        self.assertIn(b"(When performing ) Tj", data)
+        self.assertIn(b"<0029002C0035> Tj", data)
+
+    def test_spoken_for_symbol_block_rejects_undecodable_text(self) -> None:
+        from lib.character_encoding_sweep import _spoken_for_symbol_block
+
+        self.assertIsNone(_spoken_for_symbol_block(b"<0029> Tj", "● ��"))
+        self.assertEqual(_spoken_for_symbol_block(b"<0195> Tj", "●"), "bullet")
+
+
 class CharacterEncodingSweepTests(unittest.TestCase):
     def test_needs_repair_for_symbol_glyphs(self) -> None:
         self.assertTrue(_needs_character_encoding_repair("□ "))
