@@ -361,6 +361,143 @@ def _result(
     )
 
 
+def _reachable_struct_objgens(root: pikepdf.Dictionary) -> set[tuple[int, int]]:
+    reachable: set[tuple[int, int]] = set()
+    stack: list[pikepdf.Dictionary] = [root]
+    while stack:
+        obj = stack.pop()
+        objgen = obj.objgen
+        if objgen in reachable:
+            continue
+        reachable.add(objgen)
+        kids = obj.get("/K")
+        items = list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+        for item in items:
+            if isinstance(item, pikepdf.Dictionary) and item.get("/S") is not None:
+                stack.append(item)
+    return reachable
+
+
+def _parent_tree_value_objgens(
+    parent_tree: pikepdf.Dictionary,
+) -> set[tuple[int, int]]:
+    objgens: set[tuple[int, int]] = set()
+
+    def record(value: object) -> None:
+        if isinstance(value, pikepdf.Dictionary):
+            objgens.add(value.objgen)
+        elif isinstance(value, pikepdf.Array):
+            for item in value:
+                if isinstance(item, pikepdf.Dictionary):
+                    objgens.add(item.objgen)
+
+    def walk(node: pikepdf.Dictionary) -> None:
+        nums = node.get("/Nums")
+        if isinstance(nums, pikepdf.Array):
+            items = list(nums)
+            for index in range(1, len(items), 2):
+                record(items[index])
+        kids = node.get("/Kids")
+        if isinstance(kids, pikepdf.Array):
+            for kid in kids:
+                if isinstance(kid, pikepdf.Dictionary):
+                    walk(kid)
+
+    walk(parent_tree)
+    return objgens
+
+
+def _subtree_objgens(obj: pikepdf.Dictionary) -> set[tuple[int, int]]:
+    seen: set[tuple[int, int]] = set()
+    stack = [obj]
+    while stack:
+        node = stack.pop()
+        if node.objgen in seen:
+            continue
+        seen.add(node.objgen)
+        kids = node.get("/K")
+        items = list(kids) if isinstance(kids, pikepdf.Array) else [kids]
+        for item in items:
+            if isinstance(item, pikepdf.Dictionary) and item.get("/S") is not None:
+                stack.append(item)
+    return seen
+
+
+_RECONNECT_ALLOWED_PARENTS = {
+    "/TR": {"/Table", "/THead", "/TBody", "/TFoot"},
+    "/TD": {"/TR"},
+    "/TH": {"/TR"},
+    "/THead": {"/Table"},
+    "/TBody": {"/Table"},
+    "/TFoot": {"/Table"},
+    "/LI": {"/L"},
+    "/Lbl": {"/LI"},
+    "/LBody": {"/LI"},
+}
+
+
+def _reconnect_orphaned_parenttree_subtrees(
+    pdf: pikepdf.Pdf,
+    root: pikepdf.Dictionary,
+    parent_tree: pikepdf.Dictionary,
+    actions: list[str],
+) -> int:
+    """Reattach live structure subtrees whose parent down-link was lost.
+
+    Some producers corrupt one /K down-link (e.g. writing a bare number where
+    a reference belongs), leaving a fully-formed subtree — consistent /P
+    up-links, /OBJR, ParentTree entries — unreachable from the root, which
+    fails Adobe's tagged-annotations check for the annotations inside it.
+    Reattach an unreachable element only on strong evidence of intent: its /P
+    names a parent that is reachable, and its subtree is referenced by the
+    ParentTree (the author registered it as live content). Object numbers are
+    never compared: pikepdf renumbers objects on every save.
+    """
+    live_refs = _parent_tree_value_objgens(parent_tree)
+    reconnected = 0
+    for _round in range(8):
+        reachable = _reachable_struct_objgens(root)
+        appended = False
+        for obj in pdf.objects:
+            if not isinstance(obj, pikepdf.Dictionary):
+                continue
+            if obj.objgen in reachable:
+                continue
+            if obj.get("/S") is None or not _is_struct_elem(obj):
+                continue
+            parent = obj.get("/P")
+            if not isinstance(parent, pikepdf.Dictionary):
+                continue
+            if parent.objgen not in reachable:
+                continue
+            allowed_parents = _RECONNECT_ALLOWED_PARENTS.get(str(obj.get("/S")))
+            if allowed_parents is not None and (
+                str(parent.get("/S")) not in allowed_parents
+            ):
+                # The recorded /P itself violates the child's required
+                # nesting (e.g. a /TR whose parent is a /Sect); reattaching
+                # would trade an ignored subtree for an invalid one.
+                continue
+            if not (_subtree_objgens(obj) & live_refs):
+                continue
+            kids = parent.get("/K")
+            if isinstance(kids, pikepdf.Array):
+                kids.append(obj)
+            elif kids is None:
+                parent["/K"] = obj
+            else:
+                parent["/K"] = pikepdf.Array([kids, obj])
+            reconnected += 1
+            appended = True
+            actions.append(
+                f"reconnected unreachable {obj.get('/S')} subtree (registered "
+                f"in ParentTree) under its parent {parent.get('/S')}"
+            )
+        if not appended:
+            break
+    return reconnected
+
+
 def repair_tagged_annotations(
     pdf_bytes: bytes,
 ) -> tuple[bytes, TaggedAnnotationRepairResult]:
@@ -411,6 +548,9 @@ def repair_tagged_annotations(
             _as_int(next_key_value) is None or int(next_key_value) < 0
         ):
             conflicts.append("StructTreeRoot /ParentTreeNextKey is invalid")
+        reconnected = _reconnect_orphaned_parenttree_subtrees(
+            pdf, root, parent_tree, actions
+        )
         elements, objr_by_annotation, element_pages = _scan_structure(
             root,
             pages=pages,
@@ -675,6 +815,7 @@ def repair_tagged_annotations(
             or objr_additions
             or generated_elements
             or parent_additions
+            or reconnected
         )
         if not changed and not parent_tree_next_key_updated:
             return pdf_bytes, _result(

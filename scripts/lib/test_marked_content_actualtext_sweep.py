@@ -1090,6 +1090,67 @@ class OrphanMarkedContentTests(unittest.TestCase):
             self.assertEqual(block[0], "Span")
 
 
+class OrphanSpanFullExtentTests(unittest.TestCase):
+    """Block-level /ActualText must speak every glyph the block shows."""
+
+    @staticmethod
+    def _build(stream: bytes) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(stream)
+        body = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/P"),
+                "/K": 1,
+                "/Pg": page.obj,
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([body]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    def test_spoken_text_covers_shows_past_the_first_et(self) -> None:
+        # Mirrors sociology f72a442e MCID 36: a heading in one BT..ET, then
+        # more labels (some via TJ arrays) before the span's EMC. The stamped
+        # /ActualText must include all of them or AT loses the labels.
+        repaired, result = repair_marked_content_actualtext(
+            self._build(
+                b"q /Span<</MCID 7 >> BDC "
+                b"BT [ (Example 2: South K) 9.6 (or) 6.8 (ea ) ] TJ ET "
+                b"0 0 m 10 0 l S "
+                b"BT (Male ) Tj (F) Tj (emale ) Tj "
+                b"[ (Bir) -24.4 (th r) 9.3 (ate ) ] TJ ET EMC "
+                b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+            )
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertTrue(_mcid_bdc_has_actualtext(data, 7))
+        injected = [a for a in result.actions if "orphan MCID 7" in a]
+        self.assertEqual(len(injected), 1)
+        self.assertIn("Example 2: South Korea Male Female Birth rate", injected[0])
+
+    def test_undecodable_hex_show_blocks_injection(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            self._build(
+                b"q /Span<</MCID 7 >> BDC "
+                b"BT (Legend: ) Tj <002a004100420043> Tj ET EMC "
+                b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+            )
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertFalse(_mcid_bdc_has_actualtext(data, 7))
+        self.assertEqual([a for a in result.actions if "orphan MCID 7" in a], [])
+
+
 class StructPageRefTests(unittest.TestCase):
     def test_set_struct_page_if_missing_accepts_page_dictionary(self) -> None:
         with pikepdf.new() as pdf:
@@ -1197,6 +1258,16 @@ class OcrTextReliabilityTests(unittest.TestCase):
         self.assertFalse(_ocr_text_is_reliable(""))
         self.assertFalse(_ocr_text_is_reliable("= - | %"))
 
+    def test_stray_single_letters_are_rejected(self) -> None:
+        from lib.marked_content_actualtext_sweep import _ocr_text_is_reliable
+
+        self.assertFalse(_ocr_text_is_reliable('~ SURVEY "agou faa, r'))
+
+    def test_articles_and_pronoun_i_do_not_count_as_junk(self) -> None:
+        from lib.marked_content_actualtext_sweep import _ocr_text_is_reliable
+
+        self.assertTrue(_ocr_text_is_reliable("I saw a chart of results"))
+
 
 class UntaggedImageActualTextTests(unittest.TestCase):
     _IMAGE_ONLY_STREAM = (
@@ -1233,6 +1304,54 @@ class UntaggedImageActualTextTests(unittest.TestCase):
             contents,
             r"/Span << /ActualText \(y axis label\) >> BDC /Im1 Do EMC",
         )
+
+    def test_repair_wraps_image_when_text_shown_via_tj_array(self) -> None:
+        # Text painted with a TJ array (not plain Tj) must still block the
+        # whole-span /ActualText stamp, or the real text is hidden from AT.
+        pdf_bytes = _build_untagged_image_pdf(
+            b"/Span <</MCID 0>> BDC BT [ (i) 0.5 (on per year. ) ] TJ ET "
+            b"q 50 0 0 50 20 100 cm /Im1 Do Q EMC"
+        )
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="",
+        ):
+            repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertGreaterEqual(result.mcids_updated, 1)
+        contents = _page_contents_text(repaired)
+        self.assertIn("[ (i) 0.5 (on per year. ) ] TJ", contents)
+        self.assertIsNone(_actualtext_for_mcid(contents, 0))
+        self.assertRegex(
+            contents,
+            r"/Span << /ActualText \(Figure\) >> BDC /Im1 Do EMC",
+        )
+
+    def test_repair_wraps_image_when_text_shown_via_hex_string(self) -> None:
+        pdf_bytes = _build_untagged_image_pdf(
+            b"/Span <</MCID 0>> BDC BT <1f> Tj ET "
+            b"q 50 0 0 50 20 100 cm /Im1 Do Q EMC"
+        )
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="",
+        ):
+            repaired, _result = repair_marked_content_actualtext(pdf_bytes)
+        contents = _page_contents_text(repaired)
+        self.assertIn("<1f> Tj", contents)
+        self.assertIsNone(_actualtext_for_mcid(contents, 0))
+
+    def test_whitespace_only_strings_still_count_as_image_only(self) -> None:
+        pdf_bytes = _build_untagged_image_pdf(
+            b"/P <</MCID 0>> BDC BT ( ) Tj [ ( ) ] TJ ET "
+            b"q 50 0 0 50 20 20 cm /Im1 Do Q EMC"
+        )
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="x equals one",
+        ):
+            repaired, _result = repair_marked_content_actualtext(pdf_bytes)
+        contents = _page_contents_text(repaired)
+        self.assertEqual(_actualtext_for_mcid(contents, 0), "x equals one")
 
     def test_repair_is_idempotent(self) -> None:
         for stream in (self._IMAGE_ONLY_STREAM, self._MIXED_STREAM):

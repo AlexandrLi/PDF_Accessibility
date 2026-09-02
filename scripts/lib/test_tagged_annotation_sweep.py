@@ -372,5 +372,139 @@ class TaggedAnnotationSweepTests(unittest.TestCase):
         self.assertTrue(result.unresolved)
 
 
+class IntegerChildRefReconnectionTests(unittest.TestCase):
+    """A subtree written into its parent's /K as a bare object number."""
+
+    @staticmethod
+    def _build() -> tuple[bytes, int]:
+        pdf, pages, root = _base_pdf()
+        annotation = _page_annotation(pdf, pages[0], "/Link")
+        annotation["/StructParent"] = 13
+        figure = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Figure"),
+                    "/Pg": pages[0].obj,
+                    "/P": root,
+                }
+            )
+        )
+        root["/K"].append(figure)
+        link = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Link"),
+                    "/Pg": pages[0].obj,
+                }
+            )
+        )
+        reference = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Reference"),
+                    "/Pg": pages[0].obj,
+                    "/P": figure,
+                    "/K": pikepdf.Array([link]),
+                }
+            )
+        )
+        link["/P"] = reference
+        link["/K"] = pikepdf.Array([_objr(pdf, annotation, pages[0]), 41])
+        # The corruption: the parent holds the child's object NUMBER, not a
+        # reference to it.
+        figure["/K"] = pikepdf.Array([reference.objgen[0]])
+        _set_parent_tree(root, [(13, link)])
+        root["/ParentTreeNextKey"] = 14
+        return _save(pdf), reference.objgen[0]
+
+    def test_reconnects_and_clears_conflicts(self) -> None:
+        pdf_bytes, ref_objnum = self._build()
+
+        repaired, result = repair_tagged_annotations(pdf_bytes)
+
+        self.assertEqual(result.conflicts, [])
+        reconnect_actions = [
+            action for action in result.actions if "reconnected" in action
+        ]
+        self.assertEqual(len(reconnect_actions), 1)
+        self.assertIn("/Reference subtree", reconnect_actions[0])
+        with pikepdf.open(io.BytesIO(repaired)) as checked:
+            root = checked.Root["/StructTreeRoot"]
+            figure = root["/K"][0]
+            kids = list(figure["/K"])
+            # The (possibly-MCID) integer literal is preserved; the subtree
+            # reference is appended after it.
+            self.assertEqual(int(kids[0]), ref_objnum)
+            self.assertEqual(str(kids[1].get("/S")), "/Reference")
+
+    def test_reconnection_is_idempotent(self) -> None:
+        pdf_bytes, _ref_objnum = self._build()
+        repaired_once, _first = repair_tagged_annotations(pdf_bytes)
+        repaired_twice, second = repair_tagged_annotations(repaired_once)
+        self.assertEqual(repaired_twice, repaired_once)
+        self.assertEqual(second.actions, [])
+
+    def test_role_invalid_parent_blocks_reconnection(self) -> None:
+        pdf, pages, root = _base_pdf()
+        sect = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Sect"),
+                    "/Pg": pages[0].obj,
+                    "/P": root,
+                    "/K": pikepdf.Array([3]),
+                }
+            )
+        )
+        root["/K"].append(sect)
+        row = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/TR"),
+                    "/Pg": pages[0].obj,
+                    "/P": sect,
+                    "/K": pikepdf.Array([7]),
+                }
+            )
+        )
+        _set_parent_tree(root, [(0, pikepdf.Array([row]))])
+        original = _save(pdf)
+
+        repaired, result = repair_tagged_annotations(original)
+
+        self.assertEqual(repaired, original)
+        self.assertEqual(
+            [action for action in result.actions if "reconnected" in action], []
+        )
+
+    def test_integer_without_matching_orphan_is_untouched(self) -> None:
+        pdf, pages, root = _base_pdf()
+        figure = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Figure"),
+                    "/Pg": pages[0].obj,
+                    "/P": root,
+                    "/K": pikepdf.Array([15]),
+                }
+            )
+        )
+        root["/K"].append(figure)
+        original = _save(pdf)
+
+        repaired, result = repair_tagged_annotations(original)
+
+        self.assertEqual(repaired, original)
+        self.assertEqual(
+            [action for action in result.actions if "reconnected" in action], []
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

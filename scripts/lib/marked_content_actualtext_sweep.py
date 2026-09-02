@@ -157,11 +157,46 @@ def _mcid_body_has_image(body: bytes) -> bool:
     return bool(re.search(rb"/[^\s/<>{}\[\]()]+\s+Do\b", body))
 
 
-def _is_image_only_mcid_body(body: bytes) -> bool:
+_LITERAL_STRING = r"\((?:\\.|[^\\()])*\)"
+_HEX_STRING = r"<[0-9A-Fa-f\s]+>"
+_SHOW_STRING = rf"(?:{_LITERAL_STRING}|{_HEX_STRING})"
+_SIMPLE_SHOW_OP = re.compile(rf"{_SHOW_STRING}\s*(?:Tj|'|\")")
+_ARRAY_SHOW_OP = re.compile(rf"\[(?:[^\[\]()<>]|{_SHOW_STRING})*\]\s*TJ")
+
+
+def _decoded_literal_string(raw: str) -> str:
+    def unescape(match: re.Match[str]) -> str:
+        escape = match.group(1)
+        if escape[0] in "01234567":
+            return chr(int(escape, 8) & 0xFF)
+        return {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f"}.get(
+            escape, escape
+        )
+
+    return re.sub(r"\\([0-7]{1,3}|.)", unescape, raw)
+
+
+def _mcid_body_shows_text(body: bytes) -> bool:
+    """True when any text-show operator (Tj, ', \", TJ) paints visible text.
+
+    Literal strings are unescaped and must contain a non-whitespace character;
+    hex strings count as visible outright (their glyph codes are opaque here).
+    """
     text = body.decode("latin1", errors="replace")
-    has_image = _mcid_body_has_image(body)
-    has_text = bool(re.search(r"\([^()\\]{2,}\)\s*Tj", text))
-    return has_image and not has_text
+    fragments: list[str] = []
+    for pattern in (_SIMPLE_SHOW_OP, _ARRAY_SHOW_OP):
+        fragments.extend(match.group(0) for match in pattern.finditer(text))
+    for fragment in fragments:
+        if re.search(_HEX_STRING, fragment):
+            return True
+        for literal in re.finditer(_LITERAL_STRING, fragment):
+            if _decoded_literal_string(literal.group(0)[1:-1]).strip():
+                return True
+    return False
+
+
+def _is_image_only_mcid_body(body: bytes) -> bool:
+    return _mcid_body_has_image(body) and not _mcid_body_shows_text(body)
 
 
 def _struct_element_mcids(obj: pikepdf.Dictionary) -> list[int]:
@@ -507,6 +542,36 @@ def _decode_label_mcid_text(body: bytes) -> str:
     return text.strip()
 
 
+_ANY_SHOW_OP = re.compile(
+    rf"(?:\[(?:[^\[\]()<>]|{_SHOW_STRING})*\]\s*TJ)"
+    rf"|(?:{_SHOW_STRING}\s*(?:Tj|'|\"))"
+)
+
+
+def _decode_shown_text_in_order(body: bytes) -> str | None:
+    """Concatenate every text-show string in content-stream order.
+
+    Returns None when a show op paints glyphs this decoder cannot read (a
+    hex-string show other than the blank-square marker): a caller about to
+    stamp block-level /ActualText must not silence glyphs it cannot speak.
+    """
+    text = body.decode("latin1", errors="replace")
+    parts: list[str] = []
+    for match in _ANY_SHOW_OP.finditer(text):
+        for string in re.finditer(
+            rf"(?P<lit>{_LITERAL_STRING})|(?P<hex>{_HEX_STRING})", match.group(0)
+        ):
+            if string.group("lit") is not None:
+                parts.append(_decoded_literal_string(string.group("lit")[1:-1]))
+            else:
+                hex_body = re.sub(r"\s+", "", string.group("hex")[1:-1])
+                if hex_body.upper().startswith("0191"):
+                    parts.append("□")
+                else:
+                    return None
+    return "".join(parts)
+
+
 def _spoken_list_label_text(raw: str) -> str | None:
     cleaned = raw.replace("\\", "").strip()
     if not cleaned or cleaned == "□":
@@ -719,16 +784,6 @@ def _strip_content_strings(body: bytes) -> bytes:
     )
 
 
-def _body_shows_undecoded_text(body: bytes) -> bool:
-    """True when the block runs text-showing operators whose text we lost."""
-    if not re.search(rb"\bBT\b", _strip_content_strings(body)):
-        return False
-    return bool(
-        re.search(rb"(?:\)|>|\])\s*(?:Tj|TJ)\b", body)
-        or re.search(rb"\)\s*(?:'|\")", body)
-    )
-
-
 def _body_is_decorative_paths(body: bytes) -> bool:
     """True when a marked block draws only vector paths: no text, no images."""
     if _mcid_body_has_image(body):
@@ -746,12 +801,14 @@ def _orphan_marked_spoken_text(
     *,
     table_image_labels: dict[int, str] | None = None,
 ) -> str | None:
-    text = _decode_label_mcid_text(body)
+    # Block-level /ActualText silences every glyph in the block, so the
+    # spoken text must decode ALL of them; bail out when any show op is
+    # unreadable rather than replace real spoken text with a fragment.
+    decoded = _decode_shown_text_in_order(body)
+    if decoded is None:
+        return None
+    text = re.sub(r"\s+", " ", decoded).strip()
     if tag == "Span":
-        if not text.strip() and _body_shows_undecoded_text(body):
-            # The block shows glyphs we could not decode; injecting a
-            # "blank" label would replace real spoken text with silence.
-            return None
         return _spoken_list_label_text(text)
     if tag != "Table":
         return None
@@ -827,10 +884,13 @@ def _repair_orphan_marked_content_actualtext(
                 continue
             if _mcid_bdc_has_actualtext(new_data, mcid):
                 continue
-            block = _get_mcid_block(new_data, mcid)
+            # Use the block's full extent (to its own EMC, past inner ETs):
+            # /ActualText covers all of it, so every decision below must see
+            # every operator it silences.
+            block = _get_mcid_block_to_emc(new_data, mcid)
             if block is None:
                 continue
-            _bdc_tag, body = block
+            body = block[2]
             spoken = _orphan_marked_spoken_text(
                 tag,
                 body,
@@ -1652,7 +1712,8 @@ def _ocr_text_is_reliable(text: str) -> bool:
     symbols, and mangled fragments ("=, R Be - SS HO 'S", "Oo io) |oO");
     injecting that as ActualText is worse than the generic fallback. Count
     junk tokens: bare symbols, tokens with characters OCR shouldn't emit
-    mid-word, and two-letter non-words.
+    mid-word, and two-letter non-words; require the junk share to stay
+    strictly under 20% (garbled short captions land exactly on it).
     """
     tokens = text.split()
     if not tokens or not re.search(r"[A-Za-z]{3,}", text):
@@ -1671,7 +1732,7 @@ def _ocr_text_is_reliable(text: str) -> bool:
             and not re.search(r"\d", stripped)
         ):
             junk += 1
-    return junk / len(tokens) <= 0.2
+    return junk / len(tokens) < 0.2
 
 
 def _wrap_image_do_with_actualtext(
