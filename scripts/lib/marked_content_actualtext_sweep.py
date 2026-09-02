@@ -1273,6 +1273,60 @@ def _strip_actualtext_from_mcid_in_data(
     return new_data, new_data != data
 
 
+def _alt_precedence_protected_mcids(
+    pdf: pikepdf.Pdf,
+) -> set[tuple[tuple[int, int], int]]:
+    """(page objgen, MCID) pairs whose content /ActualText the alt-precedence
+    repair strips: MCIDs claimed by a Figure keeping an authoritative struct
+    /Alt. Injecting /ActualText on these elsewhere is undone in the same pass,
+    so writers must skip them or the output never reaches a byte-stable state.
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return set()
+
+    protected: set[tuple[tuple[int, int], int]] = set()
+    figures: list[pikepdf.Dictionary] = []
+
+    def collect(obj: pikepdf.Dictionary) -> None:
+        if obj.get("/S") == "/Figure":
+            figures.append(obj)
+        for child in _struct_child_dicts(obj):
+            collect(child)
+
+    collect(struct_root)
+
+    page_cache: dict[tuple[int, int], bytes] = {}
+    for figure in figures:
+        if figure.get("/Alt") is None:
+            continue
+        classes = struct_class_names(figure)
+        if "inlineFormula" in classes or any(
+            "inlineFormula" in name for name in classes
+        ):
+            continue
+        alt_text = _normalize_figure_alt_text(figure.get("/Alt"))
+        if looks_like_table_figure_alt(alt_text) or any(
+            "table-figure-reverted" in name for name in classes
+        ):
+            continue
+        page = _resolve_struct_page(pdf, figure)
+        if page is None:
+            continue
+        key = page.objgen
+        if key not in page_cache:
+            contents = page.get("/Contents")
+            page_cache[key] = (
+                _read_page_contents(contents) if contents is not None else b""
+            )
+        data = page_cache[key]
+        if not data:
+            continue
+        for mcid in _figure_content_mcids(data, _collect_mcids(figure.get("/K"))):
+            protected.add((key, mcid))
+    return protected
+
+
 def _repair_figure_alt_precedence(
     pdf: pikepdf.Pdf,
     *,
@@ -1967,6 +2021,7 @@ def repair_marked_content_actualtext(
             return pdf_bytes, result
 
         figure_index = 0
+        protected_mcids = _alt_precedence_protected_mcids(pdf)
 
         def walk(obj: pikepdf.Dictionary) -> None:
             nonlocal figure_index, figures_found, mcids_updated
@@ -2013,6 +2068,12 @@ def repair_marked_content_actualtext(
                             if has_inline_formula and mcids
                             else _table_mcid_actual_texts(alt_text, mcids)
                         )
+                        page_key = page.objgen
+                        mcid_texts = {
+                            mcid: text
+                            for mcid, text in mcid_texts.items()
+                            if (page_key, mcid) not in protected_mcids
+                        }
                         updated = _inject_actualtext_batch_on_page(
                             pdf,
                             page,
@@ -2042,6 +2103,8 @@ def repair_marked_content_actualtext(
                                 continue
                             _, body = block
                             if not _mcid_body_has_image(body):
+                                continue
+                            if (page.objgen, mcid) in protected_mcids:
                                 continue
                             mcid_texts[mcid] = "Figure"
                         if mcid_texts:

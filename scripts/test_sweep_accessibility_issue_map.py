@@ -73,6 +73,38 @@ class AccessibilityIssueMapSweepTests(unittest.TestCase):
             normalized_chapter_title("Equations & Inequalities"),
         )
 
+    def test_chapter_title_matching_strips_ch_prefix(self) -> None:
+        self.assertEqual(
+            normalized_chapter_title("Ch.15 Female Reproductive System"),
+            normalized_chapter_title("Female Reproductive System"),
+        )
+        self.assertEqual(
+            normalized_chapter_title("Chapter 3: Integumentary System"),
+            normalized_chapter_title("Integumentary System"),
+        )
+        self.assertNotEqual(
+            normalized_chapter_title("China 101"),
+            normalized_chapter_title("101"),
+        )
+
+    def test_ch_prefixed_chapter_title_matches_directly(self) -> None:
+        course = _course_with_chapter("Ch.10 Quadratic Equations & Applications")
+        matched, unmatched, _ = resolve_topics([_issue_row()], course, "course")
+        self.assertEqual(unmatched, [])
+        self.assertEqual(matched[0]["matchStrategy"], "chapterTitle")
+
+    def test_ch_prefixed_chapter_number_corroborates_unique_title(self) -> None:
+        course = _course_with_chapter("Ch.10 Quadratic Equations (Renamed)")
+        matched, unmatched, _ = resolve_topics([_issue_row()], course, "course")
+        self.assertEqual(unmatched, [])
+        self.assertEqual(matched[0]["matchStrategy"], "uniqueTitleChapterNumber")
+
+    def test_ch_prefixed_wrong_chapter_number_stays_unmatched(self) -> None:
+        course = _course_with_chapter("Ch.9 Quadratic Equations (Renamed)")
+        matched, unmatched, _ = resolve_topics([_issue_row()], course, "course")
+        self.assertEqual(matched, [])
+        self.assertEqual(len(unmatched), 1)
+
     def test_unique_title_with_matching_chapter_number_is_accepted(self) -> None:
         course = _course_with_chapter("10. Quadratic Equations")
         matched, unmatched, _ = resolve_topics([_issue_row()], course, "course")

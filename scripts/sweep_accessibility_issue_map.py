@@ -87,12 +87,16 @@ def normalized_course_sheet(value: object) -> str:
 
 
 def chapter_number(value: object) -> str:
-    match = re.match(r"^\s*0*(\d+)\s*\.", str(value or ""))
+    text = str(value or "")
+    match = re.match(r"^\s*0*(\d+)\s*\.", text)
+    if not match:
+        match = re.match(r"^\s*ch(?:apter)?\.?\s*0*(\d+)\b", text, re.IGNORECASE)
     return match.group(1) if match else ""
 
 
 def normalized_chapter_title(value: object) -> str:
     text = normalized(value)
+    text = re.sub(r"^ch(?:apter)?\.?\s*\d+\s*[:\-.]?\s*", "", text)
     text = re.sub(r"^\d+\.\s*", "", text)
     text = re.sub(r"^review\s+\d+\s*[:\-]?\s*", "", text)
     text = text.replace("&", "and")

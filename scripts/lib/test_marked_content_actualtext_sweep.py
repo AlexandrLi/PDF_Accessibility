@@ -257,6 +257,77 @@ class TableFigureRepairTests(unittest.TestCase):
         self.assertEqual(_page_contents_text(repaired_once), _page_contents_text(repaired_twice))
 
 
+def _build_shared_mcid_conflict_pdf() -> bytes:
+    """d1e08a1e-like page: a table-figure-reverted element and a real figure
+    with an authoritative /Alt both claim the same MCID 31."""
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page()
+    page["/Contents"] = pdf.make_stream(
+        b"q /Figure<</MCID 31 >> BDC /Im1 Do EMC Q"
+    )
+
+    table_figure = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Figure"),
+            "/Alt": "Table",
+            "/Contents": "Table",
+            "/C": pikepdf.Array([pikepdf.Name("/table-figure-reverted")]),
+            "/K": pikepdf.Array([31]),
+        }
+    )
+    real_figure = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Figure"),
+            "/Alt": "Illustration of a therapy session.",
+            "/K": pikepdf.Array([31]),
+        }
+    )
+    document = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Document"),
+            "/K": pikepdf.Array([real_figure, table_figure]),
+        }
+    )
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array([document]),
+        }
+    )
+
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+class SharedMcidAltPrecedenceConflictTests(unittest.TestCase):
+    def test_table_figure_does_not_inject_on_alt_protected_mcid(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            _build_shared_mcid_conflict_pdf()
+        )
+        contents = _page_contents_text(repaired)
+        self.assertIsNone(_actualtext_for_mcid(contents, 31))
+        self.assertFalse(
+            any("stripped duplicate" in action for action in result.actions)
+        )
+        self.assertFalse(
+            any("for table figure" in action for action in result.actions)
+        )
+
+    def test_repair_is_byte_stable_on_shared_mcid_conflict(self) -> None:
+        repaired_once, _ = repair_marked_content_actualtext(
+            _build_shared_mcid_conflict_pdf()
+        )
+        repaired_twice, second = repair_marked_content_actualtext(repaired_once)
+        self.assertEqual(repaired_twice, repaired_once)
+        self.assertFalse(
+            any("stripped duplicate" in action for action in second.actions)
+        )
+
+
 class Cd099d0aRegressionTests(unittest.TestCase):
     def test_table_mcid_15_does_not_steal_bacteria_mcid_158_alt(self) -> None:
         pdf_bytes = _build_cd099d0a_regression_pdf()
