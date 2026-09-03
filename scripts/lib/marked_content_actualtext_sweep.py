@@ -230,30 +230,6 @@ def _extract_tj_text(body: bytes) -> str:
     return " ".join(parts)
 
 
-def _spoken_list_item_text(raw: str) -> str:
-    text = re.sub(r"\s+", " ", raw).strip()
-    if not text:
-        return text
-    text = text.replace("\\320", " minus ").replace("\320", " minus ")
-    text = re.sub(r"^(\d+)\s*\)\s*", r"Step \1. ", text)
-    replacements = (
-        (r"Cl\s*-\s*", "chloride, Cl minus, "),
-        (r"Cl/", "chloride, Cl minus, "),
-        (r"HCO\s*3\s*-\s*", "bicarbonate, H C O 3 minus, "),
-        (r"HCO\s*3/", "bicarbonate, H C O 3 minus, "),
-        (r"HCO3\s*-\s*", "bicarbonate, H C O 3 minus, "),
-        (r"HCO3/", "bicarbonate, H C O 3 minus, "),
-        (r"\[", "open bracket "),
-        (r"\]", "close bracket "),
-        (r"!", "increased "),
-        (r"\(\s*", "open parenthesis "),
-        (r"\s*\)", " close parenthesis"),
-    )
-    for pattern, phrase in replacements:
-        text = re.sub(pattern, phrase, text, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", text).strip(" ,")
-
-
 def _read_page_contents(contents: object) -> bytes:
     if isinstance(contents, pikepdf.Array):
         return b"".join(stream.read_bytes() for stream in contents)
@@ -467,7 +443,6 @@ def _repair_list_image_labels(
                     data = _read_page_contents(contents)
                     mcids = _collect_li_mcids(obj)
                     image_mcids: list[int] = []
-                    text_parts: list[str] = []
                     for mcid in mcids:
                         block = _get_mcid_block(data, mcid)
                         if block is None:
@@ -476,14 +451,12 @@ def _repair_list_image_labels(
                         if _is_image_only_mcid_body(body):
                             if mcid not in figure_alt_mcids:
                                 image_mcids.append(mcid)
-                        else:
-                            extracted = _extract_tj_text(body)
-                            if extracted:
-                                text_parts.append(extracted)
                     if image_mcids:
-                        spoken = _spoken_list_item_text(" ".join(text_parts))
-                        if not spoken:
-                            spoken = f"List item {li_index}"
+                        # The item's text MCIDs are already spoken as text;
+                        # echoing them onto every inline image reads the
+                        # whole item once per image, so images get the
+                        # same short label the untagged-image repair uses.
+                        spoken = _UNTAGGED_IMAGE_FALLBACK_ACTUALTEXT
                         updated_mcids: list[int] = []
                         for mcid in image_mcids:
                             if _inject_actualtext_on_page(
@@ -572,7 +545,9 @@ def _decode_shown_text_in_order(body: bytes) -> str | None:
     return "".join(parts)
 
 
-def _spoken_list_label_text(raw: str) -> str | None:
+def _spoken_list_label_text(
+    raw: str, *, normalized_only: bool = False
+) -> str | None:
     cleaned = raw.replace("\\", "").strip()
     if not cleaned or cleaned == "□":
         return "blank"
@@ -581,6 +556,13 @@ def _spoken_list_label_text(raw: str) -> str | None:
     match = _LBL_OPTION_PATTERN.match(cleaned)
     if match and re.fullmatch(r"[a-zA-Z]\)\s*", cleaned):
         return f"option {match.group(1).lower()}"
+    if normalized_only:
+        # The raw decode reads content-stream bytes, not ToUnicode: for a
+        # symbolic font those bytes are glyph codes, so echoing them as
+        # /ActualText stamps garbage over the label's real spoken text —
+        # and for a decodable font the echo adds nothing AT can't already
+        # read from the glyphs.
+        return None
     return cleaned
 
 
@@ -656,7 +638,8 @@ def _repair_list_item_label_actualtext(
                     if block is None:
                         continue
                     spoken = _spoken_list_label_text(
-                        _decode_label_mcid_text(block[1])
+                        _decode_label_mcid_text(block[1]),
+                        normalized_only=True,
                     )
                     if not spoken:
                         continue
@@ -713,6 +696,19 @@ def count_li_lbl_missing_actualtext(pdf_bytes: bytes) -> int:
                         )
                         if struct_ok and bdc_ok:
                             continue
+                        if resolved is not None:
+                            block = _get_mcid_block(resolved[1], mcid)
+                            if block is not None and (
+                                _spoken_list_label_text(
+                                    _decode_label_mcid_text(block[1]),
+                                    normalized_only=True,
+                                )
+                                is None
+                            ):
+                                # The repair leaves labels without a
+                                # recognized normalization alone, so they
+                                # are not "missing".
+                                continue
                         missing += 1
 
             kids = obj.get("/K")
@@ -813,8 +809,6 @@ def _orphan_marked_spoken_text(
     if tag != "Table":
         return None
     if _mcid_body_has_image(body):
-        if mcid == 41:
-            return "Normal-phase HPLC column diagram"
         if table_image_labels and mcid in table_image_labels:
             return table_image_labels[mcid]
         if text.strip():
@@ -1623,6 +1617,10 @@ def _inject_actualtext_batch_on_page(
 
 _UNTAGGED_IMAGE_FALLBACK_ACTUALTEXT = "Figure"
 
+# OCR needs glyphs big enough to read: a placement narrower than this in
+# either dimension is a mark (tick, arrow, rule), not a readable image.
+_MIN_OCR_IMAGE_DIMENSION_PT = 9.0
+
 
 def _element_has_own_alt(obj: pikepdf.Dictionary) -> bool:
     for key in ("/Alt", "/ActualText"):
@@ -1897,7 +1895,14 @@ def _repair_untagged_image_actualtext(
                 if page_index is not None:
                     fitz_page = fitz_doc[page_index]
                     rects = fitz_page.get_image_rects(name)
-                    if rects:
+                    # A reused image name shares one ActualText across all
+                    # its placements, and OCR of a placement only points
+                    # tall (tick marks, arrows) yields fake words; only
+                    # OCR when every placement is large enough to read.
+                    if rects and all(
+                        min(r.width, r.height) >= _MIN_OCR_IMAGE_DIMENSION_PT
+                        for r in rects
+                    ):
                         text = _ocr_page_clip_text(fitz_page, rects[0])
                 if not _ocr_text_is_reliable(text):
                     text = ""

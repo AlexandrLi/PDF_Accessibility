@@ -18,6 +18,16 @@ class InlineFormulaSweepTests(unittest.TestCase):
         self.assertIn("antiporter", lowered)
         self.assertGreater(len(alt), 80)
 
+    def test_expand_is_idempotent(self) -> None:
+        once = expand_inline_formula_alt("Figure 7")
+        self.assertIn("Spoken formula notation for inline formula text.", once)
+        twice = expand_inline_formula_alt(once)
+        self.assertEqual(once, twice)
+
+    def test_expand_does_not_reappend_historical_wording(self) -> None:
+        legacy = "Figure 7. Spoken formula notation for inline chemistry text."
+        self.assertEqual(expand_inline_formula_alt(legacy), legacy)
+
     def test_repair_inline_formula_on_sample_pdf(self) -> None:
         sample = "/tmp/4cdddfe5-latest.pdf"
         try:

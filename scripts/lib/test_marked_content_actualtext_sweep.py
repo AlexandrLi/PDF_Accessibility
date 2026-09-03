@@ -26,6 +26,7 @@ from lib.marked_content_actualtext_sweep import (
     _read_page_contents,
     _resolve_struct_page,
     _set_struct_page_if_missing,
+    _spoken_list_label_text,
     count_li_lbl_missing_actualtext,
     count_orphan_marked_missing_actualtext,
     list_untagged_image_mcids_missing_actualtext,
@@ -776,6 +777,121 @@ class ListItemLabelActualTextTests(unittest.TestCase):
             spoken = sorted(str(lbl.get("/ActualText")) for lbl in lbl_elems)
             self.assertEqual(spoken, ["option a", "option c"])
 
+    def test_list_item_inline_image_gets_generic_label(self) -> None:
+        # The item's own text is already spoken as text; the inline image
+        # must get the short generic label, never an echo of that text.
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page(page_size=(200, 200))
+        image = pikepdf.Stream(pdf, b"\xff")
+        image["/Type"] = pikepdf.Name("/XObject")
+        image["/Subtype"] = pikepdf.Name("/Image")
+        image["/Width"] = 1
+        image["/Height"] = 1
+        image["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+        image["/BitsPerComponent"] = 8
+        page["/Resources"] = pikepdf.Dictionary(
+            {"/XObject": pikepdf.Dictionary({"/Im1": image})}
+        )
+        page["/Contents"] = pdf.make_stream(
+            b"/LBody<</MCID 1>> BDC (Gene expression is controlled!) Tj EMC "
+            b"/LBody<</MCID 2>> BDC q 20 0 0 20 5 5 cm /Im1 Do Q EMC"
+        )
+        text_body = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/LBody"),
+                "/K": pikepdf.Array([1, 2]),
+                "/Pg": page.obj,
+            }
+        )
+        li = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/LI"),
+                "/Pg": page.obj,
+                "/K": pikepdf.Array([text_body]),
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([li]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        repaired, result = repair_marked_content_actualtext(buf.getvalue())
+        self.assertIn("list item 1: added /ActualText to image MCIDs [2]",
+                      "\n".join(result.actions))
+        contents = _page_contents_text(repaired)
+        self.assertEqual(_actualtext_for_mcid(contents, 2), "Figure")
+        self.assertNotIn("increased", contents)
+        self.assertNotIn("Gene expression is controlled! Figure", contents)
+
+    def test_spoken_list_label_text_normalized_only(self) -> None:
+        self.assertEqual(
+            _spoken_list_label_text("a)  ", normalized_only=True), "option a"
+        )
+        self.assertEqual(_spoken_list_label_text("□", normalized_only=True), "blank")
+        self.assertEqual(_spoken_list_label_text("___", normalized_only=True), "blank")
+        # Raw content-stream bytes from a symbolic font are glyph codes,
+        # not text; the label repair must not echo them as spoken text.
+        self.assertIsNone(_spoken_list_label_text('"#', normalized_only=True))
+        self.assertIsNone(_spoken_list_label_text("1.", normalized_only=True))
+        self.assertEqual(_spoken_list_label_text('"#'), '"#')
+
+    def test_symbolic_font_label_is_not_stamped_or_counted(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b'q /Lbl<</MCID 5 >> BDC ("#)Tj EMC '
+            b"q /LBody<</MCID 6 >> BDC (Human somatic cells are diploid.) Tj EMC Q"
+        )
+        lbl = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Lbl"),
+                "/K": 5,
+                "/Pg": page.obj,
+            }
+        )
+        lbody = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/LBody"),
+                "/K": 6,
+                "/Pg": page.obj,
+            }
+        )
+        li = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/LI"),
+                "/Pg": page.obj,
+                "/K": pikepdf.Array([lbl, lbody]),
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([li]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+        pdf_bytes = buf.getvalue()
+
+        self.assertEqual(count_li_lbl_missing_actualtext(pdf_bytes), 0)
+        repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertNotIn("Lbl MCID 5", "\n".join(result.actions))
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertFalse(_mcid_bdc_has_actualtext(data, 5))
+            li_elem = opened.Root["/StructTreeRoot"]["/K"][0]
+            lbl_elem = li_elem["/K"][0]
+            self.assertIsNone(lbl_elem.get("/ActualText"))
+
     def test_skip_list_item_label_actualtext_when_li_has_alt(self) -> None:
         pdf = pikepdf.Pdf.new()
         page = pdf.add_blank_page()
@@ -1288,6 +1404,22 @@ class UntaggedImageActualTextTests(unittest.TestCase):
         self.assertGreaterEqual(result.mcids_updated, 1)
         contents = _page_contents_text(repaired)
         self.assertEqual(_actualtext_for_mcid(contents, 0), "x equals one")
+
+    def test_tiny_image_placement_skips_ocr(self) -> None:
+        # 8x3pt placement: a tick mark, not a readable image — OCR of it
+        # produces fake words, so the repair must use the generic label.
+        pdf_bytes = _build_untagged_image_pdf(
+            b"/P <</MCID 0>> BDC q 8 0 0 3 20 20 cm /Im1 Do Q EMC"
+        )
+        with unittest.mock.patch(
+            "lib.marked_content_actualtext_sweep._ocr_page_clip_text",
+            return_value="Lele",
+        ) as ocr:
+            repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertGreaterEqual(result.mcids_updated, 1)
+        ocr.assert_not_called()
+        contents = _page_contents_text(repaired)
+        self.assertEqual(_actualtext_for_mcid(contents, 0), "Figure")
 
     def test_repair_wraps_image_inside_mixed_text_mcid(self) -> None:
         pdf_bytes = _build_untagged_image_pdf(self._MIXED_STREAM)

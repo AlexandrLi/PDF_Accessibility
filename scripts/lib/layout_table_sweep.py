@@ -711,6 +711,16 @@ def _canonicalize_neptune_placeholders(
     return True
 
 
+def _is_adobe_autotagged_table(table: pikepdf.Dictionary) -> bool:
+    """True when the table's attributes prove Adobe Auto-Tag produced it."""
+    for name in ("/ADBE_NumCol", "/ADBE_NumRow"):
+        if list(_owner_attribute_values(table, name, "/Table")):
+            return True
+    return bool(
+        list(_owner_attribute_values(table, "/ADBE_TableProcess", "/ADBE_Table"))
+    )
+
+
 def _is_adobe_layout_table(
     table: pikepdf.Dictionary,
     rows: list[pikepdf.Dictionary],
@@ -1642,6 +1652,24 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
                     actions.append(
                         f"table{index}: retained ambiguous /Table with normalized /Summary"
                     )
+                continue
+            if differing_widths and _is_adobe_autotagged_table(table):
+                # An Auto-Tag table is a heuristic guess, not author
+                # intent; one still irregular after every grid repair can
+                # only fail the checker, so read it as layout instead.
+                rows, cells = _table_rows_and_cells(table)
+                _unwrap_grid_table(table, rows, cells)
+                unwrapped_grid += 1
+                changed = True
+                actions.append(
+                    f"table{index}: unwrapped irregular Adobe auto-tagged table to /Sect"
+                )
+                note = (
+                    f"table{index}: differing logical row widths; "
+                    "retained as ambiguous /Table"
+                )
+                if note in unresolved:
+                    unresolved.remove(note)
                 continue
             if differing_widths:
                 ambiguous_tables += 1

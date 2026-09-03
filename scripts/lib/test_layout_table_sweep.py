@@ -558,7 +558,105 @@ def _make_pdf_lib_overlapping_table(*, valid_indices: bool = True) -> bytes:
     return output.getvalue()
 
 
+def _make_irregular_autotag_table(*, adobe_attrs: bool) -> bytes:
+    """2x2 grid with overlapping RowSpan/ColSpan, as Adobe Auto-Tag emits."""
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+
+    def cell(label: str, attrs: dict | None = None) -> pikepdf.Dictionary:
+        c = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/TD"),
+                "/K": pikepdf.String(label),
+                "/Pg": page.obj,
+            }
+        )
+        if attrs:
+            c["/A"] = pikepdf.Dictionary(
+                {"/O": pikepdf.Name("/Table"), **attrs}
+            )
+        return c
+
+    def row(cells: list[pikepdf.Dictionary]) -> pikepdf.Dictionary:
+        return pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/TR"),
+                "/K": pikepdf.Array(cells),
+                "/Pg": page.obj,
+            }
+        )
+
+    rows = [
+        row([cell("a"), cell("Reason", {"/RowSpan": 2})]),
+        row([cell("b", {"/ColSpan": 2})]),
+    ]
+    table = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Table"),
+            "/K": pikepdf.Array(rows),
+            "/Pg": page.obj,
+        }
+    )
+    if adobe_attrs:
+        table["/A"] = pikepdf.Array(
+            [
+                pikepdf.Dictionary(
+                    {
+                        "/O": pikepdf.Name("/Table"),
+                        "/ADBE_NumCol": 2,
+                        "/ADBE_NumRow": 2,
+                    }
+                )
+            ]
+        )
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array([table]),
+        }
+    )
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
 class LayoutTableSweepTests(unittest.TestCase):
+    def test_irregular_autotag_table_is_unwrapped(self) -> None:
+        repaired, result = repair_layout_tables(
+            _make_irregular_autotag_table(adobe_attrs=True)
+        )
+        self.assertEqual(result.unwrapped_grid, 1)
+        self.assertEqual(result.ambiguous_tables, 0)
+        self.assertTrue(
+            any(
+                "unwrapped irregular Adobe auto-tagged table" in action
+                for action in result.actions
+            )
+        )
+        self.assertFalse(
+            any("retained as ambiguous" in note for note in result.unresolved)
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            root_kid = pdf.Root["/StructTreeRoot"]["/K"][0]
+            self.assertNotEqual(root_kid.get("/S"), "/Table")
+
+    def test_irregular_table_without_adobe_attrs_is_retained(self) -> None:
+        _repaired, result = repair_layout_tables(
+            _make_irregular_autotag_table(adobe_attrs=False)
+        )
+        self.assertEqual(result.unwrapped_grid, 0)
+        self.assertEqual(result.ambiguous_tables, 1)
+        self.assertTrue(
+            any(
+                "differing logical row widths" in note
+                for note in result.unresolved
+            )
+        )
+
     def test_two_row_header_table_gets_th_scope_and_headers(self) -> None:
         repaired, result = repair_layout_tables(_make_two_row_table())
 

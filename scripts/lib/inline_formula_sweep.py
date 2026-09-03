@@ -25,6 +25,12 @@ class InlineFormulaRepairResult:
         return asdict(self)
 
 
+# Matches the boilerplate this expander appends (current and historical
+# wording), so a re-run never appends it a second time.
+_SPOKEN_NOTATION_SENTINEL = re.compile(
+    r"Spoken formula notation for inline (?:chemistry|formula) text\."
+)
+
 _ANTIPORTER_PATTERN = re.compile(
     r"^(?P<prefix>.*?)\s+"
     r"(?P<left>[A-Za-z0-9+\-]+)-/(?P<right>[A-Za-z0-9+\-]+)-\s+"
@@ -85,8 +91,10 @@ def expand_inline_formula_alt(caption: str) -> str:
     for pattern, replacement in token_rules:
         expanded = re.sub(pattern, replacement, expanded)
 
-    if not looks_like_equation_alt(expanded):
-        expanded = f"{expanded}. Spoken formula notation for inline chemistry text."
+    if not looks_like_equation_alt(expanded) and not _SPOKEN_NOTATION_SENTINEL.search(
+        expanded
+    ):
+        expanded = f"{expanded}. Spoken formula notation for inline formula text."
 
     return re.sub(r"\s+", " ", expanded).strip()
 
