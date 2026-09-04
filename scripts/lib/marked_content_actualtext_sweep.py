@@ -772,6 +772,92 @@ def _table_body_has_paths_only(body: bytes) -> bool:
     return bool(re.search(rb"\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\s+m\b", body))
 
 
+def _collect_struct_page_mcids(
+    pdf: pikepdf.Pdf,
+) -> tuple[set[tuple[tuple[int, int], int]], set[int]]:
+    """Collect (page objgen, MCID) pairs owned by the structure tree.
+
+    MCIDs are page-scoped integers, so ownership must be tested per page;
+    a global MCID set masks orphans whenever another page's tree uses the
+    same number. MCIDs whose owning page cannot be determined are returned
+    separately and treated as owned everywhere.
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    owned: set[tuple[tuple[int, int], int]] = set()
+    wildcard: set[int] = set()
+    if struct_root is None:
+        return owned, wildcard
+
+    def record(mcid: int, page: pikepdf.Object | None) -> None:
+        if page is None:
+            wildcard.add(mcid)
+        else:
+            owned.add((page.objgen, mcid))
+
+    def walk(obj: pikepdf.Dictionary, page: pikepdf.Object | None) -> None:
+        own_page = obj.get("/Pg")
+        if own_page is not None:
+            page = own_page
+        content = obj.get("/K")
+        items: list[object]
+        if isinstance(content, pikepdf.Array):
+            items = list(content)
+        elif content is None:
+            items = []
+        else:
+            items = [content]
+        for item in items:
+            if isinstance(item, int):
+                record(item, page)
+            elif isinstance(item, pikepdf.Dictionary):
+                if "/MCID" in item:
+                    record(int(item.MCID), item.get("/Pg") or page)
+                else:
+                    walk(item, page)
+
+    walk(struct_root, None)
+    return owned, wildcard
+
+
+_MC_STREAM_TOKEN = re.compile(
+    rb"/(\w+)\s*(?:<<(?:(?!>>).)*>>)?\s*(?:BDC|BMC)"
+    rb"|\bEMC\b"
+    rb"|/([^\s/<>{}\[\]()]+)\s+Do\b",
+    re.DOTALL,
+)
+
+
+def _artifact_drawn_xobject_names(data: bytes) -> set[bytes]:
+    """Names of XObjects a page also draws inside /Artifact marked content."""
+    names: set[bytes] = set()
+    stack: list[bytes] = []
+    artifact_depth = 0
+    for match in _MC_STREAM_TOKEN.finditer(data):
+        token = match.group(0)
+        if token.endswith(b"BDC") or token.endswith(b"BMC"):
+            tag = match.group(1)
+            stack.append(tag)
+            if tag == b"Artifact":
+                artifact_depth += 1
+        elif token == b"EMC":
+            if stack and stack.pop() == b"Artifact":
+                artifact_depth -= 1
+        elif artifact_depth > 0:
+            names.add(match.group(2))
+    return names
+
+
+def _body_has_show_ops(body: bytes) -> bool:
+    return bool(
+        _SIMPLE_SHOW_OP.search(body.decode("latin-1"))
+        or _ARRAY_SHOW_OP.search(body.decode("latin-1"))
+    )
+
+
+def _body_xobject_names(body: bytes) -> set[bytes]:
+    return set(re.findall(rb"/([^\s/<>{}\[\]()]+)\s+Do\b", body))
+
+
 def _strip_content_strings(body: bytes) -> bytes:
     return re.sub(
         rb"\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>",
@@ -862,21 +948,67 @@ def _repair_orphan_marked_content_actualtext(
 ) -> int:
     """Add /ActualText or /Artifact to BDC blocks not linked in the struct tree."""
     struct_mcids = _collect_struct_mcids(pdf)
+    owned_page_mcids, wildcard_mcids = _collect_struct_page_mcids(pdf)
     updated = 0
 
     for page in pdf.pages:
         data = _page_contents_data(page)
         if data is None:
             continue
+        page_owned = {
+            mcid for pg, mcid in owned_page_mcids if pg == page.obj.objgen
+        } | wildcard_mcids
+        artifact_names = _artifact_drawn_xobject_names(data)
         table_image_labels = _pair_orphan_table_image_labels(data, struct_mcids)
         page_changed = False
         new_data = data
         for mcid, tag in _iter_bdc_mcids_on_page(data):
-            if mcid in struct_mcids:
+            if mcid in page_owned:
                 continue
-            if tag not in ("Table", "Span"):
+            if tag not in ("Table", "Span", "Figure"):
                 continue
             if _mcid_bdc_has_actualtext(new_data, mcid):
+                continue
+            if tag == "Figure":
+                block = _get_mcid_block_to_emc(new_data, mcid)
+                if block is None:
+                    continue
+                body = block[2]
+                if _body_has_show_ops(body):
+                    # An orphan Figure that shows text needs a tree repair a
+                    # sweep cannot infer; leave it for review, never silence it.
+                    continue
+                draw_names = _body_xobject_names(body)
+                if draw_names and draw_names <= artifact_names or (
+                    not draw_names and _body_is_decorative_paths(body)
+                ):
+                    # The page draws the same XObject again as an /Artifact
+                    # (Word exports draw one rasterized graphics layer once
+                    # per panel), so the producer already reads this repeat
+                    # as decoration.
+                    new_data, changed = _retag_orphan_bdc_as_artifact(
+                        new_data, mcid
+                    )
+                    if changed:
+                        page_changed = True
+                        updated += 1
+                        actions.append(
+                            f"orphan MCID {mcid}: retagged decorative Figure to /Artifact"
+                        )
+                elif draw_names:
+                    new_data, changed = _inject_actualtext_in_data(
+                        new_data,
+                        mcid=mcid,
+                        actual_text=_UNTAGGED_IMAGE_FALLBACK_ACTUALTEXT,
+                        preferred_tag=b"/Figure",
+                    )
+                    if changed:
+                        page_changed = True
+                        updated += 1
+                        actions.append(
+                            f"orphan MCID {mcid}: injected /ActualText "
+                            f"{_UNTAGGED_IMAGE_FALLBACK_ACTUALTEXT!r} on Figure"
+                        )
                 continue
             # Use the block's full extent (to its own EMC, past inner ETs):
             # /ActualText covers all of it, so every decision below must see
@@ -932,15 +1064,18 @@ def _repair_orphan_marked_content_actualtext(
 def count_orphan_marked_missing_actualtext(pdf_bytes: bytes) -> int:
     missing = 0
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
-        struct_mcids = _collect_struct_mcids(pdf)
+        owned_page_mcids, wildcard_mcids = _collect_struct_page_mcids(pdf)
         for page in pdf.pages:
             data = _page_contents_data(page)
             if data is None:
                 continue
+            page_owned = {
+                mcid for pg, mcid in owned_page_mcids if pg == page.obj.objgen
+            } | wildcard_mcids
             for mcid, tag in _iter_bdc_mcids_on_page(data):
-                if mcid in struct_mcids:
+                if mcid in page_owned:
                     continue
-                if tag not in ("Table", "Span"):
+                if tag not in ("Table", "Span", "Figure"):
                     continue
                 block = _get_mcid_block(data, mcid)
                 if block is None:

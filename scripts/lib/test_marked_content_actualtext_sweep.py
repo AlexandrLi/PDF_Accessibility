@@ -1206,6 +1206,127 @@ class OrphanMarkedContentTests(unittest.TestCase):
             self.assertEqual(block[0], "Span")
 
 
+class OrphanFigureTests(unittest.TestCase):
+    """Adobe Auto-Tag leaves /Figure marked content with a null ParentTree
+    slot and no owning element; the sweep must artifact repeats the page
+    already draws as decoration and surface unique graphics."""
+
+    @staticmethod
+    def _build(stream: bytes, *, owned_mcids_page2: list[int] | None = None) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(stream)
+        form = pdf.make_stream(b"/Im0 Do")
+        form["/Type"] = pikepdf.Name("/XObject")
+        form["/Subtype"] = pikepdf.Name("/Form")
+        page["/Resources"] = pikepdf.Dictionary(
+            {"/XObject": pikepdf.Dictionary({"/Fm0": form})}
+        )
+        kids = [
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/P"),
+                    "/K": 1,
+                    "/Pg": page.obj,
+                }
+            )
+        ]
+        if owned_mcids_page2:
+            page2 = pdf.add_blank_page()
+            page2["/Contents"] = pdf.make_stream(
+                b" ".join(
+                    b"/P<</MCID %d >> BDC (x) Tj EMC" % m
+                    for m in owned_mcids_page2
+                )
+            )
+            kids.append(
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/StructElem"),
+                        "/S": pikepdf.Name("/P"),
+                        "/K": pikepdf.Array(owned_mcids_page2),
+                        "/Pg": page2.obj,
+                    }
+                )
+            )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array(kids),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+        return buf.getvalue()
+
+    def test_orphan_figure_repeat_of_artifact_draw_becomes_artifact(self) -> None:
+        pdf_bytes = self._build(
+            b"q /Figure<</MCID 5 >> BDC q /Fm0 Do Q EMC "
+            b"/Artifact BMC q /Fm0 Do Q EMC "
+            b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+        )
+        repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertIn(
+            "orphan MCID 5: retagged decorative Figure to /Artifact",
+            result.actions,
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertIsNone(_get_mcid_block(data, 5))
+
+    def test_orphan_figure_with_unique_graphic_gets_actualtext(self) -> None:
+        pdf_bytes = self._build(
+            b"q /Figure<</MCID 5 >> BDC q /Fm0 Do Q EMC "
+            b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+        )
+        repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertIn(
+            "orphan MCID 5: injected /ActualText 'Figure' on Figure",
+            result.actions,
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            if isinstance(data, str):
+                data = data.encode("latin-1")
+            block = re.search(
+                rb"/Figure\s*<<[^>]*?/MCID\s+5(?!\d)[^>]*?>>", data
+            )
+            self.assertIsNotNone(block)
+            self.assertIn(b"/ActualText (Figure)", block.group(0))
+
+    def test_orphan_figure_with_text_is_left_alone(self) -> None:
+        pdf_bytes = self._build(
+            b"q /Figure<</MCID 5 >> BDC q /Fm0 Do Q BT (label) Tj ET EMC "
+            b"/Artifact BMC q /Fm0 Do Q EMC "
+            b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+        )
+        repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertEqual(
+            [a for a in result.actions if "orphan MCID 5" in a], []
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            block = _get_mcid_block(data, 5)
+            self.assertIsNotNone(block)
+            self.assertEqual(block[0], "Figure")
+
+    def test_orphan_detection_is_page_scoped(self) -> None:
+        # Another page's struct tree owns MCID 5; page 1's Figure MCID 5 is
+        # still an orphan and must be repaired.
+        pdf_bytes = self._build(
+            b"q /Figure<</MCID 5 >> BDC q /Fm0 Do Q EMC "
+            b"/Artifact BMC q /Fm0 Do Q EMC "
+            b"q /P<</MCID 1 >> BDC (body) Tj EMC",
+            owned_mcids_page2=[5],
+        )
+        repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertIn(
+            "orphan MCID 5: retagged decorative Figure to /Artifact",
+            result.actions,
+        )
+
+
 class OrphanSpanFullExtentTests(unittest.TestCase):
     """Block-level /ActualText must speak every glyph the block shows."""
 

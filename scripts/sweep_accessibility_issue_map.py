@@ -74,11 +74,40 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reuse verified outputs when source and pipeline fingerprints match",
     )
+    parser.add_argument(
+        "--title-alias",
+        action="append",
+        default=[],
+        metavar="WORKBOOK TITLE==COURSE TITLE",
+        help=(
+            "Map a workbook topic title to the course-metadata title when the "
+            "workbook drifted (repeatable); matched case-insensitively"
+        ),
+    )
     return parser.parse_args()
 
 
+# Workbooks and course metadata disagree on typographic vs ASCII punctuation
+# (e.g. DeMoivre's vs DeMoivre's); NFKC does not fold these.
+_TITLE_PUNCTUATION_FOLD = str.maketrans(
+    {
+        "‘": "'",
+        "’": "'",
+        "ʼ": "'",
+        "“": '"',
+        "”": '"',
+        "–": "-",
+        "—": "-",
+    }
+)
+
+
 def normalized(value: object) -> str:
-    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = (
+        unicodedata.normalize("NFKC", str(value or ""))
+        .translate(_TITLE_PUNCTUATION_FOLD)
+        .casefold()
+    )
     return " ".join(text.split())
 
 
@@ -173,10 +202,23 @@ def load_issue_rows(
     )
 
 
+def parse_title_aliases(raw_aliases: list[str]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for raw in raw_aliases:
+        workbook_title, separator, course_title = raw.partition("==")
+        if not separator or not workbook_title.strip() or not course_title.strip():
+            raise ValueError(
+                f"--title-alias must look like 'WORKBOOK TITLE==COURSE TITLE': {raw!r}"
+            )
+        aliases[normalized(workbook_title)] = normalized(course_title)
+    return aliases
+
+
 def resolve_topics(
     issue_rows: list[dict[str, Any]],
     course: dict[str, Any],
     course_id: str,
+    title_aliases: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     details = course.get("details") or {}
     toc_id = details.get("defaultToc")
@@ -207,7 +249,10 @@ def resolve_topics(
     unmatched: list[dict[str, Any]] = []
     for row in issue_rows:
         title = row.get("topic_title") or ""
-        title_matches = topics_by_title.get(normalized(title), [])
+        title_lookup = normalized(title)
+        if title_aliases:
+            title_lookup = title_aliases.get(title_lookup, title_lookup)
+        title_matches = topics_by_title.get(title_lookup, [])
         candidates = [
             topic_id for topic_id in title_matches if topic_id in toc_topic_chapters
         ]
@@ -633,7 +678,9 @@ def main() -> int:
         course_title,
         args.map_sheet,
     )
-    matched, unmatched, toc_id = resolve_topics(issue_rows, course, args.course_id)
+    matched, unmatched, toc_id = resolve_topics(
+        issue_rows, course, args.course_id, parse_title_aliases(args.title_alias)
+    )
     pipeline = pipeline_fingerprint()
     prior_manifest = _read_json(manifest_path) if args.resume else None
     prior_report = _read_json(report_path) if args.resume else None

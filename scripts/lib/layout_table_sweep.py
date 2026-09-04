@@ -1643,6 +1643,25 @@ def repair_layout_tables(pdf_bytes: bytes) -> tuple[bytes, LayoutTableRepairResu
             differing_widths = (
                 logical_widths is not None and len(set(logical_widths)) > 1
             )
+            if len(rows) < 2 and rows and cells and _is_adobe_autotagged_table(table):
+                # A single-row table cannot express header relationships, so
+                # Acrobat's Headers rule always fails it; Auto-Tag guessed
+                # table structure around side-by-side layout panels — read it
+                # as layout instead.
+                rows, cells = _table_rows_and_cells(table)
+                _unwrap_grid_table(table, rows, cells)
+                unwrapped_grid += 1
+                changed = True
+                actions.append(
+                    f"table{index}: unwrapped single-row Adobe auto-tagged table to /Sect"
+                )
+                note = (
+                    f"table{index}: fewer than two rows; "
+                    "retained as ambiguous /Table"
+                )
+                if note in unresolved:
+                    unresolved.remove(note)
+                continue
             if len(rows) < 2 or not rows or not cells:
                 ambiguous_tables += 1
                 if not unresolved or not unresolved[-1].startswith(f"table{index}:"):

@@ -124,6 +124,7 @@ class IssueMapWorkflowTests(unittest.TestCase):
                 review_queue=str(review),
                 workers=2,
                 resume=False,
+                title_alias=[],
             )
 
             with (
