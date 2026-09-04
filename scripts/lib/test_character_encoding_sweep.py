@@ -51,11 +51,11 @@ class BlankSquareGlyphDetectionTests(unittest.TestCase):
 
 
 class BulletBlockSpansTextObjectsTests(unittest.TestCase):
-    def _build_bullet_sentence_pdf(self) -> bytes:
+    def _build_bullet_sentence_pdf(self, symbol_codepoint: str = "25CF") -> bytes:
         # Genetics-shaped page: one /P MCID block whose BDC..EMC holds the
         # bullet glyph in its own BT/ET followed by the sentence in another.
-        cmap = """1 beginbfchar
-<0195> <25CF>
+        cmap = f"""1 beginbfchar
+<0195> <{symbol_codepoint}>
 endbfchar"""
         stream = (
             b"/P<< /MCID 1 >> BDC BT\r\n/F3 12 Tf\r\n<0195>Tj\r\nET\r\nBT\r\n"
@@ -140,6 +140,19 @@ endbfchar"""
         with pikepdf.open(io.BytesIO(repaired_again)) as pdf:
             data = pdf.pages[0].Contents.read_bytes()
         self.assertEqual(data.count(b"/ActualText (bullet)"), 1)
+
+    def test_symbol_wrap_with_hex_actualtext_is_idempotent(self) -> None:
+        # Regression: spoken text above U+00FF (here U+03B1, alpha) is
+        # written as a UTF-16BE hex string, which the already-wrapped guard
+        # must also recognize or every pass nests another /Span wrap.
+        repaired, _ = repair_character_encoding(
+            self._build_bullet_sentence_pdf(symbol_codepoint="03B1")
+        )
+        repaired_again, _ = repair_character_encoding(repaired)
+        with pikepdf.open(io.BytesIO(repaired_again)) as pdf:
+            data = pdf.pages[0].Contents.read_bytes()
+        self.assertEqual(data.count(b"/ActualText <FEFF03B1>"), 1)
+        self.assertEqual(data.count(b"/Span << /ActualText <FEFF03B1> >> BDC"), 1)
 
 
 class UndecodableGlyphProtectionTests(unittest.TestCase):

@@ -353,8 +353,14 @@ _FONT_OR_SHOW_PATTERN = re.compile(
     rb"|\[(?:\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|[^\[\]])*\])\s*(?:Tj|TJ)\b)",
     re.DOTALL,
 )
+# The ActualText value may be a literal string or, for spoken text with
+# codepoints above U+00FF, a UTF-16BE hex string; `[^>]*` cannot cross the
+# `>` closing a hex string, so both forms must be matched explicitly or the
+# wrap is re-applied on every pass.
 _SPAN_WRAP_PREFIX = re.compile(
-    rb"/Span\s*<<\s*/ActualText[^>]*>>\s*BDC\s*$", re.DOTALL
+    rb"/Span\s*<<\s*/ActualText\s*(?:\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>)"
+    rb"\s*>>\s*BDC\s*$",
+    re.DOTALL,
 )
 
 
