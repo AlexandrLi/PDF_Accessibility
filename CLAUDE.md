@@ -78,10 +78,11 @@ an artifact.
 - Update the tracker as part of the work it records, before reporting the
   work done. A sweep, a push to dev, a chapter re-wrap, or a re-validation of
   a sheet is done when the tracker says so.
-- Tick a row (`- [ ]` to `- [x]`) when the workbook shows PASS for it after
-  re-validation against the dev bucket, and append `(done YYYY-MM-DD, note)`
-  with an absolute date and the sweep report or commit that fixed it. Pushed
-  but not re-validated stays unticked.
+- Ticking is the user's call. After a push the user checks the course on dev
+  and says which rows (or which course) pass. Then tick those rows (`- [ ]` to
+  `- [x]`), append `(done YYYY-MM-DD, note)` with an absolute date and the
+  sweep report or commit that fixed it, and re-render the HTML so the marks
+  carry over. Pushed but not yet approved by the user stays unticked.
 - If a row is partly fixed, edit the rule list on the line instead of ticking.
 - Record course-level events (sweep date, push date, re-wrap date, sheet
   re-validated on) in the sentence under the course heading.
