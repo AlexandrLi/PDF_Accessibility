@@ -16,6 +16,7 @@ from sweep_accessibility_issue_map import (  # noqa: E402
     build_residual_diagnostics,
     classify_residual_status,
     normalized_chapter_title,
+    resolve_all_topics,
     resolve_topics,
 )
 
@@ -67,6 +68,25 @@ def _sweep_result(
 
 
 class AccessibilityIssueMapSweepTests(unittest.TestCase):
+    def test_all_topics_covers_every_toc_topic_with_a_pdf(self) -> None:
+        course = _course_with_chapter(
+            "Quadratic Equations",
+            extra_chapters=[
+                {"id": "ch11", "title": "Functions", "topics": [{"id": "topic-2"}, {"id": "topic-3"}]},
+                {"id": "ch12", "title": "Review", "topics": [{"id": "topic-1"}]},
+            ],
+        )
+        course["topics"]["topic-2"] = {"title": "Domain and Range", "pdfAvailable": True}
+        course["topics"]["topic-3"] = {"title": "No Preview Yet", "pdfAvailable": False}
+        matched, skipped, toc_id = resolve_all_topics(course, "course")
+        self.assertEqual(toc_id, "toc")
+        self.assertEqual([item["topicId"] for item in matched], ["topic-1", "topic-2"])
+        self.assertEqual(matched[0]["chapterId"], "ch10")
+        self.assertEqual(matched[0]["pdfKey"], "courses/course/topic_pdfs/topic-1.pdf")
+        self.assertEqual(matched[0]["matchStrategy"], "allTopics")
+        self.assertEqual(matched[0]["sourceIssueRow"]["failed_categories"], "")
+        self.assertEqual([item["topicId"] for item in skipped], ["topic-3"])
+
     def test_chapter_title_matching_treats_ampersand_as_and(self) -> None:
         self.assertEqual(
             normalized_chapter_title("1. Equations and Inequalities"),
@@ -215,6 +235,27 @@ class AccessibilityIssueMapSweepTests(unittest.TestCase):
             classify_residual_status(diagnostics),
             ("unverifiable", "swept-unverifiable"),
         )
+
+    def test_all_categories_checks_tables_without_a_workbook_claim(self) -> None:
+        diagnostics = build_residual_diagnostics(
+            _sweep_result(
+                audit={
+                    "table_count": 1,
+                    "tables_without_th": 1,
+                }
+            ),
+            "",
+            all_categories=True,
+        )
+        self.assertEqual(diagnostics["categories"]["Tables Headers"]["status"], "residual")
+        self.assertEqual(diagnostics["categories"]["Tables Regularity"]["status"], "resolved")
+
+    def test_all_categories_skips_tables_when_pdf_has_none(self) -> None:
+        diagnostics = build_residual_diagnostics(
+            _sweep_result(audit={"table_count": 0}), "", all_categories=True
+        )
+        self.assertNotIn("Tables Headers", diagnostics["categories"])
+        self.assertEqual(classify_residual_status(diagnostics), ("resolved", "swept"))
 
     def test_regularity_residual_is_explicit(self) -> None:
         diagnostics = build_residual_diagnostics(

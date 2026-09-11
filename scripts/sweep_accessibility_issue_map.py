@@ -51,6 +51,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Exact issue-map sheet name when it differs from course metadata title",
     )
+    parser.add_argument(
+        "--all-topics",
+        action="store_true",
+        help=(
+            "Sweep every topic in the course default TOC with pdfAvailable=true "
+            "instead of only the topics listed in the issue map; the map file "
+            "is not read"
+        ),
+    )
     parser.add_argument("--env", choices=("dev", "prod"), default="dev")
     parser.add_argument(
         "--output-root",
@@ -338,6 +347,73 @@ def resolve_topics(
     return matched, unmatched, toc_id
 
 
+def resolve_all_topics(
+    course: dict[str, Any],
+    course_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Build a matched-topic list for every default-TOC topic with a preview PDF.
+
+    Mirrors the entry shape of resolve_topics so the rest of the sweep, the
+    manifest and the publish preflight see no difference. The synthetic
+    sourceIssueRow carries no failed categories, so residual diagnostics fall
+    back to the post-sweep audit alone. Topics without a preview PDF are
+    returned in the second list as skipped, not unmatched: they are not
+    failures of the sweep.
+    """
+    details = course.get("details") or {}
+    toc_id = details.get("defaultToc")
+    toc = (course.get("tocs") or {}).get(toc_id) if toc_id else None
+    if not toc_id or not toc:
+        raise ValueError("Course metadata does not provide a valid default TOC")
+
+    topics = course.get("topics") or {}
+    matched: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for chapter in toc.get("chapters") or []:
+        for reference in chapter.get("topics") or []:
+            topic_id = reference.get("id")
+            if not topic_id or topic_id in seen:
+                continue
+            seen.add(topic_id)
+            topic = topics.get(topic_id) or {}
+            row = {
+                "sheet": None,
+                "row": "",
+                "topic_title": topic.get("title") or "",
+                "chapter_id": chapter.get("id") or "",
+                "chapter_title": chapter.get("title") or "",
+                "chapter_row": "",
+                "failed_columns": "",
+                "failed_categories": "",
+                "failure_count": "",
+                "topic_id": topic_id,
+                "pdf_key": preview_key(course_id, topic_id),
+            }
+            if not topic.get("pdfAvailable"):
+                skipped.append(
+                    {
+                        "topicId": topic_id,
+                        "topicTitle": topic.get("title") or topic_id,
+                        "chapterId": chapter.get("id"),
+                        "reason": "pdfAvailable=false",
+                    }
+                )
+                continue
+            matched.append(
+                {
+                    "sourceIssueRow": row,
+                    "topicId": topic_id,
+                    "topicTitle": topic.get("title") or topic_id,
+                    "chapterId": chapter.get("id"),
+                    "chapterTitle": chapter.get("title"),
+                    "matchStrategy": "allTopics",
+                    "pdfKey": preview_key(course_id, topic_id),
+                }
+            )
+    return matched, skipped, toc_id
+
+
 def _category_keys(value: object) -> set[str]:
     if isinstance(value, (list, tuple, set)):
         values = value
@@ -424,8 +500,16 @@ def _audit_category_diagnostics(
 def build_residual_diagnostics(
     sweep_result: dict[str, Any],
     failed_categories: object,
+    all_categories: bool = False,
 ) -> dict[str, Any]:
-    """Return nonblocking, per-PDF residual telemetry for issue-map sweeps."""
+    """Return nonblocking, per-PDF residual telemetry for issue-map sweeps.
+
+    With an issue map, the table checks run only for the categories the
+    workbook flagged, and a PDF with no table is unverifiable because the
+    workbook claimed one failed. With all_categories (the --all-topics sweep)
+    there is no workbook claim, so the table checks run on every PDF that has
+    a table and are simply not applicable to one that has none.
+    """
     repairs = sweep_result.get("repairs") or {}
     layout = repairs.get("layoutTable")
     layout = layout if isinstance(layout, dict) else {}
@@ -433,6 +517,11 @@ def build_residual_diagnostics(
     audit = audit if isinstance(audit, dict) else None
     categories = _category_keys(failed_categories)
     tracked_categories: dict[str, dict[str, Any]] = {}
+    if all_categories:
+        if not audit:
+            categories |= {"tablesheaders", "tablesregularity"}
+        elif audit.get("table_count"):
+            categories |= {"tablesheaders", "tablesregularity"}
     if "tablesheaders" in categories:
         tracked_categories["Tables Headers"] = _audit_category_diagnostics(
             audit, "tablesheaders"
@@ -673,14 +762,22 @@ def main() -> int:
     bucket = channels_bucket(args.env)
     course = load_course_json(s3, bucket, args.course_id)
     course_title = (course.get("details") or {}).get("title") or args.course_id
-    issue_rows, source_workbook, map_topic_rows = load_issue_rows(
-        map_path,
-        course_title,
-        args.map_sheet,
-    )
-    matched, unmatched, toc_id = resolve_topics(
-        issue_rows, course, args.course_id, parse_title_aliases(args.title_alias)
-    )
+    skipped_no_pdf: list[dict[str, Any]] = []
+    if args.all_topics:
+        matched, skipped_no_pdf, toc_id = resolve_all_topics(course, args.course_id)
+        unmatched = []
+        issue_rows = [item["sourceIssueRow"] for item in matched]
+        source_workbook = None
+        map_topic_rows = None
+    else:
+        issue_rows, source_workbook, map_topic_rows = load_issue_rows(
+            map_path,
+            course_title,
+            args.map_sheet,
+        )
+        matched, unmatched, toc_id = resolve_topics(
+            issue_rows, course, args.course_id, parse_title_aliases(args.title_alias)
+        )
     pipeline = pipeline_fingerprint()
     prior_manifest = _read_json(manifest_path) if args.resume else None
     prior_report = _read_json(report_path) if args.resume else None
@@ -829,6 +926,7 @@ def main() -> int:
             entry["residualDiagnostics"] = build_residual_diagnostics(
                 sweep_result,
                 item["sourceIssueRow"].get("failed_categories"),
+                all_categories=args.all_topics,
             )
             result_kind, entry["status"] = classify_residual_status(
                 entry["residualDiagnostics"],
@@ -886,7 +984,9 @@ def main() -> int:
     compact_topics.sort(key=lambda item: str(item.get("topicId") or ""))
     report = {
         "runAt": run_at.isoformat(),
-        "sourceIssueMap": str(map_path.resolve()),
+        "sourceIssueMap": None if args.all_topics else str(map_path.resolve()),
+        "topicSelection": "allTopics" if args.all_topics else "issueMap",
+        "skippedNoPdf": skipped_no_pdf,
         "sourceWorkbook": source_workbook,
         "course": {
             "selection": course_title,

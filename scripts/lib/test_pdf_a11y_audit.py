@@ -151,6 +151,46 @@ class PdfA11yAuditTests(unittest.TestCase):
         self.assertTrue(audit.tables_with_inconsistent_row_widths)
         json.dumps(audit.to_dict())
 
+    def test_row_groups_are_valid_table_children(self) -> None:
+        original = _make_table_pdf(residual=False)
+        with pikepdf.open(io.BytesIO(original)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            rows = list(table["/K"])
+            head = pikepdf.Dictionary(
+                {"/S": pikepdf.Name("/THead"), "/K": pikepdf.Array(rows[:1])}
+            )
+            body = pikepdf.Dictionary(
+                {"/S": pikepdf.Name("/TBody"), "/K": pikepdf.Array(rows[1:])}
+            )
+            caption = pikepdf.Dictionary({"/S": pikepdf.Name("/Caption")})
+            table["/K"] = pikepdf.Array([caption, head, body])
+            output = io.BytesIO()
+            pdf.save(output)
+
+        audit = audit_pdf_bytes(output.getvalue())
+
+        self.assertEqual(audit.table_count, 1)
+        self.assertEqual(audit.invalid_row_child_roles, [])
+        self.assertEqual(audit.tables_with_inconsistent_row_widths, [])
+
+    def test_non_row_inside_row_group_is_flagged(self) -> None:
+        original = _make_table_pdf(residual=False)
+        with pikepdf.open(io.BytesIO(original)) as pdf:
+            table = pdf.Root["/StructTreeRoot"]["/K"][0]
+            rows = list(table["/K"])
+            stray = pikepdf.Dictionary({"/S": pikepdf.Name("/P")})
+            body = pikepdf.Dictionary(
+                {"/S": pikepdf.Name("/TBody"), "/K": pikepdf.Array(rows + [stray])}
+            )
+            table["/K"] = pikepdf.Array([body])
+            output = io.BytesIO()
+            pdf.save(output)
+
+        audit = audit_pdf_bytes(output.getvalue())
+
+        self.assertEqual(len(audit.invalid_row_child_roles), 1)
+        self.assertIn("TBody child 3: /P (expected /TR)", audit.invalid_row_child_roles[0])
+
     def test_table_residuals_are_nonblocking(self) -> None:
         original = _make_table_pdf(residual=False)
         with pikepdf.open(io.BytesIO(original)) as pdf:

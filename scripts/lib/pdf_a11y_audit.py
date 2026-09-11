@@ -278,20 +278,44 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
                     for node in descendants
                     if node.get("/S") == "/TR"
                 ]
+                # ISO 32000 allows a /Table to hold /TR directly or to group
+                # rows under /THead, /TBody and /TFoot, plus one /Caption.
+                # Adobe accepts both shapes; only the rows inside a row group
+                # must be /TR.
                 direct_table_kids = direct_kids(obj)
                 for child_index, child in enumerate(direct_table_kids, start=1):
-                    if not isinstance(child, pikepdf.Dictionary) or child.get(
-                        "/S"
-                    ) != "/TR":
-                        role = (
-                            str(child.get("/S"))
-                            if isinstance(child, pikepdf.Dictionary)
-                            else str(child)
-                        )
-                        invalid_row_child_roles.append(
-                            f"{table_label} direct child {child_index}: "
-                            f"{role} (expected /TR)"
-                        )
+                    child_role = (
+                        child.get("/S") if isinstance(child, pikepdf.Dictionary) else None
+                    )
+                    if child_role == "/TR" or child_role == "/Caption":
+                        continue
+                    if child_role in ("/THead", "/TBody", "/TFoot"):
+                        for group_index, group_child in enumerate(
+                            direct_kids(child), start=1
+                        ):
+                            if not isinstance(
+                                group_child, pikepdf.Dictionary
+                            ) or group_child.get("/S") != "/TR":
+                                role = (
+                                    str(group_child.get("/S"))
+                                    if isinstance(group_child, pikepdf.Dictionary)
+                                    else str(group_child)
+                                )
+                                invalid_row_child_roles.append(
+                                    f"{table_label} direct child {child_index} "
+                                    f"{str(child_role).lstrip('/')} child {group_index}: "
+                                    f"{role} (expected /TR)"
+                                )
+                        continue
+                    role = (
+                        str(child_role)
+                        if isinstance(child, pikepdf.Dictionary)
+                        else str(child)
+                    )
+                    invalid_row_child_roles.append(
+                        f"{table_label} direct child {child_index}: "
+                        f"{role} (expected /TR, /THead, /TBody, /TFoot or /Caption)"
+                    )
 
                 for row_index, row in enumerate(rows, start=1):
                     direct_children = direct_kids(row)

@@ -125,6 +125,7 @@ class IssueMapWorkflowTests(unittest.TestCase):
                 workers=2,
                 resume=False,
                 title_alias=[],
+                all_topics=False,
             )
 
             with (
