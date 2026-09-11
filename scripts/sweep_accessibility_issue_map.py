@@ -141,6 +141,31 @@ def normalized_chapter_title(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", text)
 
 
+_CHAPTER_FOLDER_SLUG_MAX = 80
+
+
+def chapter_folder_name(entry: dict) -> str:
+    """Build the `<chapterId>-<slug>` folder name a matched entry's outputs nest under."""
+    chapter_id = str(entry.get("chapterId") or "").strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", str(entry.get("chapterTitle") or "").casefold())
+    slug = slug.strip("-")[:_CHAPTER_FOLDER_SLUG_MAX].strip("-")
+    if not chapter_id:
+        return f"no-chapter-{slug}" if slug else "no-chapter"
+    return f"{chapter_id}-{slug}" if slug else chapter_id
+
+
+def topic_output_paths(
+    original_dir: Path, swept_dir: Path, entry: dict
+) -> tuple[Path, Path]:
+    """Return the chapter-nested (original, re-swept) PDF paths for a matched entry."""
+    folder = chapter_folder_name(entry)
+    topic_id = entry["topicId"]
+    return (
+        original_dir / folder / f"{topic_id}.pdf",
+        swept_dir / folder / f"{topic_id}.pdf",
+    )
+
+
 def load_issue_rows(
     path: Path,
     course_title: str,
@@ -828,8 +853,7 @@ def main() -> int:
     pending_downloads: list[dict[str, Any]] = []
     for item in matched:
         topic_id = item["topicId"]
-        original_path = original_dir / f"{topic_id}.pdf"
-        swept_path = swept_dir / f"{topic_id}.pdf"
+        original_path, swept_path = topic_output_paths(original_dir, swept_dir, item)
         if not args.resume or prior_manifest is None:
             pending_downloads.append(item)
             continue
@@ -894,11 +918,14 @@ def main() -> int:
                 source_etags[resolved_item["topicId"]] = etag
             except Exception as error:
                 topic_id = item["topicId"]
+                failed_original_path, failed_swept_path = topic_output_paths(
+                    original_dir, swept_dir, item
+                )
                 results.append(
                     {
                         **item,
-                        "originalPdf": str(original_dir / f"{topic_id}.pdf"),
-                        "reSweptPdf": str(swept_dir / f"{topic_id}.pdf"),
+                        "originalPdf": str(failed_original_path),
+                        "reSweptPdf": str(failed_swept_path),
                         "status": "failed",
                         "errors": [f"download failed: {error}"],
                     }
@@ -912,8 +939,7 @@ def main() -> int:
         if topic_id not in downloads:
             continue
         resolved_item, etag, pdf_bytes = downloads[topic_id]
-        original_path = original_dir / f"{topic_id}.pdf"
-        swept_path = swept_dir / f"{topic_id}.pdf"
+        original_path, swept_path = topic_output_paths(original_dir, swept_dir, item)
         entry = {
             **resolved_item,
             "originalPdf": str(original_path),
@@ -922,12 +948,14 @@ def main() -> int:
             "sourceETag": etag,
         }
         try:
+            original_path.parent.mkdir(parents=True, exist_ok=True)
             original_path.write_bytes(pdf_bytes)
             counts["downloaded"] += 1
             prepared = preparation_results[topic_id]
             if isinstance(prepared, Exception):
                 raise prepared
             swept_bytes, sweep_result = prepared
+            swept_path.parent.mkdir(parents=True, exist_ok=True)
             swept_path.write_bytes(swept_bytes)
             entry.update(sweep_result)
             counts["swept"] += 1

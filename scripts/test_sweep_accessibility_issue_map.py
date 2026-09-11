@@ -14,10 +14,12 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from sweep_accessibility_issue_map import (  # noqa: E402
     build_residual_diagnostics,
+    chapter_folder_name,
     classify_residual_status,
     normalized_chapter_title,
     resolve_all_topics,
     resolve_topics,
+    topic_output_paths,
 )
 
 
@@ -86,6 +88,32 @@ class AccessibilityIssueMapSweepTests(unittest.TestCase):
         self.assertEqual(matched[0]["matchStrategy"], "allTopics")
         self.assertEqual(matched[0]["sourceIssueRow"]["failed_categories"], "")
         self.assertEqual([item["topicId"] for item in skipped], ["topic-3"])
+
+    def test_chapter_folder_name_slugs_id_and_title(self) -> None:
+        self.assertEqual(
+            chapter_folder_name({"chapterId": "ch10", "chapterTitle": "Quadratic Equations & Applications!"}),
+            "ch10-quadratic-equations-applications",
+        )
+        self.assertEqual(
+            chapter_folder_name({"chapterId": "ch10", "chapterTitle": ""}),
+            "ch10",
+        )
+        self.assertEqual(
+            chapter_folder_name({"chapterId": "", "chapterTitle": "Functions"}),
+            "no-chapter-functions",
+        )
+        self.assertEqual(
+            chapter_folder_name({"chapterId": "", "chapterTitle": ""}),
+            "no-chapter",
+        )
+
+    def test_topic_output_paths_nest_under_the_same_chapter_folder(self) -> None:
+        original_dir = Path("/tmp/originals")
+        swept_dir = Path("/tmp/reswept")
+        entry = {"topicId": "topic-1", "chapterId": "ch10", "chapterTitle": "Functions"}
+        original_path, swept_path = topic_output_paths(original_dir, swept_dir, entry)
+        self.assertEqual(original_path, original_dir / "ch10-functions" / "topic-1.pdf")
+        self.assertEqual(swept_path, swept_dir / "ch10-functions" / "topic-1.pdf")
 
     def test_chapter_title_matching_treats_ampersand_as_and(self) -> None:
         self.assertEqual(
