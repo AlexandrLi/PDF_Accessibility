@@ -257,6 +257,24 @@ class AccessibilityIssueMapSweepTests(unittest.TestCase):
         self.assertNotIn("Tables Headers", diagnostics["categories"])
         self.assertEqual(classify_residual_status(diagnostics), ("resolved", "swept"))
 
+    def test_orphan_marked_content_is_an_other_elements_residual(self) -> None:
+        # ee112303 was reported resolved while 14 orphan Spans still lacked
+        # /ActualText; the audit count now keeps such a topic out of "resolved".
+        diagnostics = build_residual_diagnostics(
+            _sweep_result(
+                audit={"table_count": 0, "orphan_marked_mcids_missing_actualtext": 14}
+            ),
+            "",
+            all_categories=True,
+        )
+        category = diagnostics["categories"]["Other Elements Alternate Text"]
+        self.assertEqual(category["status"], "residual")
+        self.assertEqual(
+            category["evidence"],
+            ["14 orphan marked-content block(s) without /ActualText"],
+        )
+        self.assertEqual(classify_residual_status(diagnostics)[0], "residual")
+
     def test_regularity_residual_is_explicit(self) -> None:
         diagnostics = build_residual_diagnostics(
             _sweep_result(

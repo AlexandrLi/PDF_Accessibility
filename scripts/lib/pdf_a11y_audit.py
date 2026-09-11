@@ -10,6 +10,7 @@ import pikepdf
 
 from lib.figure_alt_quality import SuspiciousFigureAlt, classify_figure_alt, struct_class_names
 from lib.marked_content_actualtext_sweep import (
+    count_orphan_marked_missing_actualtext,
     list_untagged_image_mcids_missing_actualtext,
 )
 from lib.tagged_content_sweep import collect_tagged_content_diagnostics
@@ -43,6 +44,7 @@ class PdfA11yAudit:
     unresolved_mcids: list[str] = field(default_factory=list)
     parent_tree_keys: list[int] = field(default_factory=list)
     nonfigure_image_mcids_missing_alt: list[str] = field(default_factory=list)
+    orphan_marked_mcids_missing_actualtext: int = 0
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -423,5 +425,8 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         parent_tree_keys=tagged_content.parent_tree_keys,
         nonfigure_image_mcids_missing_alt=(
             list_untagged_image_mcids_missing_actualtext(pdf_bytes)
+        ),
+        orphan_marked_mcids_missing_actualtext=(
+            count_orphan_marked_missing_actualtext(pdf_bytes)
         ),
     )

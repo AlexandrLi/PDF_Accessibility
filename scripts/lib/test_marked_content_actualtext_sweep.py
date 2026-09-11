@@ -712,6 +712,50 @@ class ResolveStructPageTests(unittest.TestCase):
             self.assertEqual(resolved.objgen, opened.pages[1].objgen)
 
 
+    def test_resolve_honours_pg_when_parent_tree_names_the_element(self) -> None:
+        # ee112303 regression: a Span owns a /Lbl-tagged image block on page 1,
+        # and page 2 happens to tag the same MCID as /Span. Tag matching alone
+        # sent the element to page 2, so its image never got alternate text.
+        pdf = pikepdf.Pdf.new()
+        page0 = pdf.add_blank_page()
+        page1 = pdf.add_blank_page()
+        page0["/Contents"] = pdf.make_stream(
+            b"q /Lbl<</MCID 117 >> BDC /Im2 Do EMC Q"
+        )
+        page1["/Contents"] = pdf.make_stream(
+            b"q /Span<</MCID 117 >> BDC (later) Tj EMC Q"
+        )
+        span = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Span"),
+                    "/Pg": page0.obj,
+                    "/K": 117,
+                }
+            )
+        )
+        page0["/StructParents"] = 0
+        page1["/StructParents"] = 1
+        nums0 = pikepdf.Array([None] * 117 + [span])
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([span]),
+                "/ParentTree": pikepdf.Dictionary(
+                    {"/Nums": pikepdf.Array([0, nums0, 1, pikepdf.Array([])])}
+                ),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        with pikepdf.open(io.BytesIO(buf.getvalue())) as opened:
+            span_elem = opened.Root["/StructTreeRoot"]["/K"][0]
+            resolved = _resolve_struct_page(opened, span_elem)
+            self.assertEqual(resolved.objgen, opened.pages[0].objgen)
+
+
 class ListItemLabelActualTextTests(unittest.TestCase):
     def test_repair_list_item_label_actualtext(self) -> None:
         pdf = pikepdf.Pdf.new()
@@ -1158,6 +1202,63 @@ class OrphanMarkedContentTests(unittest.TestCase):
             # dead MCID is dropped so tagged-content audits stop flagging it.
             self.assertIsNone(_get_mcid_block(data, 12))
             self.assertIn(b"/Artifact BMC", data)
+
+    def test_orphan_span_hex_strings_decode_through_tounicode(self) -> None:
+        # ee112303: orphan Spans painted with a CID font (hex strings) were
+        # skipped because the decoder could not read them. The font's
+        # ToUnicode CMap can, tracked across Tf inside and before the block.
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        cmap = pdf.make_stream(
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+            b"3 beginbfchar <0029> <0046> <004C> <0069> <0051> <006E> endbfchar\n"
+            b"1 beginbfrange <0047> <0048> <0064> endbfrange"
+        )
+        font = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type0"),
+                "/BaseFont": pikepdf.Name("/Calibri"),
+                "/Encoding": pikepdf.Name("/Identity-H"),
+                "/ToUnicode": cmap,
+            }
+        )
+        page["/Resources"] = pikepdf.Dictionary(
+            {"/Font": pikepdf.Dictionary({"/C2_0": font, "/T1_0": pikepdf.Dictionary({})})}
+        )
+        page["/Contents"] = pdf.make_stream(
+            b"BT /C2_0 1 Tf q /T1_0 1 Tf Q "
+            b"/Span<</MCID 5 >> BDC [<0029>12.7 <004C>0.5 <00510047>]TJ EMC ET "
+            b"BT /Span<</MCID 6 >> BDC /T1_0 1 Tf <0029> Tj EMC ET "
+            b"BT /P<</MCID 1 >> BDC (body) Tj EMC ET"
+        )
+        body = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/P"),
+                "/K": 1,
+                "/Pg": page.obj,
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([body]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        repaired, result = repair_marked_content_actualtext(buf.getvalue())
+
+        self.assertIn(
+            "orphan MCID 5: injected /ActualText 'Find' on Span", result.actions
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertTrue(_mcid_bdc_has_actualtext(data, 5))
+            # A hex string under a font with no readable CMap stays unspoken.
+            self.assertFalse(_mcid_bdc_has_actualtext(data, 6))
 
     def test_orphan_decorative_span_becomes_artifact(self) -> None:
         pdf = pikepdf.Pdf.new()

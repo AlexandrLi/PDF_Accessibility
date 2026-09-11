@@ -313,12 +313,73 @@ def _prefer_page_from_struct_chain(
     return None
 
 
+def _parent_tree_owner(
+    pdf: pikepdf.Pdf,
+    page: pikepdf.Dictionary | pikepdf.Page,
+    mcid: int,
+) -> pikepdf.Dictionary | None:
+    """Return the struct element the page's ParentTree entry names for mcid."""
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if not isinstance(struct_root, pikepdf.Dictionary):
+        return None
+    tree = struct_root.get("/ParentTree")
+    page_obj = page.obj if isinstance(page, pikepdf.Page) else page
+    struct_parents = page_obj.get("/StructParents")
+    if not isinstance(tree, pikepdf.Dictionary) or not isinstance(struct_parents, int):
+        return None
+    key = int(struct_parents)
+
+    def lookup(node: pikepdf.Dictionary, depth: int = 0) -> object:
+        if depth > 32:
+            return None
+        nums = node.get("/Nums")
+        if isinstance(nums, pikepdf.Array):
+            for index in range(0, len(nums) - 1, 2):
+                if isinstance(nums[index], int) and int(nums[index]) == key:
+                    return nums[index + 1]
+        kids = node.get("/Kids")
+        if isinstance(kids, pikepdf.Array):
+            for kid in kids:
+                if not isinstance(kid, pikepdf.Dictionary):
+                    continue
+                limits = kid.get("/Limits")
+                if (
+                    isinstance(limits, pikepdf.Array)
+                    and len(limits) == 2
+                    and isinstance(limits[0], int)
+                    and isinstance(limits[1], int)
+                    and not (int(limits[0]) <= key <= int(limits[1]))
+                ):
+                    continue
+                found = lookup(kid, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    entry = lookup(tree)
+    if not isinstance(entry, pikepdf.Array) or mcid < 0 or mcid >= len(entry):
+        return None
+    owner = entry[mcid]
+    return owner if isinstance(owner, pikepdf.Dictionary) else None
+
+
 def _resolve_struct_page(
     pdf: pikepdf.Pdf,
     obj: pikepdf.Dictionary,
 ) -> pikepdf.Page | None:
     mcids = _struct_element_mcids(obj)
     expected_tag = _expected_bdc_tag(obj)
+    declared_page = obj.get("/Pg")
+    if isinstance(declared_page, pikepdf.Dictionary) and len(mcids) == 1 and obj.is_indirect:
+        # The page's ParentTree is the file's own statement of who owns the
+        # MCID; when it names this element, a content-stream BDC tag that
+        # disagrees with /S (a Lbl block owned by a Span) is not evidence
+        # the element lives on another page.
+        owner = _parent_tree_owner(pdf, declared_page, mcids[0])
+        if owner is not None and owner.is_indirect and owner.objgen == obj.objgen:
+            for candidate in pdf.pages:
+                if candidate.objgen == declared_page.objgen:
+                    return candidate
     if _uses_mcid_tag_matching(obj, mcids) and expected_tag is not None:
         tag_matches = _pages_with_matching_mcid_tag(
             pdf,
@@ -521,27 +582,204 @@ _ANY_SHOW_OP = re.compile(
 )
 
 
-def _decode_shown_text_in_order(body: bytes) -> str | None:
+_CODESPACE_SECTION = re.compile(
+    r"begincodespacerange\s*(.*?)endcodespacerange", re.DOTALL
+)
+_BF_SECTION = re.compile(
+    r"begin(?P<kind>bfchar|bfrange)\s*(?P<body>.*?)end(?P=kind)", re.DOTALL
+)
+_HEX_PAIR = re.compile(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>")
+_BFRANGE_ENTRY = re.compile(
+    r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])"
+)
+
+# Glyph codes → Unicode text for one font, plus the code byte widths to try.
+FontCodeMap = tuple[dict[bytes, str], tuple[int, ...]]
+
+
+def _tounicode_text(dst: str) -> str | None:
+    if len(dst) % 4:
+        return None
+    text = bytes.fromhex(dst).decode("utf-16-be", errors="replace")
+    if any(
+        char == "\ufffd" or (ord(char) < 0x20 and not char.isspace())
+        for char in text
+    ):
+        return None
+    return text
+
+
+def _font_code_map(font: object) -> FontCodeMap | None:
+    """Build a glyph-code → text map from a font's /ToUnicode CMap.
+
+    Returns None for a font without a readable CMap, so hex strings shown
+    with it stay undecodable (and the block keeps its glyphs unsilenced).
+    """
+    if not isinstance(font, pikepdf.Dictionary):
+        return None
+    cmap = font.get("/ToUnicode")
+    if not isinstance(cmap, pikepdf.Stream):
+        return None
+    try:
+        text = cmap.read_bytes().decode("latin1", errors="replace")
+    except pikepdf.PdfError:
+        return None
+    mapping: dict[bytes, str] = {}
+    for section in _BF_SECTION.finditer(text):
+        body = section.group("body")
+        if section.group("kind") == "bfchar":
+            for src, dst in _HEX_PAIR.findall(body):
+                if len(src) % 2:
+                    continue
+                spoken = _tounicode_text(dst)
+                if spoken is not None:
+                    mapping[bytes.fromhex(src)] = spoken
+            continue
+        for lo, hi, scalar, array_body in _BFRANGE_ENTRY.findall(body):
+            if len(lo) % 2 or len(lo) != len(hi):
+                continue
+            first, last = int(lo, 16), int(hi, 16)
+            if last < first or last - first > 0xFFFF:
+                continue
+            width = len(lo) // 2
+            if array_body:
+                dsts = re.findall(r"<([0-9A-Fa-f]+)>", array_body)
+                for offset, dst in enumerate(dsts[: last - first + 1]):
+                    spoken = _tounicode_text(dst)
+                    if spoken is not None:
+                        mapping[(first + offset).to_bytes(width, "big")] = spoken
+                continue
+            base = int(scalar, 16)
+            for offset in range(last - first + 1):
+                spoken = _tounicode_text(format(base + offset, f"0{len(scalar)}X"))
+                if spoken is not None:
+                    mapping[(first + offset).to_bytes(width, "big")] = spoken
+    if not mapping:
+        return None
+    encoding = font.get("/Encoding")
+    if font.get("/Subtype") == "/Type0" and str(encoding).startswith("/Identity"):
+        widths: tuple[int, ...] = (2,)
+    else:
+        widths = tuple(sorted({len(code) for code in mapping}))
+    return mapping, widths
+
+
+def _page_font_code_maps(
+    page: pikepdf.Page | pikepdf.Dictionary,
+) -> dict[str, FontCodeMap]:
+    """Map each /Font resource name on the page to its ToUnicode code map."""
+    node: object = page.obj if isinstance(page, pikepdf.Page) else page
+    fonts: dict[str, FontCodeMap] = {}
+    seen = 0
+    while isinstance(node, pikepdf.Dictionary) and seen < 64:
+        resources = node.get("/Resources")
+        font_dict = (
+            resources.get("/Font")
+            if isinstance(resources, pikepdf.Dictionary)
+            else None
+        )
+        if isinstance(font_dict, pikepdf.Dictionary):
+            for name, font in font_dict.items():
+                code_map = _font_code_map(font)
+                if code_map is not None:
+                    fonts.setdefault(str(name).lstrip("/"), code_map)
+            break
+        node = node.get("/Parent")
+        seen += 1
+    return fonts
+
+
+def _decode_hex_string_with_font(hex_body: str, code_map: FontCodeMap) -> str | None:
+    if len(hex_body) % 2:
+        hex_body += "0"
+    data = bytes.fromhex(hex_body)
+    mapping, widths = code_map
+    parts: list[str] = []
+    index = 0
+    while index < len(data):
+        for width in widths:
+            code = data[index : index + width]
+            if len(code) == width and code in mapping:
+                parts.append(mapping[code])
+                index += width
+                break
+        else:
+            return None
+    return "".join(parts)
+
+
+# Content-stream tokens that change which font a later show op paints with.
+_FONT_STATE_TOKEN = re.compile(
+    rf"(?P<show>{_ANY_SHOW_OP.pattern})"
+    r"|(?P<push>\bq\b)|(?P<pop>\bQ\b)"
+    r"|/(?P<font>[^\s/<>\[\]()]+)\s+[-+]?[\d.]+\s+Tf\b"
+)
+
+
+def _font_in_effect_at(data: bytes, offset: int) -> str | None:
+    """Return the font resource name selected when the stream reaches offset."""
+    text = data[:offset].decode("latin1", errors="replace")
+    font: str | None = None
+    stack: list[str | None] = []
+    for token in _FONT_STATE_TOKEN.finditer(text):
+        if token.group("push"):
+            stack.append(font)
+        elif token.group("pop"):
+            if stack:
+                font = stack.pop()
+        elif token.group("font"):
+            font = token.group("font")
+    return font
+
+
+def _decode_shown_text_in_order(
+    body: bytes,
+    *,
+    font_code_maps: dict[str, FontCodeMap] | None = None,
+    initial_font: str | None = None,
+) -> str | None:
     """Concatenate every text-show string in content-stream order.
 
-    Returns None when a show op paints glyphs this decoder cannot read (a
-    hex-string show other than the blank-square marker): a caller about to
-    stamp block-level /ActualText must not silence glyphs it cannot speak.
+    Hex strings are read through the ToUnicode CMap of the font in effect
+    (tracked across Tf and q/Q). Returns None when a show op paints glyphs
+    this decoder cannot read (a hex-string show with no readable CMap for
+    its font, other than the blank-square marker): a caller about to stamp
+    block-level /ActualText must not silence glyphs it cannot speak.
     """
     text = body.decode("latin1", errors="replace")
     parts: list[str] = []
-    for match in _ANY_SHOW_OP.finditer(text):
+    font = initial_font
+    stack: list[str | None] = []
+    for token in _FONT_STATE_TOKEN.finditer(text):
+        if token.group("push"):
+            stack.append(font)
+            continue
+        if token.group("pop"):
+            if stack:
+                font = stack.pop()
+            continue
+        if token.group("font"):
+            font = token.group("font")
+            continue
         for string in re.finditer(
-            rf"(?P<lit>{_LITERAL_STRING})|(?P<hex>{_HEX_STRING})", match.group(0)
+            rf"(?P<lit>{_LITERAL_STRING})|(?P<hex>{_HEX_STRING})", token.group("show")
         ):
             if string.group("lit") is not None:
                 parts.append(_decoded_literal_string(string.group("lit")[1:-1]))
-            else:
-                hex_body = re.sub(r"\s+", "", string.group("hex")[1:-1])
-                if hex_body.upper().startswith("0191"):
-                    parts.append("□")
-                else:
-                    return None
+                continue
+            hex_body = re.sub(r"\s+", "", string.group("hex")[1:-1])
+            if hex_body.upper().startswith("0191"):
+                parts.append("□")
+                continue
+            code_map = (font_code_maps or {}).get(font or "")
+            decoded = (
+                _decode_hex_string_with_font(hex_body, code_map)
+                if code_map is not None
+                else None
+            )
+            if decoded is None:
+                return None
+            parts.append(decoded)
     return "".join(parts)
 
 
@@ -882,11 +1120,15 @@ def _orphan_marked_spoken_text(
     mcid: int,
     *,
     table_image_labels: dict[int, str] | None = None,
+    font_code_maps: dict[str, FontCodeMap] | None = None,
+    initial_font: str | None = None,
 ) -> str | None:
     # Block-level /ActualText silences every glyph in the block, so the
     # spoken text must decode ALL of them; bail out when any show op is
     # unreadable rather than replace real spoken text with a fragment.
-    decoded = _decode_shown_text_in_order(body)
+    decoded = _decode_shown_text_in_order(
+        body, font_code_maps=font_code_maps, initial_font=initial_font
+    )
     if decoded is None:
         return None
     text = re.sub(r"\s+", " ", decoded).strip()
@@ -960,6 +1202,7 @@ def _repair_orphan_marked_content_actualtext(
         } | wildcard_mcids
         artifact_names = _artifact_drawn_xobject_names(data)
         table_image_labels = _pair_orphan_table_image_labels(data, struct_mcids)
+        font_code_maps = _page_font_code_maps(page)
         page_changed = False
         new_data = data
         for mcid, tag in _iter_bdc_mcids_on_page(data):
@@ -1022,6 +1265,8 @@ def _repair_orphan_marked_content_actualtext(
                 body,
                 mcid,
                 table_image_labels=table_image_labels,
+                font_code_maps=font_code_maps,
+                initial_font=_font_in_effect_at(new_data, block[0]),
             )
             if spoken is None and tag == "Table" and _table_body_has_paths_only(body):
                 new_data, changed = _retag_orphan_bdc_as_artifact(new_data, mcid)

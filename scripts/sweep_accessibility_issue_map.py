@@ -538,13 +538,21 @@ def build_residual_diagnostics(
             ],
         }
     untagged_images = (audit or {}).get("nonfigure_image_mcids_missing_alt") or []
-    if untagged_images:
+    orphan_blocks = (audit or {}).get("orphan_marked_mcids_missing_actualtext") or 0
+    other_elements_evidence = [
+        f"image content without alternate text at {label}"
+        for label in untagged_images
+    ]
+    if orphan_blocks:
+        # Marked content the structure tree does not own and that carries
+        # no /ActualText is what Acrobat reports under Other Elements.
+        other_elements_evidence.append(
+            f"{orphan_blocks} orphan marked-content block(s) without /ActualText"
+        )
+    if other_elements_evidence:
         tracked_categories["Other Elements Alternate Text"] = {
             "status": "residual",
-            "evidence": [
-                f"image content without alternate text at {label}"
-                for label in untagged_images
-            ],
+            "evidence": other_elements_evidence,
         }
     return {
         "layoutTable": {
