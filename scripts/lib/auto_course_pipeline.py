@@ -65,7 +65,13 @@ _STANDARD_ENCODINGS = frozenset(
     {"/WinAnsiEncoding", "/MacRomanEncoding", "/StandardEncoding", "/MacExpertEncoding"}
 )
 TOPIC_ROW_RE = re.compile(
-    r"^(?P<indent>\s*)- \[(?P<done>[ xX])\] topic `(?P<id>[^`]*)` row (?P<row>\d+) (?P<rest>.*)$"
+    r"^(?P<indent>\s*)- \[(?P<done>[ xX])\] topic `(?P<id>[^`]*)`"
+    r"(?: row (?P<row>\d+))? (?P<rest>.*)$"
+)
+# A chapter row names the chapter book the lambda merges from those topics.
+CHAPTER_ROW_RE = re.compile(
+    r"^(?P<indent>\s*)- \[(?P<done>[ xX])\] ch `(?P<id>[^`]*)`"
+    r"(?: row (?P<row>\d+))? (?P<rest>.*)$"
 )
 _ROW_RULE_RE = re.compile(r"([A-Z][A-Za-z ]*?) \[(?:fork|lambda|both)\]")
 
@@ -207,6 +213,46 @@ def high_confidence(
         reasons.append("render not byte-identical")
     if adobe is None or not adobe.get("pass"):
         reasons.append("Adobe check did not pass")
+    else:
+        manual = sorted(
+            entry["rule"]
+            for entry in adobe.get("rules") or []
+            if _normalized(entry.get("status")) == "needsmanualcheck"
+            and _normalized(entry.get("rule")) not in ALWAYS_MANUAL_RULES
+        )
+        if manual:
+            reasons.append("needs manual check: " + ", ".join(manual))
+        if row_rules:
+            _passed, unresolved = match_row_rules(row_rules, adobe.get("rules") or [])
+            if unresolved:
+                reasons.append("row rules not passed: " + ", ".join(unresolved))
+    if fonts_without_tounicode:
+        reasons.append(f"{fonts_without_tounicode} font(s) without ToUnicode")
+    return {"high": not reasons, "reasons": reasons}
+
+
+def chapter_high_confidence(
+    adobe: dict[str, Any] | None,
+    *,
+    row_rules: list[str] | None,
+    fonts_without_tounicode: int,
+) -> dict[str, Any]:
+    """Decide whether a rebuilt chapter book's tracker row can be ticked.
+
+    Shaped like `high_confidence`, minus the render test: the book is merged by
+    `generate-pdf-lambda` from the pushed previews, not repaired here, so there
+    is nothing local to compare it against, and the rebuild is meant to change
+    the file. The font test stays, because a font with no ToUnicode map is the
+    known case where the API passes Character encoding and desktop Acrobat
+    fails it, and the merged book carries the previews' fonts.
+    """
+    reasons: list[str] = []
+    if row_rules is None:
+        reasons.append("no tracker row")
+    if adobe is None or not adobe.get("pass"):
+        reasons.append("Adobe check did not pass")
+        if adobe and adobe.get("failedRules"):
+            reasons[-1] += ": " + ", ".join(adobe["failedRules"])
     else:
         manual = sorted(
             entry["rule"]
@@ -511,12 +557,9 @@ def _course_section(lines: list[str], course_id: str) -> tuple[int, int] | None:
     return start, end
 
 
-def tracker_topic_rows(tracker: Path, course_id: str) -> dict[str, dict[str, Any]]:
-    """Topic rows under the course heading, keyed by topic id.
-
-    Each value holds the line index, whether the row is ticked, and the rules
-    named on the row ("Other Elements", "Headers", ...).
-    """
+def _tracker_rows(
+    tracker: Path, course_id: str, pattern: re.Pattern[str]
+) -> dict[str, dict[str, Any]]:
     if not tracker.exists():
         return {}
     lines = tracker.read_text(encoding="utf-8").split("\n")
@@ -525,7 +568,7 @@ def tracker_topic_rows(tracker: Path, course_id: str) -> dict[str, dict[str, Any
         return {}
     rows: dict[str, dict[str, Any]] = {}
     for index in range(*section):
-        match = TOPIC_ROW_RE.match(lines[index])
+        match = pattern.match(lines[index])
         if not match:
             continue
         rows[match.group("id")] = {
@@ -536,6 +579,48 @@ def tracker_topic_rows(tracker: Path, course_id: str) -> dict[str, dict[str, Any
     return rows
 
 
+def tracker_topic_rows(tracker: Path, course_id: str) -> dict[str, dict[str, Any]]:
+    """Topic rows under the course heading, keyed by topic id.
+
+    Each value holds the line index, whether the row is ticked, and the rules
+    named on the row ("Other Elements", "Headers", ...).
+    """
+    return _tracker_rows(tracker, course_id, TOPIC_ROW_RE)
+
+
+def tracker_chapter_rows(tracker: Path, course_id: str) -> dict[str, dict[str, Any]]:
+    """Chapter rows under the course heading, keyed by chapter id.
+
+    Shaped like `tracker_topic_rows`, over the `- [ ] ch` lines.
+    """
+    return _tracker_rows(tracker, course_id, CHAPTER_ROW_RE)
+
+
+def _tick_rows(
+    tracker: Path,
+    course_id: str,
+    notes: dict[str, str],
+    *,
+    date: str,
+    kind: str,
+    pattern: re.Pattern[str],
+) -> list[str]:
+    rows = _tracker_rows(tracker, course_id, pattern)
+    lines = tracker.read_text(encoding="utf-8").split("\n")
+    ticked: list[str] = []
+    for row_id, note in notes.items():
+        row = rows.get(row_id)
+        if row is None or row["done"]:
+            continue
+        line = lines[row["line"]]
+        line = line.replace(f"- [ ] {kind}", f"- [x] {kind}", 1).rstrip()
+        lines[row["line"]] = f"{line} (done {date}, {note})"
+        ticked.append(row_id)
+    if ticked:
+        tracker.write_text("\n".join(lines), encoding="utf-8")
+    return ticked
+
+
 def tick_tracker_rows(
     tracker: Path, course_id: str, notes: dict[str, str], *, date: str
 ) -> list[str]:
@@ -543,17 +628,15 @@ def tick_tracker_rows(
 
     Rows already ticked are left alone. Returns the ids that were ticked.
     """
-    rows = tracker_topic_rows(tracker, course_id)
-    lines = tracker.read_text(encoding="utf-8").split("\n")
-    ticked: list[str] = []
-    for topic_id, note in notes.items():
-        row = rows.get(topic_id)
-        if row is None or row["done"]:
-            continue
-        line = lines[row["line"]]
-        line = line.replace("- [ ] topic", "- [x] topic", 1).rstrip()
-        lines[row["line"]] = f"{line} (done {date}, {note})"
-        ticked.append(topic_id)
-    if ticked:
-        tracker.write_text("\n".join(lines), encoding="utf-8")
-    return ticked
+    return _tick_rows(
+        tracker, course_id, notes, date=date, kind="topic", pattern=TOPIC_ROW_RE
+    )
+
+
+def tick_tracker_chapter_rows(
+    tracker: Path, course_id: str, notes: dict[str, str], *, date: str
+) -> list[str]:
+    """Tick the given chapter rows, the same way as topic rows."""
+    return _tick_rows(
+        tracker, course_id, notes, date=date, kind="ch", pattern=CHAPTER_ROW_RE
+    )

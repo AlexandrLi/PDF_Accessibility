@@ -36,17 +36,18 @@ A topic with no structure tree is untouched by every sweep stage. Run
 glyphs, so the output renders differently and takes the render-exception path
 below.
 
-## Unattended run (topic PDFs only)
+## Unattended run
 
 ```sh
 scripts/accessibility-course-workflow.sh auto <course-id> [--plan-only]
 ```
 
-`auto` runs the whole topic flow for one course with no approval step:
+`auto` runs the whole flow for one course with no approval step:
 sweep the topics with open rows in the tracker for that course (every
 default-TOC topic with `--all-topics`), Adobe Auto-Tag any topic with no
 structure tree and sweep the tagged file, run the Adobe PDF Services checker on every changed resolved
-topic, publish the topics that pass, append a dated sentence to the
+topic, publish the topics that pass, rebuild the course's downloads and
+chapter books on dev and check them, append a dated sentence to the
 tracker, and re-render `reports/accessibility-progress.html` from it. The policy lives in `scripts/lib/auto_course_pipeline.py`. A topic
 is pushed only when the sweep says resolved with a stable second pass (a
 residual whose only categories are Tables Headers or Tables Regularity also
@@ -66,6 +67,34 @@ lists the rows ticked and why each other pushed row was not. Every other row
 stays unticked until the user checks dev. Use `--plan-only` to run every stage
 and write the replacement plan without touching S3. Roll back an `auto` push with `rollback` and the replacement
 audit the summary names.
+
+After a push that verified at least one object, `auto` invokes
+`generate-pdf-{env}-generateCoursePdf` so the topic downloads and every TOC's
+chapter books are rebuilt from the pushed previews, then waits for the default
+TOC's books to land in S3 (a book counts as rebuilt when its ETag or
+LastModified moves past the pre-invocation snapshot, so a rebuild to the same
+bytes still counts). Lambda's async retries re-drive a book that runs past the
+chapter lambda's 15-minute clock, so the wait runs up to `--rebuild-timeout`
+(default 2700s, polling every `--rebuild-poll`) and survives a throttled poll.
+It then invalidates the course's `topic_pdfs/*` and `worksheets/*` (the lambda
+invalidates `worksheets/*` when it dispatches, minutes before the books exist),
+runs the Adobe checker on each rebuilt book, and ticks the chapter rows whose
+book passes every rule the row names, with nothing needing manual check beyond
+Logical Reading Order and Color contrast and no font missing a ToUnicode map.
+Two chapters that share a title in one TOC also share one worksheet key, so
+neither row is ticked from the one book the lambda leaves there. By default only chapters with an open
+row are checked; `--check-all-worksheets` checks every rebuilt book. The handler answers 500 when any one of its fan-out requests
+failed, so `auto` reads the payload: a failed chapter-book request stops the
+stage, while a failed topic download is recorded as a warning in the tracker
+sentence and the wait goes ahead. The stage is dev-only, because every handler
+in `generate-pdf-lambda` answers 403 outside the dev stage; `--skip-rebuild`
+turns it off, and the `rebuild`, `worksheetCheck` and `chapterTick` stages in
+the summary say what happened. An AWS fault during the stage is recorded as
+`rebuild.error` rather than raised, because the push it follows has already
+happened and the tracker sentence has to record it.
+`--rebuild-only` runs that stage by itself against what is already on dev,
+which is how to re-drive it after a timeout or for a course whose topics an
+earlier run pushed. It rebuilds for real, so it refuses `--plan-only`.
 
 ## Publishing
 
@@ -111,8 +140,9 @@ an artifact.
 - Update the tracker as part of the work it records, before reporting the
   work done. A sweep, a push to dev, a chapter re-wrap, or a re-validation of
   a sheet is done when the tracker says so.
-- Ticking is the user's call, with one exception: `auto` ticks topic rows it
-  pushed as high confidence (see "Unattended run"). For everything else the
+- Ticking is the user's call, with one exception: `auto` ticks the topic rows
+  it pushed as high confidence, and the chapter rows whose rebuilt book passes
+  every rule the row names (see "Unattended run"). For everything else the
   user checks the course on dev after a push and says which rows (or which
   course) pass. Then tick those rows (`- [ ]` to `- [x]`), append
   `(done YYYY-MM-DD, note)` with an absolute date and the sweep report or
@@ -151,7 +181,8 @@ an artifact.
   `/courses/{courseId}/topic_pdfs/*` on CloudFront distribution
   `E27O7BO97BHXFO` (the lambda invalidates only `worksheets/*`, so the topic
   wraps stay cached; seen 2026-09-14), re-validate the sheet, update the
-  tracker.
+  tracker. `auto` does the invoke, the wait, both invalidations and the chapter
+  check itself; run those by hand only after `--skip-rebuild` or a failed run.
 - The UI never serves `topic_pdfs/{topicId}.pdf`. It serves the wraps
   `topic_pdfs/{title}_{topicId}.pdf` (and `_with_answer_key.pdf`) and
   `worksheets/{chapterTitle}-{tocId}.pdf`, which `generate-pdf-lambda` builds

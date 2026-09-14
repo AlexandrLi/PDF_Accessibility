@@ -12,6 +12,7 @@ import pikepdf
 
 from lib.auto_course_pipeline import (
     adobe_gate,
+    chapter_high_confidence,
     append_tracker_note,
     apply_retag_to_topic,
     build_publish_manifest,
@@ -23,7 +24,9 @@ from lib.auto_course_pipeline import (
     needs_autotag,
     render_diff_fractions,
     retag_topic,
+    tick_tracker_chapter_rows,
     tick_tracker_rows,
+    tracker_chapter_rows,
     tracker_topic_rows,
 )
 
@@ -96,7 +99,8 @@ TRACKER = (
     "- [ ] ch `c1` row 2 **Chapter 0** chapter PDF fails: Other Elements [fork]\n"
     "  - [ ] topic `t1` row 6 Functions: Other Elements [fork]\n"
     "  - [ ] topic `t2` row 7 Tables: Headers [fork], Tab Order [fork] (in Aug 25 map)\n"
-    "  - [x] topic `t3` row 8 Done: Headers [fork] (done 2026-09-01, by hand)\n\n"
+    "  - [x] topic `t3` row 8 Done: Headers [fork] (done 2026-09-01, by hand)\n"
+    "  - [ ] topic `t4` Unlisted (no workbook row): Headers [fork]\n\n"
     "### `other`\n\n  - [ ] topic `t9` row 1 Elsewhere: Headers [fork]\n"
 )
 
@@ -346,13 +350,60 @@ class HighConfidenceTests(unittest.TestCase):
         self.assertEqual(count_fonts_without_tounicode(out.getvalue()), 0)
 
 
+class ChapterConfidenceTests(unittest.TestCase):
+    def test_passing_book_with_passed_row_rules_is_high(self) -> None:
+        verdict = chapter_high_confidence(
+            {**PASS, "rules": _rules()},
+            row_rules=["Other Elements", "Headers"],
+            fonts_without_tounicode=0,
+        )
+        self.assertEqual(verdict, {"high": True, "reasons": []})
+
+    def test_a_font_without_tounicode_blocks_the_tick(self) -> None:
+        verdict = chapter_high_confidence(
+            {**PASS, "rules": _rules()},
+            row_rules=["Headers"],
+            fonts_without_tounicode=3,
+        )
+        self.assertEqual(verdict["reasons"], ["3 font(s) without ToUnicode"])
+
+    def test_failed_rules_and_a_missing_row_are_named(self) -> None:
+        gate = {
+            "pass": False,
+            "readable": True,
+            "failed": 1,
+            "failedRules": ["Document: Bookmarks"],
+            "rules": _rules(("Bookmarks", "Failed")),
+        }
+        self.assertEqual(
+            chapter_high_confidence(
+                gate, row_rules=["Bookmarks"], fonts_without_tounicode=0
+            )["reasons"],
+            ["Adobe check did not pass: Document: Bookmarks"],
+        )
+        self.assertIn(
+            "no tracker row",
+            chapter_high_confidence(
+                {**PASS, "rules": _rules()}, row_rules=None, fonts_without_tounicode=0
+            )["reasons"],
+        )
+
+    def test_a_manual_check_beyond_the_always_manual_pair_blocks_the_tick(self) -> None:
+        verdict = chapter_high_confidence(
+            {**PASS, "rules": _rules(("Tagged content", "Needs manual check"))},
+            row_rules=[],
+            fonts_without_tounicode=0,
+        )
+        self.assertEqual(verdict["reasons"], ["needs manual check: Tagged content"])
+
+
 class TrackerTests(unittest.TestCase):
     def test_topic_rows_are_scoped_to_the_course(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "tracker.md"
             path.write_text(TRACKER, encoding="utf-8")
             rows = tracker_topic_rows(path, "trig")
-            self.assertEqual(sorted(rows), ["t1", "t2", "t3"])
+            self.assertEqual(sorted(rows), ["t1", "t2", "t3", "t4"])
             self.assertEqual(rows["t2"]["rules"], ["Headers", "Tab Order"])
             self.assertTrue(rows["t3"]["done"])
             self.assertFalse(rows["t1"]["done"])
@@ -373,6 +424,36 @@ class TrackerTests(unittest.TestCase):
             self.assertIn("  - [ ] topic `t9`", text)
             self.assertIn("- [ ] ch `c1`", text)
 
+
+    def test_row_without_a_workbook_number_is_read_and_ticked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tracker.md"
+            path.write_text(TRACKER, encoding="utf-8")
+            self.assertEqual(tracker_topic_rows(path, "trig")["t4"]["rules"], ["Headers"])
+            self.assertEqual(tick_tracker_rows(path, "trig", {"t4": "auto"}, date="2026-09-14"), ["t4"])
+            self.assertIn(
+                "  - [x] topic `t4` Unlisted (no workbook row): Headers [fork] (done 2026-09-14, auto)\n",
+                path.read_text(encoding="utf-8"),
+            )
+
+    def test_chapter_rows_tick_without_touching_topic_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tracker.md"
+            path.write_text(TRACKER, encoding="utf-8")
+            rows = tracker_chapter_rows(path, "trig")
+            self.assertEqual(sorted(rows), ["c1"])
+            self.assertEqual(rows["c1"]["rules"], ["Other Elements"])
+            ticked = tick_tracker_chapter_rows(
+                path, "trig", {"c1": "rebuilt", "c9": "rebuilt"}, date="2026-09-14"
+            )
+            self.assertEqual(ticked, ["c1"])
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(
+                "- [x] ch `c1` row 2 **Chapter 0** chapter PDF fails: Other Elements [fork]"
+                " (done 2026-09-14, rebuilt)\n",
+                text,
+            )
+            self.assertIn("  - [ ] topic `t1` row 6", text)
 
     def test_sentence_joins_the_course_paragraph(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

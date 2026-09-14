@@ -217,7 +217,7 @@ Courses can be migrated **chapter by chapter** over multiple runs:
 | DynamoDB batch coordinator         | **Skip** — CLI loops synchronously or polls Step Function per topic |
 | Ongoing `pdf/channels/` S3 trigger | **Skip** — CLI copies sources into a11y bucket per job              |
 | Mongo / course JSON updates        | **Skip** — existing flags only                                      |
-| Invoke `generateCoursePdf`         | **Never**                                                           |
+| Invoke `generateCoursePdf`         | **Never** once the fork wraps and merges (see 2.12)                 |
 | Re-process / single-topic API      | **Skip** — use `--chapter-id` or full course re-run                 |
 
 ### 2.7 CLI flags (reference)
@@ -483,6 +483,8 @@ Migration touches **two S3 buckets**. Do not conflate them.
 **Flow:** read source from channels → process in a11y bucket → **write all three CDN keys back to channels** → invalidate CloudFront. The a11y bucket is never the user-facing store.
 
 **Why not “promote + regenerate”?** `generate-pdf-lambda` wraps/merges with `pdf-lib` draw operations that degrade PDF/UA tags. After migration, **never invoke** `generateCoursePdf` — the fork must rebuild download and chapter files from **already-remediated preview PDFs**.
+
+**Until the fork owns that step (2026-09-14):** the wraps and chapter books a user downloads are written only by `generate-pdf-lambda`, so a push to the previews changes nothing visible until it reruns. `scripts/auto_fix_course.py` therefore invokes `generate-pdf-dev-generateCoursePdf` after a successful push, waits for the books, and Adobe-checks them (see "Unattended run" in CLAUDE.md). The merge has not cost a tracked rule so far: every algebra-trigonometry chapter book passed the Adobe API on every rule its tracker row names, Bookmarks included, after the 2026-09-14 rebuild. The known exception is the `_with_answer_key` wrap, which fails Tagged content on its Chromium-rendered key pages. The rule above still stands as the migration end state; the rebuild stage is what keeps dev honest in the meantime.
 
 ### 2.13 Document hierarchy (preview = source)
 
