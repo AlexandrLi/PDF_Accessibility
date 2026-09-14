@@ -17,10 +17,12 @@ import pikepdf
 
 from lib.marked_content_actualtext_sweep import (
     _decode_pdf_actualtext_value,
+    _decode_label_mcid_text,
     _get_mcid_block,
     _inject_actualtext_in_data,
     _inject_actualtext_on_page,
     _mcid_bdc_has_actualtext,
+    _page_font_code_maps,
     _pdf_literal_string,
     _read_actualtext_from_mcid,
     _read_page_contents,
@@ -146,6 +148,30 @@ def _page_contents_text(pdf_bytes: bytes) -> str:
         contents = pdf.pages[0].get("/Contents")
         assert contents is not None
         return _read_page_contents(contents).decode("latin1", errors="replace")
+
+
+def _type0_font(
+    pdf: pikepdf.Pdf, bfchars: dict[str, str]
+) -> pikepdf.Dictionary:
+    """An Identity-H font whose /ToUnicode names the given codes."""
+    entries = "\n".join(f"<{src}> <{dst}>" for src, dst in bfchars.items())
+    cmap = (
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
+        "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+        f"{len(bfchars)} beginbfchar\n{entries}\nendbfchar\n"
+        "endcmap end end"
+    )
+    return pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type0"),
+                "/BaseFont": pikepdf.Name("/ArialMT"),
+                "/Encoding": pikepdf.Name("/Identity-H"),
+                "/ToUnicode": pdf.make_stream(cmap.encode("latin1")),
+            }
+        )
+    )
 
 
 def _actualtext_for_mcid(contents: str, mcid: int) -> str | None:
@@ -885,6 +911,45 @@ class ListItemLabelActualTextTests(unittest.TestCase):
         self.assertIsNone(_spoken_list_label_text("1.", normalized_only=True))
         self.assertEqual(_spoken_list_label_text('"#'), '"#')
 
+    def test_label_glyph_code_is_read_through_the_font(self) -> None:
+        # 0194 is a bullet in this font. Naming the code beats the
+        # blank-square convention, or the bullet is spoken "blank".
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Resources"] = pikepdf.Dictionary(
+            {"/Font": pikepdf.Dictionary({"/C2_1": _type0_font(pdf, {"0194": "25CF"})})}
+        )
+        body = b"q BT /C2_1 1 Tf 12 0 0 12 36 700 Tm <0194>Tj ET Q"
+
+        self.assertEqual(
+            _decode_label_mcid_text(body, font_code_maps=_page_font_code_maps(page)),
+            "●",
+        )
+
+    def test_unnamed_blank_square_code_still_reads_as_the_box(self) -> None:
+        # With no font naming 0191, the code is the only evidence there is.
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Resources"] = pikepdf.Dictionary(
+            {"/Font": pikepdf.Dictionary({"/C2_1": _type0_font(pdf, {"0194": "25CF"})})}
+        )
+        body = b"q BT /C2_1 1 Tf 12 0 0 12 36 700 Tm <0191>Tj ET Q"
+
+        raw = _decode_label_mcid_text(body, font_code_maps=_page_font_code_maps(page))
+        self.assertEqual(raw, "□")
+        self.assertEqual(_spoken_list_label_text(raw, normalized_only=True), "blank")
+
+    def test_unreadable_label_glyphs_are_not_spoken_as_blank(self) -> None:
+        # No /ToUnicode at all: the label paints something nobody can read,
+        # which is not the same as painting nothing.
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        body = b"q BT /C2_1 1 Tf 12 0 0 12 36 700 Tm <0194>Tj ET Q"
+
+        raw = _decode_label_mcid_text(body, font_code_maps=_page_font_code_maps(page))
+        self.assertIsNone(raw)
+        self.assertIsNone(_spoken_list_label_text(raw, normalized_only=True))
+
     def test_symbolic_font_label_is_not_stamped_or_counted(self) -> None:
         pdf = pikepdf.Pdf.new()
         page = pdf.add_blank_page()
@@ -1305,6 +1370,49 @@ class OrphanMarkedContentTests(unittest.TestCase):
             block = _get_mcid_block(data, 6)
             self.assertIsNotNone(block)
             self.assertEqual(block[0], "Span")
+
+    def test_orphan_span_showing_only_a_space_is_not_spoken_blank(self) -> None:
+        # An empty decode is the answer box for a /Lbl, not for a Span that
+        # shows one space next to a heading: "blank" there adds a word the
+        # page never paints.
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"q /Span<</MCID 5 >> BDC 0 0 612 792 re W* n "
+            b"BT /TT0 1 Tf 12 0 0 12 204 708 Tm ( )Tj ET EMC "
+            b"q /P<</MCID 1 >> BDC (TOPIC: FACTORING POLYNOMIALS) Tj EMC"
+        )
+        body = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/P"),
+                "/K": 1,
+                "/Pg": page.obj,
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([body]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        repaired, result = repair_marked_content_actualtext(buf.getvalue())
+
+        self.assertNotIn(
+            "orphan MCID 5: injected /ActualText 'blank' on Span", result.actions
+        )
+        self.assertIn(
+            "orphan MCID 5: retagged decorative Span to /Artifact", result.actions
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertIsNone(_get_mcid_block(data, 5))
+            self.assertNotIn(b"blank", data)
+        # Artifacting it keeps the orphan out of the Other-elements count.
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
 
 
 class OrphanFigureTests(unittest.TestCase):
@@ -1821,6 +1929,45 @@ class UntaggedImageActualTextTests(unittest.TestCase):
             self.assertEqual(
                 list_untagged_image_mcids_missing_actualtext(repaired), []
             )
+
+
+def _build_contentless_span_pdf() -> bytes:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    page.Contents = pdf.make_stream(
+        b"/Span <</MCID 0>> BDC BT /F1 12 Tf 10 100 Td (x) Tj ET EMC\n"
+    )
+
+    def elem(name: str, **extra: object) -> pikepdf.Dictionary:
+        data = {"/Type": pikepdf.Name("/StructElem"), "/S": pikepdf.Name(f"/{name}")}
+        for key, value in extra.items():
+            data[f"/{key}"] = value
+        return pikepdf.Dictionary(data)
+
+    spoken = elem("Span", ActualText=pikepdf.String("x"), K=pikepdf.Array([0]), Pg=page.obj)
+    empty = elem("Span", ActualText=pikepdf.String(" "), K=pikepdf.Array([]))
+    paragraph = elem("P", K=pikepdf.Array([spoken, empty]))
+    document = elem("Document", K=pikepdf.Array([paragraph]))
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {"/Type": pikepdf.Name("/StructTreeRoot"), "/K": pikepdf.Array([document])}
+    )
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
+class ContentlessAltTests(unittest.TestCase):
+    def test_strips_actualtext_from_empty_span_but_keeps_spoken_span(self) -> None:
+        repaired, result = repair_marked_content_actualtext(_build_contentless_span_pdf())
+
+        pdf = pikepdf.open(io.BytesIO(repaired))
+        spoken, empty = pdf.Root.StructTreeRoot.K[0].K[0].K
+        self.assertEqual(str(spoken.ActualText), "x")
+        self.assertNotIn("/ActualText", empty)
+        self.assertIn(
+            "removed ActualText from empty Span with no page content", result.actions
+        )
 
 
 if __name__ == "__main__":

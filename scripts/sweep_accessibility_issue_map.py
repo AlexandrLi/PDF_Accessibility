@@ -60,6 +60,16 @@ def parse_args() -> argparse.Namespace:
             "is not read"
         ),
     )
+    parser.add_argument(
+        "--topic-id",
+        action="append",
+        default=None,
+        metavar="TOPIC_ID",
+        help=(
+            "With --all-topics, sweep only these default-TOC topics (repeatable); "
+            "ids not in the TOC are reported as unmatched"
+        ),
+    )
     parser.add_argument("--env", choices=("dev", "prod"), default="dev")
     parser.add_argument(
         "--output-root",
@@ -370,6 +380,30 @@ def resolve_topics(
             }
         )
     return matched, unmatched, toc_id
+
+
+def select_topics(
+    matched: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+    topic_ids: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep only the requested topic ids from a resolve_all_topics result.
+
+    Returns (matched, skipped, unmatched): skipped keeps the requested topics
+    that have no preview PDF, and unmatched lists requested ids absent from
+    the default TOC so a stale tracker row is visible in the report.
+    """
+    wanted = {str(topic_id) for topic_id in topic_ids}
+    kept = [item for item in matched if str(item["topicId"]) in wanted]
+    kept_skipped = [item for item in skipped if str(item["topicId"]) in wanted]
+    known = {str(item["topicId"]) for item in matched} | {
+        str(item["topicId"]) for item in skipped
+    }
+    unmatched = [
+        {"topicId": topic_id, "reason": "topic id not in the default TOC"}
+        for topic_id in sorted(wanted - known)
+    ]
+    return kept, kept_skipped, unmatched
 
 
 def resolve_all_topics(
@@ -719,9 +753,12 @@ def _prepare_downloads(
         return {}, "resume-only"
     if workers == 1:
         results: dict[str, tuple[bytes, dict[str, Any]] | Exception] = {}
-        for topic_id, (_item, _etag, pdf_bytes) in downloads.items():
+        for topic_id, (item, _etag, pdf_bytes) in downloads.items():
             try:
-                results[topic_id] = prepare_pdf(pdf_bytes)
+                results[topic_id] = prepare_pdf(
+                    pdf_bytes,
+                    document_title=item.get("topicTitle"),
+                )
             except Exception as error:
                 results[topic_id] = error
         return results, "serial"
@@ -730,8 +767,12 @@ def _prepare_downloads(
         process_results: dict[str, tuple[bytes, dict[str, Any]] | Exception] = {}
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(prepare_pdf, pdf_bytes): topic_id
-                for topic_id, (_item, _etag, pdf_bytes) in downloads.items()
+                executor.submit(
+                    prepare_pdf,
+                    pdf_bytes,
+                    document_title=item.get("topicTitle"),
+                ): topic_id
+                for topic_id, (item, _etag, pdf_bytes) in downloads.items()
             }
             for future in as_completed(futures):
                 topic_id = futures[future]
@@ -744,8 +785,12 @@ def _prepare_downloads(
         thread_results: dict[str, tuple[bytes, dict[str, Any]] | Exception] = {}
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(prepare_pdf, pdf_bytes): topic_id
-                for topic_id, (_item, _etag, pdf_bytes) in downloads.items()
+                executor.submit(
+                    prepare_pdf,
+                    pdf_bytes,
+                    document_title=item.get("topicTitle"),
+                ): topic_id
+                for topic_id, (item, _etag, pdf_bytes) in downloads.items()
             }
             for future in as_completed(futures):
                 topic_id = futures[future]
@@ -796,9 +841,14 @@ def main() -> int:
     course = load_course_json(s3, bucket, args.course_id)
     course_title = (course.get("details") or {}).get("title") or args.course_id
     skipped_no_pdf: list[dict[str, Any]] = []
+    requested_topic_ids = getattr(args, "topic_id", None) or []
     if args.all_topics:
         matched, skipped_no_pdf, toc_id = resolve_all_topics(course, args.course_id)
         unmatched = []
+        if requested_topic_ids:
+            matched, skipped_no_pdf, unmatched = select_topics(
+                matched, skipped_no_pdf, requested_topic_ids
+            )
         issue_rows = [item["sourceIssueRow"] for item in matched]
         source_workbook = None
         map_topic_rows = None
@@ -1021,7 +1071,12 @@ def main() -> int:
     report = {
         "runAt": run_at.isoformat(),
         "sourceIssueMap": None if args.all_topics else str(map_path.resolve()),
-        "topicSelection": "allTopics" if args.all_topics else "issueMap",
+        "topicSelection": (
+            "topicIds" if args.all_topics and requested_topic_ids else "allTopics"
+        )
+        if args.all_topics
+        else "issueMap",
+        "requestedTopicIds": sorted(requested_topic_ids) or None,
         "skippedNoPdf": skipped_no_pdf,
         "sourceWorkbook": source_workbook,
         "course": {

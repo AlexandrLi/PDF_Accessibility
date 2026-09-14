@@ -14,6 +14,7 @@ import pymupdf
 
 from lib.bookmark_sweep import repair_bookmarks
 from lib.character_encoding_sweep import repair_character_encoding
+from lib.document_title_sweep import repair_document_title
 from lib.figure_alt_sweep import repair_missing_figure_alt
 from lib.heading_nesting_sweep import repair_heading_nesting
 from lib.inline_formula_sweep import repair_inline_formula_figures
@@ -28,6 +29,7 @@ from lib.tagged_content_sweep import repair_tagged_content
 SWEEP_MODULES = (
     "bookmark_sweep.py",
     "character_encoding_sweep.py",
+    "document_title_sweep.py",
     "figure_alt_sweep.py",
     "heading_nesting_sweep.py",
     "inline_formula_sweep.py",
@@ -94,7 +96,11 @@ def render_hashes(pdf_bytes: bytes) -> list[str]:
         document.close()
 
 
-def run_sweeps(pdf_bytes: bytes) -> tuple[bytes, dict[str, Any]]:
+def run_sweeps(
+    pdf_bytes: bytes,
+    *,
+    document_title: str | None = None,
+) -> tuple[bytes, dict[str, Any]]:
     current = pdf_bytes
     repairs: dict[str, Any] = {}
     warnings: list[str] = []
@@ -175,6 +181,10 @@ def run_sweeps(pdf_bytes: bytes) -> tuple[bytes, dict[str, Any]]:
     run_stage("characterEncoding", repair_character_encoding)
     run_stage("headingNesting", repair_heading_nesting)
     run_stage("bookmarks", repair_bookmarks)
+    run_stage(
+        "documentTitle",
+        lambda data: repair_document_title(data, title=document_title),
+    )
 
     started = perf_counter()
     try:
@@ -200,16 +210,26 @@ def run_sweeps(pdf_bytes: bytes) -> tuple[bytes, dict[str, Any]]:
     }
 
 
-def prepare_pdf(pdf_bytes: bytes) -> tuple[bytes, dict[str, Any]]:
+def prepare_pdf(
+    pdf_bytes: bytes,
+    *,
+    document_title: str | None = None,
+) -> tuple[bytes, dict[str, Any]]:
     original_validation = validate_pdf(pdf_bytes)
     original_render_hashes = render_hashes(pdf_bytes)
-    swept_bytes, sweep_result = run_sweeps(pdf_bytes)
+    swept_bytes, sweep_result = run_sweeps(
+        pdf_bytes,
+        document_title=document_title,
+    )
     swept_validation = validate_pdf(swept_bytes)
     swept_render_hashes = render_hashes(swept_bytes)
     changed = swept_bytes != pdf_bytes
 
     if changed:
-        second_bytes, second_result = run_sweeps(swept_bytes)
+        second_bytes, second_result = run_sweeps(
+            swept_bytes,
+            document_title=document_title,
+        )
         second_pass = {
             "executed": True,
             "byteStable": second_bytes == swept_bytes,

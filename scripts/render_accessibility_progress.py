@@ -2,7 +2,8 @@
 """Render reports/ACCESSIBILITY_PROGRESS.md as a static HTML page.
 
 The markdown checklist is the source of truth. This script only draws it:
-a course board in the centre (done / open rows, progress bar, top rules),
+a course board in the centre (courses by id, finished ones last; done / open
+rows, progress bar, top rules),
 each course expanding to its chapters and topics, and the reference sections
 (next actions, key findings, rule ownership) at the bottom. Nothing on the
 page writes back; tick rows in the markdown file and re-render.
@@ -330,8 +331,8 @@ def render(md: str, src_label: str) -> str:
         grand_done += done
         grand_total += total
         scored.append((total - done, c))
-    # Most open work first; finished courses sink to the bottom.
-    scored.sort(key=lambda x: -x[0])
+    # Courses in id order; finished courses sink to the bottom, also in id order.
+    scored.sort(key=lambda x: (x[0] == 0, x[1]["id"]))
     board = "".join(render_course(c, summary) for _, c in scored)
     open_courses = sum(1 for n, _ in scored if n)
     gpct = f"{100 * grand_done / grand_total if grand_total else 0:.0f}%"

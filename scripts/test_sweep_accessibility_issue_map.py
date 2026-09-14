@@ -18,6 +18,7 @@ from sweep_accessibility_issue_map import (  # noqa: E402
     classify_residual_status,
     normalized_chapter_title,
     resolve_all_topics,
+    select_topics,
     resolve_topics,
     topic_output_paths,
 )
@@ -70,6 +71,14 @@ def _sweep_result(
 
 
 class AccessibilityIssueMapSweepTests(unittest.TestCase):
+    def test_select_topics_keeps_requested_ids_and_reports_unknown_ones(self) -> None:
+        matched = [{"topicId": "a"}, {"topicId": "b"}]
+        skipped = [{"topicId": "c", "reason": "pdfAvailable=false"}]
+        kept, kept_skipped, unmatched = select_topics(matched, skipped, ["b", "c", "zz"])
+        self.assertEqual([item["topicId"] for item in kept], ["b"])
+        self.assertEqual([item["topicId"] for item in kept_skipped], ["c"])
+        self.assertEqual(unmatched, [{"topicId": "zz", "reason": "topic id not in the default TOC"}])
+
     def test_all_topics_covers_every_toc_topic_with_a_pdf(self) -> None:
         course = _course_with_chapter(
             "Quadratic Equations",

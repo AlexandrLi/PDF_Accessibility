@@ -23,6 +23,8 @@ scripts/accessibility-course-workflow.sh prepare <course-id> --all-topics
 
 `--all-topics` sweeps every topic in the course default TOC and is the normal
 mode. Without it `prepare` sweeps only the topics in the Aug 25 issue map.
+`--all-topics --topic-id <id>` (repeatable) narrows the sweep to those TOC
+topics; ids missing from the TOC are listed under `unmatched`.
 Topics with `pdfAvailable=false` are listed under `skippedNoPdf` in the
 report, and table checks run on every PDF that has a table.
 
@@ -34,9 +36,40 @@ A topic with no structure tree is untouched by every sweep stage. Run
 glyphs, so the output renders differently and takes the render-exception path
 below.
 
+## Unattended run (topic PDFs only)
+
+```sh
+scripts/accessibility-course-workflow.sh auto <course-id> [--plan-only]
+```
+
+`auto` runs the whole topic flow for one course with no approval step:
+sweep the topics with open rows in the tracker for that course (every
+default-TOC topic with `--all-topics`), Adobe Auto-Tag any topic with no
+structure tree and sweep the tagged file, run the Adobe PDF Services checker on every changed resolved
+topic, publish the topics that pass, append a dated sentence to the
+tracker, and re-render `reports/accessibility-progress.html` from it. The policy lives in `scripts/lib/auto_course_pipeline.py`. A topic
+is pushed only when the sweep says resolved with a stable second pass (a
+residual whose only categories are Tables Headers or Tables Regularity also
+qualifies, since the local table audit is stricter than Acrobat), the
+file changed, the Adobe API reports zero failed rules, and the render is
+identical or the topic was Auto-Tagged with no page changing more than
+`--max-render-diff` (default 5%) of its pixels. Everything else lands in
+`reports/<course>-auto-<timestamp>.auto.review.json` with the reasons.
+
+The Adobe API passes files desktop Acrobat fails, so an `auto` push is not
+Acrobat-verified. `auto` still ticks a pushed topic's tracker row itself when
+the topic is high confidence: the render is byte-identical, Adobe marks
+nothing "Needs manual check" beyond Logical Reading Order and Color contrast,
+every rule named on the row passed, and no font lacks a ToUnicode map (the
+known case where desktop Acrobat is stricter). The summary's `tick` stage
+lists the rows ticked and why each other pushed row was not. Every other row
+stays unticked until the user checks dev. Use `--plan-only` to run every stage
+and write the replacement plan without touching S3. Roll back an `auto` push with `rollback` and the replacement
+audit the summary names.
+
 ## Publishing
 
-Publishing waits for the user's explicit go-ahead in the current session,
+Manual publishing waits for the user's explicit go-ahead in the current session,
 given after they open the generated PDFs in desktop Acrobat. The API checker
 passes files that desktop Acrobat fails, so the API result alone is not
 approval.
@@ -78,11 +111,13 @@ an artifact.
 - Update the tracker as part of the work it records, before reporting the
   work done. A sweep, a push to dev, a chapter re-wrap, or a re-validation of
   a sheet is done when the tracker says so.
-- Ticking is the user's call. After a push the user checks the course on dev
-  and says which rows (or which course) pass. Then tick those rows (`- [ ]` to
-  `- [x]`), append `(done YYYY-MM-DD, note)` with an absolute date and the
-  sweep report or commit that fixed it, and re-render the HTML so the marks
-  carry over. Pushed but not yet approved by the user stays unticked.
+- Ticking is the user's call, with one exception: `auto` ticks topic rows it
+  pushed as high confidence (see "Unattended run"). For everything else the
+  user checks the course on dev after a push and says which rows (or which
+  course) pass. Then tick those rows (`- [ ]` to `- [x]`), append
+  `(done YYYY-MM-DD, note)` with an absolute date and the sweep report or
+  commit that fixed it, and re-render the HTML so the marks carry over.
+  Pushed but neither high confidence nor approved by the user stays unticked.
 - If a row is partly fixed, edit the rule list on the line instead of ticking.
 - Record course-level events (sweep date, push date, re-wrap date, sheet
   re-validated on) in the sentence under the course heading.
@@ -110,6 +145,20 @@ an artifact.
   user on 2026-09-11.
 - `biochemistry` was swept on 2026-08-26 but never pushed. Re-sweep and check
   before pushing.
-- Full fix path for a course: sweep every topic here, publish to dev, re-run
-  `generate-chapters-pdf` in `generate-pdf-lambda` for that course,
-  re-validate the sheet, update the tracker.
+- Full fix path for a course: sweep every topic here, publish to dev, invoke
+  the dev lambda `generate-pdf-dev-generateCoursePdf` with `{"courseId"}` so
+  every topic download and every TOC's chapter books are rebuilt, invalidate
+  `/courses/{courseId}/topic_pdfs/*` on CloudFront distribution
+  `E27O7BO97BHXFO` (the lambda invalidates only `worksheets/*`, so the topic
+  wraps stay cached; seen 2026-09-14), re-validate the sheet, update the
+  tracker.
+- The UI never serves `topic_pdfs/{topicId}.pdf`. It serves the wraps
+  `topic_pdfs/{title}_{topicId}.pdf` (and `_with_answer_key.pdf`) and
+  `worksheets/{chapterTitle}-{tocId}.pdf`, which `generate-pdf-lambda` builds
+  from the preview. A push to the preview changes nothing a user downloads
+  until `generateCoursePdf` (or the topic and chapter lambdas) reruns. Found
+  2026-09-14: algebra-trigonometry downloads were still the 2026-09-03 wraps
+  after two days of preview pushes. The `_with_answer_key` wraps fail Tagged
+  content on their Chromium-rendered key pages; that is a lambda defect
+  (answer-key branch), not a preview problem, and the workbook does not track
+  those files.

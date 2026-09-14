@@ -547,12 +547,32 @@ def _repair_list_image_labels(
 
 
 _BLANK_SQUARE_HEX = re.compile(rb"<0191")
+_BLANK_SQUARE_HEX_PREFIX = "0191"
+_HEX_SHOW_STRING = re.compile(rb"<[0-9A-Fa-f\s]+>")
 _LBL_OPTION_PATTERN = re.compile(r"^([a-zA-Z])\)?")
 
 
-def _decode_label_mcid_text(body: bytes) -> str:
-    if _BLANK_SQUARE_HEX.search(body):
-        return "□"
+def _decode_label_mcid_text(
+    body: bytes,
+    *,
+    font_code_maps: dict[str, FontCodeMap] | None = None,
+) -> str | None:
+    """The characters a list label paints, or None when they cannot be read.
+
+    A hex show carries glyph codes, so it is read through the font's
+    /ToUnicode rather than guessed from the code. Code 0191 stays the empty
+    answer box only where no font names it; trusting the code alone speaks a
+    bullet as "blank".
+
+    A label whose codes no font names is unreadable, which is not the same as
+    a label that paints nothing: returning "" for it would have
+    `_spoken_list_label_text` call it "blank" on no evidence at all.
+    """
+    if _HEX_SHOW_STRING.search(body):
+        decoded = _decode_shown_text_in_order(body, font_code_maps=font_code_maps)
+        if decoded is not None:
+            return decoded.strip()
+        return "□" if _BLANK_SQUARE_HEX.search(body) else None
     text = _extract_tj_text(body)
     if not text.strip():
         parts: list[str] = []
@@ -768,24 +788,32 @@ def _decode_shown_text_in_order(
                 parts.append(_decoded_literal_string(string.group("lit")[1:-1]))
                 continue
             hex_body = re.sub(r"\s+", "", string.group("hex")[1:-1])
-            if hex_body.upper().startswith("0191"):
-                parts.append("□")
-                continue
             code_map = (font_code_maps or {}).get(font or "")
             decoded = (
                 _decode_hex_string_with_font(hex_body, code_map)
                 if code_map is not None
                 else None
             )
-            if decoded is None:
-                return None
-            parts.append(decoded)
+            if decoded is not None:
+                parts.append(decoded)
+                continue
+            # 0191 is the empty answer box only where the font declines to
+            # name the code. A font that does name it outranks the
+            # convention: the same code carries a bullet elsewhere, and
+            # reading that as the box speaks it "blank".
+            if hex_body.upper().startswith(_BLANK_SQUARE_HEX_PREFIX):
+                parts.append("□")
+                continue
+            return None
     return "".join(parts)
 
 
 def _spoken_list_label_text(
-    raw: str, *, normalized_only: bool = False
+    raw: str | None, *, normalized_only: bool = False
 ) -> str | None:
+    if raw is None:
+        # Glyphs the decoder could not read. Nothing is safely speakable.
+        return None
     cleaned = raw.replace("\\", "").strip()
     if not cleaned or cleaned == "□":
         return "blank"
@@ -876,7 +904,10 @@ def _repair_list_item_label_actualtext(
                     if block is None:
                         continue
                     spoken = _spoken_list_label_text(
-                        _decode_label_mcid_text(block[1]),
+                        _decode_label_mcid_text(
+                            block[1],
+                            font_code_maps=_page_font_code_maps(page),
+                        ),
                         normalized_only=True,
                     )
                     if not spoken:
@@ -938,7 +969,12 @@ def count_li_lbl_missing_actualtext(pdf_bytes: bytes) -> int:
                             block = _get_mcid_block(resolved[1], mcid)
                             if block is not None and (
                                 _spoken_list_label_text(
-                                    _decode_label_mcid_text(block[1]),
+                                    _decode_label_mcid_text(
+                                        block[1],
+                                        font_code_maps=_page_font_code_maps(
+                                            resolved[0]
+                                        ),
+                                    ),
                                     normalized_only=True,
                                 )
                                 is None
@@ -1114,6 +1150,21 @@ def _body_is_decorative_paths(body: bytes) -> bool:
     return bool(re.search(rb"\b(?:re|m)\b", stripped))
 
 
+def _body_paints_no_content(
+    body: bytes,
+    *,
+    font_code_maps: dict[str, FontCodeMap] | None = None,
+    initial_font: str | None = None,
+) -> bool:
+    """True when a block draws no image and shows nothing but whitespace."""
+    if _mcid_body_has_image(body):
+        return False
+    decoded = _decode_shown_text_in_order(
+        body, font_code_maps=font_code_maps, initial_font=initial_font
+    )
+    return decoded is not None and not decoded.strip()
+
+
 def _orphan_marked_spoken_text(
     tag: str,
     body: bytes,
@@ -1133,6 +1184,12 @@ def _orphan_marked_spoken_text(
         return None
     text = re.sub(r"\s+", " ", decoded).strip()
     if tag == "Span":
+        if not text and not _mcid_body_has_image(body):
+            # A Span showing nothing but spaces paints no content. An empty
+            # decode is the answer box for a /Lbl, where an empty label IS
+            # the box, but here it would speak a word over a page that shows
+            # none: the caller retags these /Artifact instead.
+            return None
         return _spoken_list_label_text(text)
     if tag != "Table":
         return None
@@ -1152,6 +1209,8 @@ def _orphan_marked_spoken_text(
 def _pair_orphan_table_image_labels(
     data: bytes,
     struct_mcids: set[int],
+    *,
+    font_code_maps: dict[str, FontCodeMap] | None = None,
 ) -> dict[int, str]:
     labels: dict[int, str] = {}
     orphans = [
@@ -1165,8 +1224,10 @@ def _pair_orphan_table_image_labels(
         block = _get_mcid_block(data, mcid)
         if block is None or not _mcid_body_has_image(block[1]):
             continue
-        decoded = _decode_label_mcid_text(block[1]).strip()
-        if decoded and not re.fullmatch(r"_+", decoded):
+        decoded = _decode_label_mcid_text(
+            block[1], font_code_maps=font_code_maps
+        )
+        if decoded and not re.fullmatch(r"_+", decoded.strip()):
             continue
         for next_mcid, next_tag in orphans[index + 1 :]:
             if next_tag != "Span":
@@ -1175,7 +1236,9 @@ def _pair_orphan_table_image_labels(
             if next_block is None:
                 continue
             spoken = _spoken_list_label_text(
-                _decode_label_mcid_text(next_block[1])
+                _decode_label_mcid_text(
+                    next_block[1], font_code_maps=font_code_maps
+                )
             )
             if spoken and spoken != "blank":
                 labels[mcid] = spoken
@@ -1201,8 +1264,10 @@ def _repair_orphan_marked_content_actualtext(
             mcid for pg, mcid in owned_page_mcids if pg == page.obj.objgen
         } | wildcard_mcids
         artifact_names = _artifact_drawn_xobject_names(data)
-        table_image_labels = _pair_orphan_table_image_labels(data, struct_mcids)
         font_code_maps = _page_font_code_maps(page)
+        table_image_labels = _pair_orphan_table_image_labels(
+            data, struct_mcids, font_code_maps=font_code_maps
+        )
         page_changed = False
         new_data = data
         for mcid, tag in _iter_bdc_mcids_on_page(data):
@@ -1277,7 +1342,14 @@ def _repair_orphan_marked_content_actualtext(
                         f"orphan MCID {mcid}: retagged Table to /Artifact"
                     )
                 continue
-            if tag == "Span" and _body_is_decorative_paths(body):
+            if tag == "Span" and (
+                _body_is_decorative_paths(body)
+                or _body_paints_no_content(
+                    body,
+                    font_code_maps=font_code_maps,
+                    initial_font=_font_in_effect_at(new_data, block[0]),
+                )
+            ):
                 new_data, changed = _retag_orphan_bdc_as_artifact(new_data, mcid)
                 if changed:
                     page_changed = True
@@ -1467,6 +1539,64 @@ def _repair_nested_li_figure_alt(
                         break
 
         for child in _struct_child_dicts(obj):
+            walk(child)
+
+    walk(struct_root)
+    return updated
+
+
+def _struct_has_page_content(obj: pikepdf.Dictionary) -> bool:
+    kids = obj.get("/K")
+    items: list[pikepdf.Object] = []
+    if isinstance(kids, pikepdf.Array):
+        for kid in kids:
+            if isinstance(kid, pikepdf.Array):
+                items.extend(kid)
+            else:
+                items.append(kid)
+    elif kids is not None:
+        items.append(kids)
+    for item in items:
+        if not isinstance(item, pikepdf.Dictionary):
+            return True
+        if "/MCID" in item or item.get("/Type") == "/OBJR":
+            return True
+        if item.get("/S") is not None and _struct_has_page_content(item):
+            return True
+    return False
+
+
+def _repair_contentless_alt(
+    pdf: pikepdf.Pdf,
+    *,
+    actions: list[str],
+) -> int:
+    """Drop /Alt and /ActualText from struct elements that own no page content.
+
+    Word leaves empty /Span elements with a single-space /ActualText inside
+    text boxes. Acrobat fails them under "Alternate Text: Associated with
+    content" because the text replaces nothing on any page.
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return 0
+
+    updated = 0
+
+    def walk(obj: pikepdf.Dictionary) -> None:
+        nonlocal updated
+        for child in _struct_child_dicts(obj):
+            if child.get("/S") is None:
+                continue
+            keys = [key for key in ("/Alt", "/ActualText") if key in child]
+            if keys and not _struct_has_page_content(child):
+                for key in keys:
+                    del child[key]
+                updated += 1
+                actions.append(
+                    f"removed {'/'.join(k.lstrip('/') for k in keys)} from empty "
+                    f"{str(child['/S']).lstrip('/')} with no page content"
+                )
             walk(child)
 
     walk(struct_root)
@@ -2584,6 +2714,7 @@ def repair_marked_content_actualtext(
 
         walk(struct_root)
         _repair_nested_li_figure_alt(pdf, actions=actions)
+        _repair_contentless_alt(pdf, actions=actions)
         _repair_extra_char_span_nested_alt(pdf, actions=actions)
         mcids_updated += _repair_list_image_labels(pdf, actions=actions)
         mcids_updated += _repair_list_item_label_actualtext(pdf, actions=actions)

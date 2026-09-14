@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 
 import pikepdf
 
@@ -113,18 +114,111 @@ def strip_suspicious_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[Suspiciou
         return output.getvalue(), stripped
 
 
+def _struct_children(obj: pikepdf.Dictionary) -> list[pikepdf.Dictionary]:
+    kids = obj.get("/K")
+    children: list[pikepdf.Dictionary] = []
+    if isinstance(kids, pikepdf.Array):
+        for kid in kids:
+            if isinstance(kid, pikepdf.Dictionary):
+                children.append(kid)
+            elif isinstance(kid, pikepdf.Array):
+                children.extend(n for n in kid if isinstance(n, pikepdf.Dictionary))
+    elif isinstance(kids, pikepdf.Dictionary):
+        children.append(kids)
+    return [child for child in children if child.get("/S") is not None]
+
+
+def _clear_descendant_alt(figure: pikepdf.Dictionary) -> list[str]:
+    """Drop /Alt and /ActualText from every struct element under a Figure.
+
+    Acrobat's "Nested alternate text" rule fails an element whose alternate
+    text encloses more alternate text, so a Figure can only receive /Alt once
+    nothing beneath it speaks for itself. Word exports leave /ActualText on the
+    Spans inside a figure (mostly single spaces and mis-mapped math glyphs).
+    Returns the texts removed, in tree order, so the caller can fold anything
+    meaningful into the Figure's own alt.
+    """
+    removed: list[str] = []
+
+    def walk(obj: pikepdf.Dictionary) -> None:
+        for child in _struct_children(obj):
+            for key in ("/Alt", "/ActualText"):
+                if key in child:
+                    removed.append(str(child[key]))
+                    del child[key]
+            walk(child)
+
+    walk(figure)
+    return removed
+
+
+def _meaningful_fragments(texts: list[str]) -> list[str]:
+    """Keep only removed texts that carry a Latin letter or digit.
+
+    Whitespace and Word's private-use glyph echoes (Ethiopic or Greek code
+    points standing in for Cambria Math parentheses) say nothing useful.
+    """
+    fragments: list[str] = []
+    for text in texts:
+        cleaned = " ".join(text.split())
+        if cleaned and re.search(r"[A-Za-z0-9]", cleaned) and cleaned not in fragments:
+            fragments.append(cleaned)
+    return fragments
+
+
+def _has_page_content(obj: pikepdf.Dictionary) -> bool:
+    """True when some marked content or annotation sits under this element."""
+    kids = obj.get("/K")
+    items: list[pikepdf.Object] = []
+    if isinstance(kids, pikepdf.Array):
+        for kid in kids:
+            if isinstance(kid, pikepdf.Array):
+                items.extend(kid)
+            else:
+                items.append(kid)
+    elif kids is not None:
+        items.append(kids)
+    for item in items:
+        if not isinstance(item, pikepdf.Dictionary):
+            return True
+        if "/MCID" in item or item.get("/Type") == "/OBJR":
+            return True
+        if item.get("/S") is not None and _has_page_content(item):
+            return True
+    return False
+
+
+def _remove_child(parent: pikepdf.Dictionary, child: pikepdf.Dictionary) -> None:
+    kids = parent.get("/K")
+    if isinstance(kids, pikepdf.Dictionary):
+        if kids.objgen == child.objgen:
+            del parent["/K"]
+        return
+    if not isinstance(kids, pikepdf.Array):
+        return
+    for index in range(len(kids) - 1, -1, -1):
+        kid = kids[index]
+        if isinstance(kid, pikepdf.Dictionary) and kid.objgen == child.objgen:
+            del kids[index]
+
+
 def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
     """Set /Alt (and /Contents when absent) on figures missing alt text.
 
+    Any /Alt or /ActualText under the figure is removed first, so the new alt
+    does not nest over it; readable fragments of that text join the fallback.
+    A figure with no page content at all is dropped from the tree instead,
+    because Acrobat fails alternate text that is not associated with content.
     Returns updated PDF bytes and 1-based figure indices that were repaired.
     """
     repaired: list[int] = []
+    removed_empty = 0
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
         figure_index = 0
 
-        def walk(obj: pikepdf.Object) -> None:
-            nonlocal figure_index
+        def walk(obj: pikepdf.Object, parent: pikepdf.Dictionary | None) -> None:
+            nonlocal figure_index, removed_empty
             if not isinstance(obj, pikepdf.Dictionary):
                 return
             if obj.get("/S") == "/Figure":
@@ -132,31 +226,39 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
                 alt = obj.get("/Alt")
                 alt_text = str(alt).strip() if alt is not None else ""
                 if not alt_text:
+                    if parent is not None and not _has_page_content(obj):
+                        _remove_child(parent, obj)
+                        removed_empty += 1
+                        return
+                    removed = _clear_descendant_alt(obj)
                     contents = obj.get("/Contents")
                     fallback = str(contents).strip() if contents is not None else ""
                     if not fallback:
+                        fragments = _meaningful_fragments(removed)
                         fallback = f"Figure {figure_index}"
+                        if fragments:
+                            fallback = f"{fallback}: {' '.join(fragments)}"
                     obj["/Alt"] = pikepdf.String(fallback)
                     if contents is None:
                         obj["/Contents"] = pikepdf.String(fallback)
                     repaired.append(figure_index)
             kids = obj.get("/K")
             if isinstance(kids, pikepdf.Array):
-                for kid in kids:
+                for kid in list(kids):
                     if isinstance(kid, pikepdf.Dictionary):
-                        walk(kid)
+                        walk(kid, obj)
                     elif isinstance(kid, pikepdf.Array):
-                        for nested in kid:
+                        for nested in list(kid):
                             if isinstance(nested, pikepdf.Dictionary):
-                                walk(nested)
+                                walk(nested, obj)
             elif isinstance(kids, pikepdf.Dictionary):
-                walk(kids)
+                walk(kids, obj)
 
         struct_root = pdf.Root.get("/StructTreeRoot")
         if struct_root is not None:
-            walk(struct_root)
+            walk(struct_root, None)
 
-        if not repaired:
+        if not repaired and not removed_empty:
             return pdf_bytes, repaired
         output = io.BytesIO()
         pdf.save(output)
