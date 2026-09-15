@@ -15,9 +15,13 @@ from pathlib import Path
 
 import pikepdf
 
+from lib.test_glyph_evidence import MINUS_GID, MINUS_RECORD, _truetype_program
 from lib.marked_content_actualtext_sweep import (
+    FontState,
     _decode_pdf_actualtext_value,
     _decode_label_mcid_text,
+    _decode_shown_text_in_order,
+    _font_in_effect_at,
     _get_mcid_block,
     _inject_actualtext_in_data,
     _inject_actualtext_on_page,
@@ -152,9 +156,13 @@ def _page_contents_text(pdf_bytes: bytes) -> str:
 
 
 def _type0_font(
-    pdf: pikepdf.Pdf, bfchars: dict[str, str]
+    pdf: pikepdf.Pdf, bfchars: dict[str, str], program: bytes | None = None
 ) -> pikepdf.Dictionary:
-    """An Identity-H font whose /ToUnicode names the given codes."""
+    """An Identity-H font whose /ToUnicode names the given codes.
+
+    With a program, the font embeds it as a CIDFontType2 with identity
+    glyph ids, the shape Word gives Cambria Math.
+    """
     entries = "\n".join(f"<{src}> <{dst}>" for src, dst in bfchars.items())
     cmap = (
         "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n"
@@ -162,17 +170,32 @@ def _type0_font(
         f"{len(bfchars)} beginbfchar\n{entries}\nendbfchar\n"
         "endcmap end end"
     )
-    return pdf.make_indirect(
-        pikepdf.Dictionary(
-            {
-                "/Type": pikepdf.Name("/Font"),
-                "/Subtype": pikepdf.Name("/Type0"),
-                "/BaseFont": pikepdf.Name("/ArialMT"),
-                "/Encoding": pikepdf.Name("/Identity-H"),
-                "/ToUnicode": pdf.make_stream(cmap.encode("latin1")),
-            }
-        )
+    font = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/Font"),
+            "/Subtype": pikepdf.Name("/Type0"),
+            "/BaseFont": pikepdf.Name("/ArialMT"),
+            "/Encoding": pikepdf.Name("/Identity-H"),
+            "/ToUnicode": pdf.make_stream(cmap.encode("latin1")),
+        }
     )
+    if program is not None:
+        font["/BaseFont"] = pikepdf.Name("/ABCDEF+CambriaMath")
+        font["/DescendantFonts"] = pikepdf.Array(
+            [
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/Font"),
+                        "/Subtype": pikepdf.Name("/CIDFontType2"),
+                        "/CIDToGIDMap": pikepdf.Name("/Identity"),
+                        "/FontDescriptor": pikepdf.Dictionary(
+                            {"/FontFile2": pdf.make_stream(program)}
+                        ),
+                    }
+                )
+            ]
+        )
+    return pdf.make_indirect(font)
 
 
 def _actualtext_for_mcid(contents: str, mcid: int) -> str | None:
@@ -2114,6 +2137,86 @@ class UnnamedGlyphTests(unittest.TestCase):
         )
         self.assertFalse(changed)
         self.assertEqual(repaired, data)
+
+    def test_private_use_code_is_named_from_the_glyph_outline(self) -> None:
+        # business-statistics 2026-09-15: Word maps the Cambria Math glyphs
+        # its equation layout substitutes to U+F000..; the embedded subset
+        # keeps their outlines at the full font's ids. Code 0D46 (minus) is
+        # named from its outline, code 0003 (no outline) reads as a space,
+        # and the CMap's own "0042" for code 0041 is never overridden.
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        program = _truetype_program({MINUS_GID: MINUS_RECORD})
+        page["/Resources"] = pikepdf.Dictionary(
+            {
+                "/Font": pikepdf.Dictionary(
+                    {
+                        "/C2_0": _type0_font(
+                            pdf, {"0D46": "F000", "0041": "0042"}, program
+                        ),
+                        "/C2_1": _type0_font(pdf, {"0D46": "F000"}),
+                    }
+                )
+            }
+        )
+        maps = _page_font_code_maps(page)
+        self.assertEqual(
+            _decode_shown_text_in_order(
+                b"BT /C2_0 1 Tf <0D4600030041> Tj ET", font_code_maps=maps
+            ),
+            "\u2212 B",
+        )
+        # Without a program there is no evidence, and the block stays unread.
+        self.assertIsNone(
+            _decode_shown_text_in_order(
+                b"BT /C2_1 1 Tf <0D46> Tj ET", font_code_maps=maps
+            )
+        )
+
+    def test_orphan_span_of_private_use_glyphs_gets_actualtext(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        program = _truetype_program({MINUS_GID: MINUS_RECORD})
+        page["/Resources"] = pikepdf.Dictionary(
+            {
+                "/Font": pikepdf.Dictionary(
+                    {"/C2_0": _type0_font(pdf, {"0D46": "F000", "0035": "0035"}, program)}
+                )
+            }
+        )
+        page["/Contents"] = pdf.make_stream(
+            b"BT /C2_0 1 Tf /Span<</MCID 5 >> BDC <0D460035> Tj EMC ET "
+            b"BT /P<</MCID 1 >> BDC (body) Tj EMC ET"
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([_struct_elem("P", K=1, Pg=page.obj)]),
+            }
+        )
+        repaired, result = repair_marked_content_actualtext(_save(pdf))
+        self.assertEqual(
+            _read_actualtext_from_mcid(_page_contents_text(repaired).encode("latin1"), 5),
+            "\u22125",
+        )
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
+
+    def test_block_opening_with_q_paints_with_the_restored_font(self) -> None:
+        # a753fab4 p3 MCID 57: the block starts with `Q Q Q`, so its text
+        # shows in the font the outer state saved, not the one in effect at
+        # the BDC. The q-stack travels with the font.
+        data = b"BT /C2_0 1 Tf q /T1_0 1 Tf q /T1_1 1 Tf /Span<</MCID 5 >> BDC Q Q <0041> Tj EMC"
+        state = _font_in_effect_at(data, data.index(b"/Span"))
+        self.assertEqual(state, FontState("T1_1", ("C2_0", "T1_0")))
+        maps = {"C2_0": ({b"\x00\x41": "A"}, (2,))}
+        body = b"Q Q <0041> Tj"
+        self.assertEqual(
+            _decode_shown_text_in_order(body, font_code_maps=maps, initial_font=state),
+            "A",
+        )
+        self.assertIsNone(
+            _decode_shown_text_in_order(body, font_code_maps=maps, initial_font="T1_1")
+        )
 
 
 class PagelessAltContentTests(unittest.TestCase):

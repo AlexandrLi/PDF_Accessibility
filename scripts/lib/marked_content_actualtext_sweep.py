@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import asdict, dataclass
+from typing import NamedTuple
 
 import pikepdf
 import pymupdf
@@ -15,6 +16,7 @@ from lib.figure_alt_quality import (
     struct_class_names,
 )
 from lib.figure_to_table_sweep import _parse_column_headers, _parse_table_rows
+from lib.glyph_evidence import glyph_evidence_text
 from lib.inline_formula_sweep import expand_inline_formula_alt
 
 
@@ -658,11 +660,69 @@ def _tounicode_text(dst: str) -> str | None:
     return text
 
 
+def _identity_truetype_program(font: pikepdf.Dictionary) -> bytes | None:
+    """The embedded TrueType program of a font whose 2-byte codes are glyph ids."""
+    if font.get("/Subtype") != "/Type0" or not str(font.get("/Encoding", "")).startswith(
+        "/Identity"
+    ):
+        return None
+    descendants = font.get("/DescendantFonts")
+    if not isinstance(descendants, pikepdf.Array) or not len(descendants):
+        return None
+    descendant = descendants[0]
+    if not isinstance(descendant, pikepdf.Dictionary):
+        return None
+    if descendant.get("/Subtype") != "/CIDFontType2":
+        return None
+    cid_to_gid = descendant.get("/CIDToGIDMap")
+    if cid_to_gid is not None and cid_to_gid != "/Identity":
+        return None
+    descriptor = descendant.get("/FontDescriptor")
+    program = (
+        descriptor.get("/FontFile2") if isinstance(descriptor, pikepdf.Dictionary) else None
+    )
+    if not isinstance(program, pikepdf.Stream):
+        return None
+    try:
+        return program.read_bytes()
+    except pikepdf.PdfError:
+        return None
+
+
+class _GlyphEvidenceCodeMap(dict):
+    """A code map that names, on demand, the codes the CMap left unnamed.
+
+    Word maps the Cambria Math glyphs its equation layout reaches through
+    OpenType substitutions to Private Use characters, which the CMap parse
+    refuses. The embedded program still holds each glyph's outline, so a
+    code without a spoken destination is looked up there (see
+    lib.glyph_evidence) the first time a show op uses it. A destination the
+    CMap does name is never overridden.
+    """
+
+    def __init__(self, mapping: dict[bytes, str], program: bytes) -> None:
+        super().__init__(mapping)
+        self._program = program
+
+    def __missing__(self, code: bytes) -> str:
+        text = (
+            glyph_evidence_text(self._program, int.from_bytes(code, "big"))
+            if len(code) == 2
+            else None
+        )
+        if text is None:
+            raise KeyError(code)
+        self[code] = text
+        return text
+
+
 def _font_code_map(font: object) -> FontCodeMap | None:
     """Build a glyph-code → text map from a font's /ToUnicode CMap.
 
     Returns None for a font without a readable CMap, so hex strings shown
     with it stay undecodable (and the block keeps its glyphs unsilenced).
+    An Identity TrueType font with a CMap also answers for codes the CMap
+    leaves unnamed, from the glyph outlines in its embedded program.
     """
     if not isinstance(font, pikepdf.Dictionary):
         return None
@@ -703,6 +763,9 @@ def _font_code_map(font: object) -> FontCodeMap | None:
                 spoken = _tounicode_text(format(base + offset, f"0{len(scalar)}X"))
                 if spoken is not None:
                     mapping[(first + offset).to_bytes(width, "big")] = spoken
+    program = _identity_truetype_program(font)
+    if program is not None:
+        return _GlyphEvidenceCodeMap(mapping, program), (2,)
     if not mapping:
         return None
     encoding = font.get("/Encoding")
@@ -748,10 +811,14 @@ def _decode_hex_string_with_font(hex_body: str, code_map: FontCodeMap) -> str | 
     while index < len(data):
         for width in widths:
             code = data[index : index + width]
-            if len(code) == width and code in mapping:
+            if len(code) != width:
+                continue
+            try:
                 parts.append(mapping[code])
-                index += width
-                break
+            except KeyError:
+                continue
+            index += width
+            break
         else:
             return None
     return "".join(parts)
@@ -765,8 +832,19 @@ _FONT_STATE_TOKEN = re.compile(
 )
 
 
-def _font_in_effect_at(data: bytes, offset: int) -> str | None:
-    """Return the font resource name selected when the stream reaches offset."""
+class FontState(NamedTuple):
+    """The font a show op paints with, and the fonts pending `Q` restores."""
+
+    font: str | None
+    stack: tuple[str | None, ...] = ()
+
+
+def _font_in_effect_at(data: bytes, offset: int) -> FontState:
+    """Return the font state the stream has reached at offset.
+
+    A block that opens with `Q` paints with the font of the state it
+    restores, so the q-stack travels with the current font.
+    """
     text = data[:offset].decode("latin1", errors="replace")
     font: str | None = None
     stack: list[str | None] = []
@@ -778,14 +856,14 @@ def _font_in_effect_at(data: bytes, offset: int) -> str | None:
                 font = stack.pop()
         elif token.group("font"):
             font = token.group("font")
-    return font
+    return FontState(font, tuple(stack))
 
 
 def _decode_shown_text_in_order(
     body: bytes,
     *,
     font_code_maps: dict[str, FontCodeMap] | None = None,
-    initial_font: str | None = None,
+    initial_font: str | FontState | None = None,
 ) -> str | None:
     """Concatenate every text-show string in content-stream order.
 
@@ -797,8 +875,10 @@ def _decode_shown_text_in_order(
     """
     text = body.decode("latin1", errors="replace")
     parts: list[str] = []
-    font = initial_font
-    stack: list[str | None] = []
+    if isinstance(initial_font, FontState):
+        font, stack = initial_font.font, list(initial_font.stack)
+    else:
+        font, stack = initial_font, []
     for token in _FONT_STATE_TOKEN.finditer(text):
         if token.group("push"):
             stack.append(font)
@@ -1183,7 +1263,7 @@ def _body_paints_no_content(
     body: bytes,
     *,
     font_code_maps: dict[str, FontCodeMap] | None = None,
-    initial_font: str | None = None,
+    initial_font: str | FontState | None = None,
 ) -> bool:
     """True when a block draws no image and shows nothing but whitespace."""
     if _mcid_body_has_image(body):
@@ -1201,7 +1281,7 @@ def _orphan_marked_spoken_text(
     *,
     table_image_labels: dict[int, str] | None = None,
     font_code_maps: dict[str, FontCodeMap] | None = None,
-    initial_font: str | None = None,
+    initial_font: str | FontState | None = None,
 ) -> str | None:
     # Block-level /ActualText silences every glyph in the block, so the
     # spoken text must decode ALL of them; bail out when any show op is

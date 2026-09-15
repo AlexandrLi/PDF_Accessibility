@@ -31,6 +31,8 @@ SWEEP_MODULES = (
     "character_encoding_sweep.py",
     "document_title_sweep.py",
     "figure_alt_sweep.py",
+    "glyph_evidence.py",
+    "data/cambria_math_glyphs.json",
     "heading_nesting_sweep.py",
     "inline_formula_sweep.py",
     "layout_table_sweep.py",
