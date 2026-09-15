@@ -28,6 +28,8 @@ PASS_RE = re.compile(r"^- \*\*(?P<title>Chapter [^*]+)\*\* \(chapter PDF passes\
 DONE_NOTE_RE = re.compile(r"\((done [^)]*)\)\s*$")
 TRAIL_NOTE_RE = re.compile(r"\s\(([^()]*(?:\([^()]*\)[^()]*)*)\)\s*$")
 DATE_RE = re.compile(r"\b(20\d\d-\d\d-\d\d)\b")
+# A row ticked because no file exists to fix, per the tracker legend.
+NOFILE_RE = re.compile(r"no preview to fix", re.I)
 
 # Reference sections in the order they appear at the bottom; the rest of the
 # markdown headings are dropped from the page (the board replaces the Summary
@@ -124,6 +126,7 @@ def parse(md: str):
                     "done": m.group("done").lower() == "x",
                     "text": rest,
                     "note": note_text,
+                    "nofile": bool(note_text and NOFILE_RE.search(note_text)),
                     "topics": [],
                 }
                 if m.group("indent"):
@@ -137,7 +140,7 @@ def parse(md: str):
                 continue
             pm = PASS_RE.match(ln)
             if pm:
-                item = {"kind": "passes", "text": pm.group("title"), "topics": [], "done": None}
+                item = {"kind": "passes", "text": pm.group("title"), "topics": [], "done": None, "nofile": False}
                 items.append(item)
                 stack = [item]
                 continue
@@ -160,15 +163,16 @@ def summary_by_course(prose: dict) -> dict:
 
 
 def count(items):
-    done = total = 0
+    """(done, total, nofile): nofile rows are counted done, and also on their own."""
+    done = total = nofile = 0
     for it in items:
-        if it["kind"] != "passes":
+        rows = [it] if it["kind"] != "passes" else []
+        rows += it["topics"]
+        for r in rows:
             total += 1
-            done += it["done"]
-        for t in it["topics"]:
-            total += 1
-            done += t["done"]
-    return done, total
+            done += r["done"]
+            nofile += r["done"] and r["nofile"]
+    return done, total, nofile
 
 
 def last_event(about: str) -> str:
@@ -198,8 +202,9 @@ header .sub{color:var(--muted);font-size:.85rem;margin-top:.3rem}
 .total{display:grid;grid-template-columns:auto 1fr;gap:.2rem .9rem;align-items:center;min-width:min(100%,360px)}
 .total .big{font-size:2rem;font-weight:600;font-variant-numeric:tabular-nums;line-height:1;grid-row:span 2}
 .total .cap{color:var(--muted);font-size:.8rem}
-.bar{display:block;height:6px;width:100%;background:var(--panel-2);border-radius:3px;overflow:hidden}
+.bar{display:flex;height:6px;width:100%;background:var(--panel-2);border-radius:3px;overflow:hidden}
 .bar .fill{display:block;height:100%;background:var(--pass)}
+.bar .fill-na{display:block;height:100%;background:repeating-linear-gradient(135deg,var(--done) 0 2px,transparent 2px 5px)}
 .controls{display:flex;flex-wrap:wrap;gap:.6rem 1.4rem;align-items:center;font-size:.85rem;color:var(--ink-2);margin-block:.4rem .8rem}
 .controls label{display:inline-flex;gap:.4rem;align-items:center;cursor:pointer}
 .controls .legend{display:inline-flex;flex-wrap:wrap;gap:.3rem .9rem;color:var(--muted);margin-left:auto}
@@ -236,10 +241,13 @@ code.id{font-size:.72rem;color:var(--muted);background:var(--panel-2);user-selec
 .item .note{margin-left:1.5rem;font-size:.76rem;color:var(--muted)}
 .item.done .note{color:var(--pass)}
 .item.done .ttl{color:var(--done);text-decoration:line-through} .item.done .fails{opacity:.5}
+.item.nofile .box,.item.nofile .note{color:var(--muted)}
+.item.nofile .ttl{text-decoration:none;font-style:italic}
 .tag{display:inline-block;font:500 .64rem/1 ui-monospace,Menlo,monospace;letter-spacing:.03em;padding:.22em .4em;border-radius:3px;vertical-align:middle;margin-left:.3em}
 .tag-fork{background:var(--accent-soft);color:var(--accent)} .tag-lambda{background:var(--lambda-soft);color:var(--lambda)}
 .tag-both{background:var(--fail-soft);color:var(--fail)}
 .lbl{font-size:.74rem;font-weight:600} .lbl-fail{color:var(--fail)} .lbl-pass{color:var(--pass)}
+.lbl-nofile{color:var(--muted);font-weight:500;border:1px dashed var(--line);border-radius:3px;padding:.05em .35em}
 body.hide-done ul.topics>li.done,body.hide-done ul.items>li>.item.done,body.hide-done .course.complete{display:none}
 body.hide-done ul.items>li.all-done{display:none}
 .ref{margin-top:2.5rem;border-top:1px solid var(--line);padding-top:.5rem}
@@ -278,25 +286,30 @@ JS = """
 
 
 def render_item(it, cls):
-    box = "[x]" if it["done"] else "[ ]"
+    box = "[-]" if it["nofile"] else ("[x]" if it["done"] else "[ ]")
     label, _, fails = it["text"].partition(": ") if it["kind"] == "topic" else it["text"].partition(" chapter PDF fails: ")
     fails_html = inline(fails)
     if it["kind"] == "ch":
         fails_html = '<span class="lbl lbl-fail">chapter PDF fails</span> ' + fails_html
     note = f'<div class="note">{esc(it["note"])}</div>' if it["note"] else ""
+    chip = '<span class="lbl lbl-nofile" title="No file exists to fix, so the row counts as finished">no preview to fix</span>' if it["nofile"] else ""
     return (
-        f'<div class="item {cls}{" done" if it["done"] else ""}"><div class="head"><span class="box">{box}</span>'
+        f'<div class="item {cls}{" done" if it["done"] else ""}{" nofile" if it["nofile"] else ""}">'
+        f'<div class="head"><span class="box">{box}</span>'
         f'<span class="ttl">{inline(label)}</span>'
-        f'<code class="id" title="{"chapter" if it["kind"] == "ch" else "topic"} id, workbook row {it["row"]}">{esc(it["id"])}</code></div>'
+        f'<code class="id" title="{"chapter" if it["kind"] == "ch" else "topic"} id, workbook row {it["row"]}">{esc(it["id"])}</code>{chip}</div>'
         f'<div class="fails">{fails_html}</div>{note}</div>'
     )
 
 
 def render_course(c, summary):
     cid = c["id"]
-    done, total = count(c["items"])
-    pct = f"{100 * done / total if total else 0:.0f}%"
+    done, total, nofile = count(c["items"])
+    pct = f"{100 * (done - nofile) / total if total else 0:.0f}%"
+    na_pct = f"{100 * nofile / total if total else 0:.0f}%"
     complete = " complete" if total and done == total else ""
+    num_title = f' title="{nofile} of the {done} counted finished have no preview to fix"' if nofile else ""
+    na_bar = f'<span class="fill-na" style="width:{na_pct}" title="no preview to fix"></span>' if nofile else ""
     fail_cells, top_rules = summary.get(cid, ("", ""))
     rows = []
     for it in c["items"]:
@@ -313,8 +326,9 @@ def render_course(c, summary):
     return (
         f'<details class="course{complete}" id="c-{cid}"><summary>'
         f'<span class="name mono">{esc(cid)}</span>'
-        f'<span class="num">{done} / {total}</span>'
-        f'<span class="bar"><span class="fill" style="width:{pct}"></span></span>'
+        f'<span class="num"{num_title}>{done} / {total}{" *" if nofile else ""}</span>'
+        f'<span class="bar"><span class="fill" style="width:{pct}"></span>'
+        f'{na_bar}</span>'
         f'<span class="rules" title="{esc(top_rules)}">{esc(top_rules)}</span>'
         f'<span class="when">{esc(last_event(c["about"]))}</span>'
         f'</summary><div class="course-body">{log}<ul class="items">{"".join(rows)}</ul></div></details>'
@@ -324,18 +338,20 @@ def render_course(c, summary):
 def render(md: str, src_label: str) -> str:
     title, prose, courses = parse(md)
     summary = summary_by_course(prose)
-    grand_done = grand_total = 0
+    grand_done = grand_total = grand_nofile = 0
     scored = []
     for c in courses:
-        done, total = count(c["items"])
+        done, total, nofile = count(c["items"])
         grand_done += done
         grand_total += total
+        grand_nofile += nofile
         scored.append((total - done, c))
     # Courses in id order; finished courses sink to the bottom, also in id order.
     scored.sort(key=lambda x: (x[0] == 0, x[1]["id"]))
     board = "".join(render_course(c, summary) for _, c in scored)
     open_courses = sum(1 for n, _ in scored if n)
     gpct = f"{100 * grand_done / grand_total if grand_total else 0:.0f}%"
+    na_cap = f" ({grand_nofile} with no preview to fix)" if grand_nofile else ""
     ref = []
     for name in BOTTOM_SECTIONS:
         if name not in prose:
@@ -351,12 +367,12 @@ def render(md: str, src_label: str) -> str:
 <div class="page">
 <header>
  <div><h1>{esc(title)}</h1><div class="sub">Rendered {date.today().isoformat()} from {esc(src_label)}. Read only: tick rows in the markdown and re-render.</div></div>
- <div class="total"><span class="big">{gpct}</span><span class="cap">{grand_done} of {grand_total} rows done, {open_courses} of {len(courses)} courses still open</span><span class="bar"><span class="fill" style="width:{gpct}"></span></span></div>
+ <div class="total"><span class="big">{gpct}</span><span class="cap">{grand_done} of {grand_total} rows done{na_cap}, {open_courses} of {len(courses)} courses still open</span><span class="bar"><span class="fill" style="width:{gpct}"></span></span></div>
 </header>
 <div class="controls">
  <label><input type="checkbox" id="hide-done"> Hide done rows</label>
  <button type="button" id="open-all">Expand all</button><button type="button" id="close-all">Collapse all</button>
- <span class="legend"><span><span class="tag tag-fork">fork</span> topic fix</span><span><span class="tag tag-lambda">lambda</span> chapter merge fix</span><span><span class="tag tag-both">both</span> topic fix plus re-wrap</span></span>
+ <span class="legend"><span><span class="mono">[-]</span> no preview to fix, counted finished</span><span><span class="tag tag-fork">fork</span> topic fix</span><span><span class="tag tag-lambda">lambda</span> chapter merge fix</span><span><span class="tag tag-both">both</span> topic fix plus re-wrap</span></span>
 </div>
 <div class="board">
  <div class="board-head"><span>Course</span><span>Done / rows</span><span>Progress</span><span>Top failing rules</span><span style="text-align:right">Last event</span></div>

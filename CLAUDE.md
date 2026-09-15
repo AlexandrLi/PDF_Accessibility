@@ -149,6 +149,16 @@ an artifact.
   commit that fixed it, and re-render the HTML so the marks carry over.
   Pushed but neither high confidence nor approved by the user stays unticked.
 - If a row is partly fixed, edit the rule list on the line instead of ticking.
+- A row with no file behind it is ticked without asking, with the note `no
+  preview to fix` (user decision 2026-09-15). A topic whose course JSON carries
+  no `pdfAvailable` flag has no `topic_pdfs/{topicId}.pdf` to sweep and adds
+  nothing to its chapter book, so the workbook FAIL cannot be cleared here.
+  Those rows count as finished instead of staying open and distracting from the
+  ones that can be fixed. Check the course JSON and the dev key before ticking,
+  say so in the note, and put the row back to `- [ ]` if a preview appears.
+  Confirmed 2026-09-15 that intro-bio `0347d268` and `eceff217` are the only
+  such rows in the tracker, and that every open chapter row still has topics
+  with a preview.
 - Record course-level events (sweep date, push date, re-wrap date, sheet
   re-validated on) in the sentence under the course heading.
 - Rows are permanent. A row that fails again after being ticked goes back to
