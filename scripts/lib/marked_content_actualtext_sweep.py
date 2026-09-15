@@ -1282,13 +1282,19 @@ def _repair_orphan_marked_content_actualtext(
                 if block is None:
                     continue
                 body = block[2]
-                if _body_has_show_ops(body):
+                paints_nothing = _body_paints_no_content(
+                    body,
+                    font_code_maps=font_code_maps,
+                    initial_font=_font_in_effect_at(new_data, block[0]),
+                )
+                if _body_has_show_ops(body) and not paints_nothing:
                     # An orphan Figure that shows text needs a tree repair a
                     # sweep cannot infer; leave it for review, never silence it.
                     continue
                 draw_names = _body_xobject_names(body)
                 if draw_names and draw_names <= artifact_names or (
-                    not draw_names and _body_is_decorative_paths(body)
+                    not draw_names
+                    and (_body_is_decorative_paths(body) or paints_nothing)
                 ):
                     # The page draws the same XObject again as an /Artifact
                     # (Word exports draw one rasterized graphics layer once
@@ -1342,7 +1348,10 @@ def _repair_orphan_marked_content_actualtext(
                         f"orphan MCID {mcid}: retagged Table to /Artifact"
                     )
                 continue
-            if tag == "Span" and (
+            # Word draws table borders and cell shading as `re f*` fills in
+            # their own /Table blocks, and pads empty cells with one space;
+            # neither paints anything a reader could speak.
+            if not spoken and (
                 _body_is_decorative_paths(body)
                 or _body_paints_no_content(
                     body,
@@ -1355,7 +1364,7 @@ def _repair_orphan_marked_content_actualtext(
                     page_changed = True
                     updated += 1
                     actions.append(
-                        f"orphan MCID {mcid}: retagged decorative Span to /Artifact"
+                        f"orphan MCID {mcid}: retagged decorative {tag} to /Artifact"
                     )
                 continue
             if not spoken:

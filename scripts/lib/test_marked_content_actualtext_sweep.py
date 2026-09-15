@@ -1415,6 +1415,89 @@ class OrphanMarkedContentTests(unittest.TestCase):
         self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
 
 
+    def test_orphan_table_cell_fills_become_artifact(self) -> None:
+        # Word draws table borders and cell shading as `re f*` fills in
+        # orphan /Table blocks; the paths-only test looked for `m` alone.
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"q /Table<</MCID 5 >> BDC 0.557 0.667 0.859 rg "
+            b"463.18 652.78 111.5 27.48 re f* EMC "
+            b"q /Table<</MCID 6 >> BDC 10 10 100 50 re f* BT (Mass) Tj ET EMC "
+            b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+        )
+        body = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/P"),
+                "/K": 1,
+                "/Pg": page.obj,
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([body]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        repaired, result = repair_marked_content_actualtext(buf.getvalue())
+
+        self.assertIn(
+            "orphan MCID 5: retagged decorative Table to /Artifact", result.actions
+        )
+        self.assertIn(
+            "orphan MCID 6: injected /ActualText 'Mass' on Table", result.actions
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertIsNone(_get_mcid_block(data, 5))
+            self.assertIn(b"/Artifact BMC", data)
+            # The fill itself is still painted.
+            self.assertIn(b"463.18 652.78 111.5 27.48 re f*", data)
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
+
+    def test_orphan_table_showing_only_a_space_becomes_artifact(self) -> None:
+        # Word pads an empty table cell with one space in its own /Table
+        # block. It paints nothing, so it is neither spoken nor "blank".
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"q /Table<</MCID 5 >> BDC 465.19 600.1 109.46 58.44 re W* n "
+            b"BT 0 g /TT0 1 Tf 9.96 0 0 9.96 520.3 646.54 Tm ( )Tj ET EMC "
+            b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+        )
+        body = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/P"),
+                "/K": 1,
+                "/Pg": page.obj,
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([body]),
+            }
+        )
+        buf = io.BytesIO()
+        pdf.save(buf)
+
+        repaired, result = repair_marked_content_actualtext(buf.getvalue())
+
+        self.assertIn(
+            "orphan MCID 5: retagged decorative Table to /Artifact", result.actions
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertIsNone(_get_mcid_block(data, 5))
+            self.assertNotIn(b"blank", data)
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
+
+
 class OrphanFigureTests(unittest.TestCase):
     """Adobe Auto-Tag leaves /Figure marked content with a null ParentTree
     slot and no owning element; the sweep must artifact repeats the page
@@ -1503,6 +1586,25 @@ class OrphanFigureTests(unittest.TestCase):
             )
             self.assertIsNotNone(block)
             self.assertIn(b"/ActualText (Figure)", block.group(0))
+
+    def test_orphan_figure_showing_only_a_space_becomes_artifact(self) -> None:
+        # A fraction bar plus Word's padding space shows no text; only a
+        # non-whitespace decode makes an orphan Figure text-bearing.
+        pdf_bytes = self._build(
+            b"q /Figure<</MCID 5 >> BDC 498.7 625.06 10.26 0.66 re f* "
+            b"BT /TT4 1 Tf 10.02 0 0 10.02 508.96 622.54 Tm ( )Tj ET EMC "
+            b"q /P<</MCID 1 >> BDC (body) Tj EMC"
+        )
+        repaired, result = repair_marked_content_actualtext(pdf_bytes)
+        self.assertIn(
+            "orphan MCID 5: retagged decorative Figure to /Artifact",
+            result.actions,
+        )
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            data = _read_page_contents(opened.pages[0]["/Contents"])
+            self.assertIsNone(_get_mcid_block(data, 5))
+            self.assertIn(b"498.7 625.06 10.26 0.66 re f*", data)
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
 
     def test_orphan_figure_with_text_is_left_alone(self) -> None:
         pdf_bytes = self._build(
