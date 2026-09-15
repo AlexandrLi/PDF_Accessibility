@@ -9,7 +9,11 @@ from dataclasses import asdict, dataclass
 import pikepdf
 import pymupdf
 
-from lib.figure_alt_quality import looks_like_table_figure_alt, struct_class_names
+from lib.figure_alt_quality import (
+    classify_figure_alt,
+    looks_like_table_figure_alt,
+    struct_class_names,
+)
 from lib.figure_to_table_sweep import _parse_column_headers, _parse_table_rows
 from lib.inline_formula_sweep import expand_inline_formula_alt
 
@@ -193,6 +197,11 @@ def _mcid_body_shows_text(body: bytes) -> bool:
             if _decoded_literal_string(literal.group(0)[1:-1]).strip():
                 return True
     return False
+
+
+def _mcid_block_shows_text(data: bytes, mcid: int) -> bool:
+    block = _get_mcid_block_to_emc(data, mcid)
+    return block is not None and _mcid_body_shows_text(block[2])
 
 
 def _is_image_only_mcid_body(body: bytes) -> bool:
@@ -617,12 +626,32 @@ _BFRANGE_ENTRY = re.compile(
 FontCodeMap = tuple[dict[bytes, str], tuple[int, ...]]
 
 
+def _is_private_use(char: str) -> bool:
+    return 0xE000 <= ord(char) <= 0xF8FF
+
+
+def _is_encoding_placeholder(char: str) -> bool:
+    # The characterEncoding stage renames an unreliable /ToUnicode destination
+    # to a Box Drawing character so extraction stops yielding U+FFFD; the
+    # glyph is no better named than before.
+    return 0x2500 <= ord(char) <= 0x257F
+
+
 def _tounicode_text(dst: str) -> str | None:
     if len(dst) % 4:
         return None
     text = bytes.fromhex(dst).decode("utf-16-be", errors="replace")
+    # A Private Use codepoint is the font declining to name the glyph: Word
+    # maps Cambria Math's stretchy delimiters to U+F000-U+F004, which no
+    # reader can speak. Treat the code as unmapped so the block stays
+    # undecodable rather than guessing a delimiter or dropping it. The same
+    # goes for the placeholder the encoding stage swaps in on a later pass,
+    # or the second sweep would speak what the first refused.
     if any(
-        char == "\ufffd" or (ord(char) < 0x20 and not char.isspace())
+        char == "\ufffd"
+        or (ord(char) < 0x20 and not char.isspace())
+        or _is_private_use(char)
+        or _is_encoding_placeholder(char)
         for char in text
     ):
         return None
@@ -2033,6 +2062,10 @@ def _inject_actualtext_in_data(
     preferred_tag: bytes | None = None,
     replace_existing: bool = False,
 ) -> tuple[bytes, bool]:
+    if any(_is_private_use(char) for char in actual_text):
+        # Spoken text is derived from font evidence; a Private Use codepoint
+        # means there is none for this glyph, so nothing may be written.
+        return data, False
     actual_bytes = _pdf_literal_string(actual_text)
     pattern = re.compile(
         rb"/(?P<tag>" + _MCID_BDC_TAG + rb")\s*<<"
@@ -2577,6 +2610,384 @@ def list_untagged_image_mcids_missing_actualtext(pdf_bytes: bytes) -> list[str]:
     return labels
 
 
+def _reachable_struct_objgens(pdf: pikepdf.Pdf) -> set[tuple[int, int]]:
+    """Object ids of every struct element reached from the StructTreeRoot."""
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    reachable: set[tuple[int, int]] = set()
+    if struct_root is None:
+        return reachable
+
+    def walk(obj: pikepdf.Dictionary) -> None:
+        for child in _struct_child_dicts(obj):
+            if "/MCID" in child or child.get("/Type") == "/OBJR":
+                continue
+            if child.is_indirect:
+                if child.objgen in reachable:
+                    continue
+                reachable.add(child.objgen)
+            walk(child)
+
+    walk(struct_root)
+    return reachable
+
+
+def _struct_descends_from(
+    obj: pikepdf.Dictionary,
+    ancestor: pikepdf.Dictionary,
+) -> bool:
+    current: object = obj
+    for _ in range(64):
+        if not isinstance(current, pikepdf.Dictionary):
+            return False
+        if current.is_indirect and current.objgen == ancestor.objgen:
+            return True
+        current = current.get("/P")
+    return False
+
+
+def _page_named_for_descendants(
+    pdf: pikepdf.Pdf,
+    obj: pikepdf.Dictionary,
+    mcids: list[int],
+) -> pikepdf.Page | None:
+    """The one page whose ParentTree names obj or its descendants for mcids."""
+    matches: list[pikepdf.Page] = []
+    for page in pdf.pages:
+        named = 0
+        for mcid in mcids:
+            owner = _parent_tree_owner(pdf, page, mcid)
+            if owner is None:
+                continue
+            if not _struct_descends_from(owner, obj):
+                break
+            named += 1
+        else:
+            if named:
+                matches.append(page)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _repair_pageless_alt_content_page(
+    pdf: pikepdf.Pdf,
+    *,
+    actions: list[str],
+) -> int:
+    """Give a /Pg to an alternate-text element whose bare MCIDs name no page.
+
+    An earlier round rewrote reverted tables as /Figure /Alt "Table" with bare
+    MCIDs copied from the abandoned cell subtree and no /Pg anywhere up the
+    chain. Acrobat cannot find the content that alternate text replaces and
+    fails "Alternate text: Associated with content", and the sweeps here treat
+    the MCIDs as owned on every page, which hides real orphans. The page whose
+    ParentTree names this element's own descendants for those MCIDs is the
+    file's statement of where the content is.
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return 0
+    page_numbers = {page.obj.objgen: index for index, page in enumerate(pdf.pages, 1)}
+    updated = 0
+
+    def walk(obj: pikepdf.Dictionary, page: pikepdf.Object | None) -> None:
+        nonlocal updated
+        own_page = obj.get("/Pg")
+        if own_page is not None:
+            page = own_page
+        if (
+            page is None
+            and obj.is_indirect
+            and obj.get("/S") is not None
+            and ("/Alt" in obj or "/ActualText" in obj)
+        ):
+            mcids = _collect_mcids(obj.get("/K"))
+            found = _page_named_for_descendants(pdf, obj, mcids) if mcids else None
+            if found is not None:
+                obj["/Pg"] = found.obj
+                page = found.obj
+                updated += 1
+                actions.append(
+                    f"set /Pg on pageless {str(obj['/S']).lstrip('/')} with "
+                    f"alternate text to page {page_numbers[found.obj.objgen]} "
+                    f"named by its ParentTree entries for MCIDs {mcids}"
+                )
+        for child in _struct_child_dicts(obj):
+            if "/MCID" in child or child.get("/Type") == "/OBJR":
+                continue
+            walk(child, page)
+
+    walk(struct_root, None)
+    return updated
+
+
+# Structure types whose content model takes a Figure. Grouping elements and
+# block containers do; a list, a table, a row or another Figure does not.
+_FIGURE_CONTAINERS = frozenset(
+    {
+        "/Document",
+        "/DocumentFragment",
+        "/Part",
+        "/Art",
+        "/Sect",
+        "/Div",
+        "/BlockQuote",
+        "/Aside",
+        "/Caption",
+        "/LBody",
+        "/TD",
+        "/TH",
+        "/P",
+    }
+)
+
+
+def _reachable_container_for(
+    obj: pikepdf.Dictionary,
+    reachable: set[tuple[int, int]],
+) -> tuple[pikepdf.Dictionary, pikepdf.Dictionary] | None:
+    """Nearest reachable ancestor that takes a Figure and speaks no alt itself.
+
+    Returns that container and the child on the /P chain directly under it,
+    which is where the element used to sit and where it goes back in.
+    """
+    child = obj
+    parent = child.get("/P")
+    for _ in range(64):
+        if not isinstance(parent, pikepdf.Dictionary):
+            return None
+        if parent.get("/Type") == "/StructTreeRoot":
+            return None
+        if (
+            parent.is_indirect
+            and parent.objgen in reachable
+            and str(parent.get("/S")) in _FIGURE_CONTAINERS
+            and "/Alt" not in parent
+            and "/ActualText" not in parent
+        ):
+            return parent, child
+        child = parent
+        parent = parent.get("/P")
+    return None
+
+
+def _struct_kids_list(obj: pikepdf.Dictionary) -> list[object]:
+    kids = obj.get("/K")
+    if isinstance(kids, pikepdf.Array):
+        return list(kids)
+    if kids is None:
+        return []
+    return [kids]
+
+
+_LABEL_ONLY_ALT = re.compile(
+    r"^(?:figure|fig\.?|table|diagram|image|graph|chart|equation)\s*\d*\.?$",
+    re.IGNORECASE,
+)
+
+
+def _figure_alt_names_no_content(alt_text: str, figure: pikepdf.Dictionary) -> bool:
+    """True for an Alt that labels the figure without describing it.
+
+    Covers a bare "Figure 24" and the caption-only alt the inline-formula
+    expander pads with its "Spoken formula notation" sentence.
+    """
+    if _LABEL_ONLY_ALT.match(alt_text.strip()):
+        return True
+    return bool(
+        classify_figure_alt(alt_text, struct_classes=struct_class_names(figure))
+    )
+
+
+def _repair_dead_alt_figure_owners(
+    pdf: pikepdf.Pdf,
+    *,
+    actions: list[str],
+) -> int:
+    """Reattach an unreachable /Figure with /Alt named for orphan Figure blocks.
+
+    Word tags each equation fragment as its own /Figure block and Adobe's
+    tagger gives the Figure element an /Alt spelling the equation out. An
+    earlier round reverted the enclosing Table to a Figure and abandoned its
+    TR/TD subtree, so the equation Figure is still named by the ParentTree but
+    no longer reached from the root; its blocks read as orphans, and an orphan
+    Figure that shows text is left alone. Hang the Figure back on the nearest
+    reachable ancestor that takes a Figure and carries no alternate text of
+    its own, right after the reachable child it used to sit under.
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return 0
+    reachable = _reachable_struct_objgens(pdf)
+    owned_page_mcids, wildcard_mcids = _collect_struct_page_mcids(pdf)
+    updated = 0
+
+    for index, page in enumerate(pdf.pages, 1):
+        data = _page_contents_data(page)
+        if data is None:
+            continue
+        page_key = page.obj.objgen
+        page_owned = {mcid for pg, mcid in owned_page_mcids if pg == page_key}
+        for mcid, tag in _iter_bdc_mcids_on_page(data):
+            if tag != "Figure" or mcid in page_owned or mcid in wildcard_mcids:
+                continue
+            owner = _parent_tree_owner(pdf, page, mcid)
+            if owner is None or not owner.is_indirect or owner.objgen in reachable:
+                continue
+            alt_text = _normalize_figure_alt_text(owner.get("/Alt"))
+            if owner.get("/S") != "/Figure" or not alt_text:
+                continue
+            if _figure_alt_names_no_content(alt_text, owner):
+                # Once reattached, the Alt is what a reader hears in place of
+                # the blocks, and the inline-formula walk stamps it over the
+                # first one. A label or caption would silence the equation.
+                continue
+            owner_page = owner.get("/Pg")
+            if owner_page is not None and owner_page.objgen != page_key:
+                continue
+            mcids = _collect_mcids(owner.get("/K"))
+            if mcid not in mcids or any(other in page_owned for other in mcids):
+                continue
+            placement = _reachable_container_for(owner, reachable)
+            if placement is None:
+                continue
+            container, anchor = placement
+            kids = _struct_kids_list(container)
+            insert_at = next(
+                (
+                    position + 1
+                    for position, kid in enumerate(kids)
+                    if isinstance(kid, pikepdf.Dictionary)
+                    and kid.is_indirect
+                    and kid.objgen == anchor.objgen
+                ),
+                len(kids),
+            )
+            kids.insert(insert_at, owner)
+            container["/K"] = pikepdf.Array(kids)
+            owner["/P"] = container
+            _set_struct_page_if_missing(owner, page)
+            reachable.add(owner.objgen)
+            page_owned.update(mcids)
+            updated += 1
+            actions.append(
+                f"page {index}: reattached unreachable Figure {alt_text[:40]!r} "
+                f"owning orphan MCIDs {mcids} under "
+                f"{str(container['/S']).lstrip('/')}"
+            )
+    return updated
+
+
+def _struct_layout_bbox(
+    obj: pikepdf.Dictionary,
+) -> tuple[float, float, float, float] | None:
+    attributes = obj.get("/A")
+    candidates: list[object]
+    if isinstance(attributes, pikepdf.Array):
+        candidates = list(attributes)
+    else:
+        candidates = [attributes]
+    for candidate in candidates:
+        if not isinstance(candidate, pikepdf.Dictionary):
+            continue
+        bbox = candidate.get("/BBox")
+        if isinstance(bbox, pikepdf.Array) and len(bbox) == 4:
+            x0, y0, x1, y1 = (float(value) for value in bbox)
+            return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+    return None
+
+
+_TM_OPERATOR = re.compile(
+    rb"(?:[-+]?[\d.]+\s+){4}([-+]?[\d.]+)\s+([-+]?[\d.]+)\s+Tm\b"
+)
+_TEXT_MOVE_OPERATOR = re.compile(rb"\b(?:cm|Td|TD|T\*)\b|(?<=\))\s*['\"]")
+
+
+def _text_origins(body: bytes) -> list[tuple[float, float]]:
+    """Page-space text origins of a block, or [] when they cannot be read off.
+
+    Only `Tm` sets an absolute origin; a `cm`, a `Td` or a line advance moves
+    text somewhere the matrix operands do not say, so such a block is not
+    placed.
+    """
+    if _TEXT_MOVE_OPERATOR.search(_strip_content_strings(body)):
+        return []
+    return [
+        (float(match.group(1)), float(match.group(2)))
+        for match in _TM_OPERATOR.finditer(body)
+    ]
+
+
+def _repair_parent_tree_named_figure_content(
+    pdf: pikepdf.Pdf,
+    *,
+    actions: list[str],
+) -> int:
+    """Link an orphan block into the reachable /Figure its ParentTree entry names.
+
+    Adobe's tagger left the Figure's /K naming only its image block while the
+    page's ParentTree names the Figure for the equation text drawn inside the
+    Figure's layout /BBox as well. The struct /Alt already speaks that text;
+    without the link the block is an orphan whose only sweep repair would be
+    an /ActualText built from glyphs the font may not name.
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return 0
+    reachable = _reachable_struct_objgens(pdf)
+    owned_page_mcids, wildcard_mcids = _collect_struct_page_mcids(pdf)
+    updated = 0
+
+    for index, page in enumerate(pdf.pages, 1):
+        data = _page_contents_data(page)
+        if data is None:
+            continue
+        page_key = page.obj.objgen
+        page_owned = {
+            mcid for pg, mcid in owned_page_mcids if pg == page_key
+        } | wildcard_mcids
+        for mcid, _tag in _iter_bdc_mcids_on_page(data):
+            if mcid in page_owned:
+                continue
+            owner = _parent_tree_owner(pdf, page, mcid)
+            if owner is None or not owner.is_indirect or owner.objgen not in reachable:
+                continue
+            alt_text = _normalize_figure_alt_text(owner.get("/Alt"))
+            if owner.get("/S") != "/Figure" or not alt_text:
+                continue
+            owner_page = owner.get("/Pg")
+            if owner_page is None or owner_page.objgen != page_key:
+                continue
+            bbox = _struct_layout_bbox(owner)
+            if bbox is None:
+                continue
+            block = _get_mcid_block_to_emc(data, mcid)
+            if block is None or not _body_has_show_ops(block[2]):
+                continue
+            origins = _text_origins(block[2])
+            x0, y0, x1, y1 = bbox
+            if not origins or not all(
+                x0 - 1 <= x <= x1 + 1 and y0 - 1 <= y <= y1 + 1 for x, y in origins
+            ):
+                continue
+            kids = _struct_kids_list(owner)
+            insert_at = next(
+                (
+                    position
+                    for position, kid in enumerate(kids)
+                    if isinstance(kid, int) and int(kid) > mcid
+                ),
+                len(kids),
+            )
+            kids.insert(insert_at, mcid)
+            owner["/K"] = pikepdf.Array(kids)
+            page_owned.add(mcid)
+            updated += 1
+            actions.append(
+                f"page {index}: linked orphan MCID {mcid} into the Figure "
+                f"{alt_text[:40]!r} its ParentTree entry names"
+            )
+    return updated
+
+
 def _struct_page_ref(page: pikepdf.Page | pikepdf.Dictionary) -> pikepdf.Dictionary:
     """Return a page dictionary suitable for struct-tree /Pg entries."""
     if isinstance(page, pikepdf.Page):
@@ -2605,6 +3016,9 @@ def repair_marked_content_actualtext(
             result = MarkedContentActualTextRepairResult(0, 0, [])
             return pdf_bytes, result
 
+        _repair_pageless_alt_content_page(pdf, actions=actions)
+        _repair_dead_alt_figure_owners(pdf, actions=actions)
+        _repair_parent_tree_named_figure_content(pdf, actions=actions)
         figure_index = 0
         protected_mcids = _alt_precedence_protected_mcids(pdf)
 
@@ -2659,6 +3073,16 @@ def repair_marked_content_actualtext(
                             for mcid, text in mcid_texts.items()
                             if (page_key, mcid) not in protected_mcids
                         }
+                        if not has_inline_formula and alt_text == "Table":
+                            # The placeholder alt names no content, so over a
+                            # block that shows text it would speak "Table" in
+                            # place of the text.
+                            data = _page_contents_data(page) or b""
+                            mcid_texts = {
+                                mcid: text
+                                for mcid, text in mcid_texts.items()
+                                if not _mcid_block_shows_text(data, mcid)
+                            }
                         updated = _inject_actualtext_batch_on_page(
                             pdf,
                             page,

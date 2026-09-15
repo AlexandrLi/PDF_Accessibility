@@ -29,6 +29,7 @@ from lib.marked_content_actualtext_sweep import (
     _resolve_struct_page,
     _set_struct_page_if_missing,
     _spoken_list_label_text,
+    _tounicode_text,
     count_li_lbl_missing_actualtext,
     count_orphan_marked_missing_actualtext,
     list_untagged_image_mcids_missing_actualtext,
@@ -2070,6 +2071,239 @@ class ContentlessAltTests(unittest.TestCase):
         self.assertIn(
             "removed ActualText from empty Span with no page content", result.actions
         )
+
+
+def _struct_elem(name: str, **extra: object) -> pikepdf.Dictionary:
+    data = {"/Type": pikepdf.Name("/StructElem"), "/S": pikepdf.Name(f"/{name}")}
+    for key, value in extra.items():
+        data[f"/{key}"] = value
+    return pikepdf.Dictionary(data)
+
+
+def _save(pdf: pikepdf.Pdf) -> bytes:
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
+def _parent_tree(*entries: tuple[int, list[object]]) -> pikepdf.Dictionary:
+    nums: list[object] = []
+    for key, owners in entries:
+        nums.extend([key, pikepdf.Array(owners)])
+    return pikepdf.Dictionary({"/Nums": pikepdf.Array(nums)})
+
+
+class UnnamedGlyphTests(unittest.TestCase):
+    """A ToUnicode destination that names no character is not spoken text."""
+
+    def test_private_use_destination_is_unmapped(self) -> None:
+        # Word maps Cambria Math's stretchy parentheses to U+F000-U+F003.
+        self.assertIsNone(_tounicode_text("F000"))
+        self.assertIsNone(_tounicode_text("0041F003"))
+        self.assertEqual(_tounicode_text("0041"), "A")
+
+    def test_encoding_stage_placeholder_is_unmapped(self) -> None:
+        # The characterEncoding stage renames U+F000 to a Box Drawing
+        # character after this sweep ran; the second pass must not speak it.
+        self.assertIsNone(_tounicode_text("2501"))
+
+    def test_injection_refuses_private_use_text(self) -> None:
+        data = b"/Span<</MCID 3 >> BDC BT <1234> Tj ET EMC"
+        repaired, changed = _inject_actualtext_in_data(
+            data, mcid=3, actual_text="\uf000x\uf001"
+        )
+        self.assertFalse(changed)
+        self.assertEqual(repaired, data)
+
+
+class PagelessAltContentTests(unittest.TestCase):
+    """A /Figure /Alt "Table" with bare MCIDs and no /Pg up its chain gets the
+    page whose ParentTree names it for those MCIDs."""
+
+    @staticmethod
+    def _build(*, block: bytes) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        page0 = pdf.add_blank_page()
+        page1 = pdf.add_blank_page()
+        page0["/Contents"] = pdf.make_stream(b"/P<</MCID 0 >> BDC (body) Tj EMC")
+        page1["/Contents"] = pdf.make_stream(b"/Figure<</MCID 3 >> BDC " + block + b" EMC")
+        page0["/StructParents"] = 0
+        page1["/StructParents"] = 1
+        paragraph = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([0]), Pg=page0.obj))
+        figure = pdf.make_indirect(
+            _struct_elem("Figure", Alt=pikepdf.String("Table"), K=pikepdf.Array([3]))
+        )
+        document = pdf.make_indirect(
+            _struct_elem("Document", K=pikepdf.Array([paragraph, figure]))
+        )
+        paragraph["/P"] = document
+        figure["/P"] = document
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([document]),
+                "/ParentTree": _parent_tree(
+                    (0, [paragraph]), (1, [None, None, None, figure])
+                ),
+            }
+        )
+        return _save(pdf)
+
+    def test_pageless_alt_figure_gets_the_page_its_parent_tree_entry_names(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            self._build(block=b"q /Im0 Do Q")
+        )
+
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            figure = pdf.Root["/StructTreeRoot"]["/K"][0]["/K"][1]
+            self.assertEqual(figure["/Pg"].objgen, pdf.pages[1].obj.objgen)
+        self.assertIn(
+            "set /Pg on pageless Figure with alternate text to page 2 named by "
+            "its ParentTree entries for MCIDs [3]",
+            result.actions,
+        )
+
+    def test_placeholder_table_alt_is_not_stamped_over_shown_text(self) -> None:
+        repaired, _result = repair_marked_content_actualtext(
+            self._build(block=b"BT /F1 10 Tf (2 m/s) Tj ET")
+        )
+
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            data = _read_page_contents(pdf.pages[1]["/Contents"])
+        self.assertFalse(_mcid_bdc_has_actualtext(data, 3))
+
+
+class DeadAltFigureOwnerTests(unittest.TestCase):
+    """An unreachable /Figure with /Alt that the ParentTree names for orphan
+    Figure blocks goes back under the nearest reachable container."""
+
+    @staticmethod
+    def _build(*, alt: str) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"/Figure<</MCID 0 >> BDC BT (x) Tj ET EMC "
+            b"/Figure<</MCID 1 >> BDC BT (= y) Tj ET EMC "
+            b"/P<</MCID 2 >> BDC (body) Tj EMC"
+        )
+        page["/StructParents"] = 0
+        paragraph = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([2]), Pg=page.obj))
+        # The earlier round left this Figure over the table it reverted; it
+        # speaks its own alt, so nothing may be hung under it.
+        reverted = pdf.make_indirect(
+            _struct_elem("Figure", Alt=pikepdf.String("Table"), K=pikepdf.Array([]), Pg=page.obj)
+        )
+        document = pdf.make_indirect(
+            _struct_elem("Document", K=pikepdf.Array([reverted, paragraph]))
+        )
+        paragraph["/P"] = document
+        reverted["/P"] = document
+        # The abandoned cell subtree: TR -> TD -> equation Figure, none reachable.
+        row = pdf.make_indirect(_struct_elem("TR", P=reverted))
+        cell = pdf.make_indirect(_struct_elem("TD", P=row))
+        equation = pdf.make_indirect(
+            _struct_elem(
+                "Figure",
+                Alt=pikepdf.String(alt),
+                C=pikepdf.Array([pikepdf.Name("/fb-region-inlineFormula")]),
+                K=pikepdf.Array([0, 1]),
+                Pg=page.obj,
+                P=cell,
+            )
+        )
+        cell["/K"] = pikepdf.Array([equation])
+        row["/K"] = pikepdf.Array([cell])
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([document]),
+                "/ParentTree": _parent_tree((0, [equation, equation, paragraph])),
+            }
+        )
+        return _save(pdf)
+
+    def test_dead_figure_is_reattached_after_the_element_it_sat_under(self) -> None:
+        original = self._build(alt="x equals y")
+        self.assertEqual(count_orphan_marked_missing_actualtext(original), 2)
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            document = pdf.Root["/StructTreeRoot"]["/K"][0]
+            kids = document["/K"]
+            # The walk then retags the inline-formula Figure as a Span.
+            self.assertEqual([str(kid["/S"]) for kid in kids], ["/Figure", "/Span", "/P"])
+            self.assertEqual(str(kids[1]["/Alt"]), "x equals y")
+            self.assertEqual(kids[1]["/P"].objgen, document.objgen)
+        self.assertIn(
+            "page 1: reattached unreachable Figure 'x equals y' owning orphan "
+            "MCIDs [0, 1] under Document",
+            result.actions,
+        )
+
+    def test_dead_figure_with_caption_only_alt_stays_out_of_the_tree(self) -> None:
+        # Reattached, this alt would be spoken in place of the equation and
+        # stamped over its first block.
+        original = self._build(
+            alt="Figure 10. Spoken formula notation for inline chemistry text."
+        )
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            document = pdf.Root["/StructTreeRoot"]["/K"][0]
+            self.assertEqual(len(document["/K"]), 2)
+            data = _read_page_contents(pdf.pages[0]["/Contents"])
+        self.assertFalse(_mcid_bdc_has_actualtext(data, 0))
+        self.assertFalse(any("reattached" in action for action in result.actions))
+
+
+class ParentTreeNamedFigureContentTests(unittest.TestCase):
+    """An orphan text block drawn inside a reachable Figure's layout /BBox,
+    whose ParentTree entry names that Figure, is linked into its /K."""
+
+    def test_orphan_text_inside_the_figure_bbox_is_linked(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"/Figure<</MCID 0 >> BDC q /Im0 Do Q EMC "
+            b"/Span<</MCID 1 >> BDC BT /F1 10 Tf 1 0 0 1 50 60 Tm (A = B) Tj ET EMC "
+            b"/Span<</MCID 2 >> BDC BT /F1 10 Tf 1 0 0 1 300 60 Tm (caption) Tj ET EMC"
+        )
+        page["/StructParents"] = 0
+        figure = pdf.make_indirect(
+            _struct_elem(
+                "Figure",
+                Alt=pikepdf.String("Equation A equals B."),
+                K=pikepdf.Array([0]),
+                Pg=page.obj,
+                A=pikepdf.Dictionary(
+                    {"/O": pikepdf.Name("/Layout"), "/BBox": pikepdf.Array([40, 40, 120, 100])}
+                ),
+            )
+        )
+        document = pdf.make_indirect(_struct_elem("Document", K=pikepdf.Array([figure])))
+        figure["/P"] = document
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([document]),
+                "/ParentTree": _parent_tree((0, [figure, figure, figure])),
+            }
+        )
+
+        repaired, result = repair_marked_content_actualtext(_save(pdf))
+
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            linked = opened.Root["/StructTreeRoot"]["/K"][0]["/K"][0]
+            self.assertEqual([int(kid) for kid in linked["/K"]], [0, 1])
+        self.assertIn(
+            "page 1: linked orphan MCID 1 into the Figure 'Equation A equals B.' "
+            "its ParentTree entry names",
+            result.actions,
+        )
+        self.assertFalse(any("MCID 2 into" in action for action in result.actions))
 
 
 if __name__ == "__main__":

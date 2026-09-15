@@ -344,5 +344,61 @@ class TaggedContentSweepTests(unittest.TestCase):
             document = pdf.Root["/StructTreeRoot"]["/K"][0]
             self.assertEqual(len(document["/K"]), 2)
 
+class PagelessAltElementTests(unittest.TestCase):
+    def test_pages_an_alt_element_before_scanning_so_its_mcids_stop_masking_orphans(self) -> None:
+        # A /Figure /Alt with bare MCIDs and no /Pg reads as owning those MCIDs
+        # on every page, so the scan never sees the real orphans. Paged on the
+        # first pass, it leaves nothing for a second pass to adopt.
+        pdf = pikepdf.new()
+        page0 = pdf.add_blank_page(page_size=(200, 200))
+        page1 = pdf.add_blank_page(page_size=(200, 200))
+        page0["/Contents"] = pdf.make_stream(b"/P << /MCID 0 >> BDC (body) Tj EMC")
+        page1["/Contents"] = pdf.make_stream(b"/Figure << /MCID 0 >> BDC /Im0 Do EMC")
+        page0["/StructParents"] = 0
+        page1["/StructParents"] = 1
+
+        def elem(name: str, **extra: object) -> pikepdf.Dictionary:
+            data = {"/Type": pikepdf.Name("/StructElem"), "/S": pikepdf.Name(f"/{name}")}
+            for key, value in extra.items():
+                data[f"/{key}"] = value
+            return pdf.make_indirect(pikepdf.Dictionary(data))
+
+        paragraph = elem("P", K=pikepdf.Array([0]), Pg=page0.obj)
+        figure = elem("Figure", Alt=pikepdf.String("Table"), K=pikepdf.Array([0]))
+        document = elem("Document", K=pikepdf.Array([paragraph, figure]))
+        paragraph["/P"] = document
+        figure["/P"] = document
+        pdf.Root["/StructTreeRoot"] = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/StructTreeRoot"),
+                    "/K": pikepdf.Array([document]),
+                    "/ParentTree": pikepdf.Dictionary(
+                        {
+                            "/Nums": pikepdf.Array(
+                                [0, pikepdf.Array([paragraph]), 1, pikepdf.Array([figure])]
+                            )
+                        }
+                    ),
+                }
+            )
+        )
+        output = io.BytesIO()
+        pdf.save(output)
+
+        repaired, result = repair_tagged_content(output.getvalue())
+
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            paged = opened.Root["/StructTreeRoot"]["/K"][0]["/K"][1]
+            self.assertEqual(paged["/Pg"].objgen, opened.pages[1].obj.objgen)
+        self.assertIn(
+            "set /Pg on pageless Figure with alternate text to page 2 named by "
+            "its ParentTree entries for MCIDs [0]",
+            result.actions,
+        )
+        again, _second = repair_tagged_content(repaired)
+        self.assertEqual(again, repaired)
+
+
 if __name__ == "__main__":
     unittest.main()

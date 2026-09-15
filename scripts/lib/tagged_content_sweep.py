@@ -18,6 +18,7 @@ from lib.marked_content_actualtext_sweep import (
     _iter_bdc_mcids_on_page,
     _page_contents_data,
     _page_font_code_maps,
+    _repair_pageless_alt_content_page,
 )
 
 
@@ -768,6 +769,13 @@ def repair_tagged_content(
                 actions=[],
             )
             return pdf_bytes, result
+
+        # An alt element with bare MCIDs and no page makes those MCIDs
+        # "pageless" for the scan below, which then treats them as owned on
+        # every page and never adopts the real orphans. Page it first, so a
+        # second pass finds nothing new to adopt.
+        if _repair_pageless_alt_content_page(pdf, actions=actions):
+            changed = True
 
         scan = _scan_structure(pdf)
         struct_elements_updated = 0
