@@ -324,12 +324,11 @@ def _prefer_page_from_struct_chain(
     return None
 
 
-def _parent_tree_owner(
+def _parent_tree_entry(
     pdf: pikepdf.Pdf,
     page: pikepdf.Dictionary | pikepdf.Page,
-    mcid: int,
-) -> pikepdf.Dictionary | None:
-    """Return the struct element the page's ParentTree entry names for mcid."""
+) -> pikepdf.Array | None:
+    """Return the ParentTree array the page's /StructParents key selects."""
     struct_root = pdf.Root.get("/StructTreeRoot")
     if not isinstance(struct_root, pikepdf.Dictionary):
         return None
@@ -368,7 +367,17 @@ def _parent_tree_owner(
         return None
 
     entry = lookup(tree)
-    if not isinstance(entry, pikepdf.Array) or mcid < 0 or mcid >= len(entry):
+    return entry if isinstance(entry, pikepdf.Array) else None
+
+
+def _parent_tree_owner(
+    pdf: pikepdf.Pdf,
+    page: pikepdf.Dictionary | pikepdf.Page,
+    mcid: int,
+) -> pikepdf.Dictionary | None:
+    """Return the struct element the page's ParentTree entry names for mcid."""
+    entry = _parent_tree_entry(pdf, page)
+    if entry is None or mcid < 0 or mcid >= len(entry):
         return None
     owner = entry[mcid]
     return owner if isinstance(owner, pikepdf.Dictionary) else None
@@ -1274,6 +1283,226 @@ def _body_paints_no_content(
     return decoded is not None and not decoded.strip()
 
 
+_Matrix = tuple[float, float, float, float, float, float]
+_Rect = tuple[float, float, float, float]
+_IDENTITY: _Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+_PATH_PAINT_OPERATORS = frozenset({"n", "f", "F", "f*", "B", "B*", "b", "b*", "S", "s"})
+_TEXT_SHOW_OPERATORS = frozenset({"Tj", "TJ", "'", '"'})
+# Operators that paint something the text-box model below does not cover.
+_UNMODELLED_PAINT_OPERATORS = frozenset({"Do", "sh", "BI", "ID", "EI", "INLINE IMAGE"})
+
+
+def _matrix_multiply(left: _Matrix, right: _Matrix) -> _Matrix:
+    a, b, c, d, e, f = left
+    a2, b2, c2, d2, e2, f2 = right
+    return (
+        a * a2 + b * c2,
+        a * b2 + b * d2,
+        c * a2 + d * c2,
+        c * b2 + d * d2,
+        e * a2 + f * c2 + e2,
+        e * b2 + f * d2 + f2,
+    )
+
+
+def _transform_point(matrix: _Matrix, x: float, y: float) -> tuple[float, float]:
+    return (
+        matrix[0] * x + matrix[2] * y + matrix[4],
+        matrix[1] * x + matrix[3] * y + matrix[5],
+    )
+
+
+def _points_bbox(points: list[tuple[float, float]]) -> _Rect:
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _rect_intersection(first: _Rect | None, second: _Rect) -> _Rect:
+    if first is None:
+        return second
+    return (
+        max(first[0], second[0]),
+        max(first[1], second[1]),
+        min(first[2], second[2]),
+        min(first[3], second[3]),
+    )
+
+
+def _rects_touch(box: _Rect, clip: _Rect, *, tolerance: float = 0.5) -> bool:
+    if clip[0] > clip[2] or clip[1] > clip[3]:
+        # Two clips with no common area leave nothing to paint into.
+        return False
+    return not (
+        box[2] < clip[0] - tolerance
+        or clip[2] < box[0] - tolerance
+        or box[3] < clip[1] - tolerance
+        or clip[3] < box[1] - tolerance
+    )
+
+
+def _shown_text_clipped_away(data: bytes, mcid: int) -> bool:
+    """True when every glyph a marked block shows lies outside the clip in force.
+
+    Word draws a text box that crosses a page break on both pages, each time
+    clipped to that page's share, so the far side's glyphs are in the content
+    stream and never on the page. The clip that hides them is usually set
+    before the block opens (the block often starts with a `Q` that pops back
+    to it), so the graphics state is replayed from the start of the page.
+
+    The model errs toward "paints": every glyph is boxed at one em per code
+    byte plus the character and word spacing, half an em below the baseline
+    and 1.2 em above, with the run's width accumulated since the last
+    positioning operator; only rectangular clips (`re`, or a path whose
+    points bound the box) narrow the clip; a zero font size, a missing clip,
+    an XObject, a shading or an inline image inside the block, or a stream
+    that does not parse all count as painting.
+    """
+    try:
+        with pikepdf.Pdf.new() as scratch:
+            instructions = pikepdf.parse_content_stream(scratch.make_stream(data))
+    except (pikepdf.PdfError, RuntimeError, ValueError):
+        return False
+
+    ctm = _IDENTITY
+    clip: _Rect | None = None
+    saved: list[tuple[_Matrix, _Rect | None]] = []
+    path_points: list[tuple[float, float]] = []
+    pending_clip = False
+    text_matrix = line_matrix = _IDENTITY
+    font_size = 0.0
+    horizontal_scale = 1.0
+    rise = char_spacing = word_spacing = leading = 0.0
+    run_width = 0.0
+    in_block = False
+    depth = 0
+    shows = 0
+
+    def numbers(operands: list[object]) -> list[float]:
+        return [float(value) for value in operands]
+
+    for operands, operator in instructions:
+        op = str(operator)
+        if op in ("BDC", "BMC"):
+            if in_block:
+                depth += 1
+            elif (
+                op == "BDC"
+                and len(operands) == 2
+                and isinstance(operands[1], pikepdf.Dictionary)
+            ):
+                marked = operands[1].get("/MCID")
+                if isinstance(marked, int) and int(marked) == mcid:
+                    in_block = True
+                    depth = 1
+            continue
+        if op == "EMC":
+            if in_block:
+                depth -= 1
+                if depth == 0:
+                    break
+            continue
+        if in_block and op in _UNMODELLED_PAINT_OPERATORS:
+            return False
+        if op == "q":
+            saved.append((ctm, clip))
+        elif op == "Q":
+            if saved:
+                ctm, clip = saved.pop()
+        elif op == "cm" and len(operands) == 6:
+            ctm = _matrix_multiply(tuple(numbers(operands)), ctm)
+        elif op == "re" and len(operands) == 4:
+            x, y, width, height = numbers(operands)
+            path_points.extend(
+                _transform_point(ctm, px, py)
+                for px, py in ((x, y), (x + width, y), (x, y + height), (x + width, y + height))
+            )
+        elif op in ("m", "l") and len(operands) == 2:
+            x, y = numbers(operands)
+            path_points.append(_transform_point(ctm, x, y))
+        elif op in ("c", "v", "y"):
+            values = numbers(operands)
+            for index in range(0, len(values) - 1, 2):
+                path_points.append(_transform_point(ctm, values[index], values[index + 1]))
+        elif op in ("W", "W*"):
+            pending_clip = True
+        elif op in _PATH_PAINT_OPERATORS:
+            if pending_clip and path_points:
+                clip = _rect_intersection(clip, _points_bbox(path_points))
+            path_points = []
+            pending_clip = False
+        elif op == "BT":
+            text_matrix = line_matrix = _IDENTITY
+            run_width = 0.0
+        elif op == "Tf" and len(operands) == 2:
+            font_size = abs(float(operands[1]))
+        elif op == "Tz" and len(operands) == 1:
+            horizontal_scale = numbers(operands)[0] / 100.0
+        elif op == "Ts" and len(operands) == 1:
+            rise = numbers(operands)[0]
+        elif op == "Tc" and len(operands) == 1:
+            char_spacing = numbers(operands)[0]
+        elif op == "Tw" and len(operands) == 1:
+            word_spacing = numbers(operands)[0]
+        elif op == "TL" and len(operands) == 1:
+            leading = numbers(operands)[0]
+        elif op == "Tm" and len(operands) == 6:
+            text_matrix = line_matrix = tuple(numbers(operands))
+            run_width = 0.0
+        elif op in ("Td", "TD") and len(operands) == 2:
+            tx, ty = numbers(operands)
+            if op == "TD":
+                leading = -ty
+            line_matrix = _matrix_multiply((1.0, 0.0, 0.0, 1.0, tx, ty), line_matrix)
+            text_matrix = line_matrix
+            run_width = 0.0
+        elif op == "T*":
+            line_matrix = _matrix_multiply((1.0, 0.0, 0.0, 1.0, 0.0, -leading), line_matrix)
+            text_matrix = line_matrix
+            run_width = 0.0
+        elif op in _TEXT_SHOW_OPERATORS:
+            if op == '"' and len(operands) == 3:
+                word_spacing, char_spacing = numbers(operands[:2])
+            if op in ("'", '"'):
+                line_matrix = _matrix_multiply(
+                    (1.0, 0.0, 0.0, 1.0, 0.0, -leading), line_matrix
+                )
+                text_matrix = line_matrix
+                run_width = 0.0
+            codes = 0
+            adjustment = 0.0
+            if op == "TJ":
+                if not operands or not isinstance(operands[0], pikepdf.Array):
+                    return False
+                for item in operands[0]:
+                    if isinstance(item, pikepdf.String):
+                        codes += len(bytes(item))
+                    else:
+                        adjustment += abs(float(item)) / 1000.0
+            elif operands and isinstance(operands[-1], pikepdf.String):
+                codes = len(bytes(operands[-1]))
+            else:
+                return False
+            if not in_block:
+                continue
+            shows += 1
+            if font_size <= 0 or clip is None:
+                return False
+            scale = horizontal_scale if horizontal_scale > 0 else 1.0
+            padding = adjustment * font_size * scale
+            width = (codes * font_size + codes * (abs(char_spacing) + abs(word_spacing))) * scale
+            x0, x1 = -padding, run_width + width + padding
+            y0, y1 = -0.5 * font_size + rise, 1.2 * font_size + rise
+            render = _matrix_multiply(text_matrix, ctm)
+            box = _points_bbox(
+                [_transform_point(render, px, py) for px, py in ((x0, y0), (x1, y0), (x0, y1), (x1, y1))]
+            )
+            run_width += width + padding
+            if _rects_touch(box, clip):
+                return False
+    return in_block and shows > 0
+
+
 def _orphan_marked_spoken_text(
     tag: str,
     body: bytes,
@@ -1397,8 +1626,23 @@ def _repair_orphan_marked_content_actualtext(
                     initial_font=_font_in_effect_at(new_data, block[0]),
                 )
                 if _body_has_show_ops(body) and not paints_nothing:
-                    # An orphan Figure that shows text needs a tree repair a
-                    # sweep cannot infer; leave it for review, never silence it.
+                    if not _shown_text_clipped_away(new_data, mcid):
+                        # An orphan Figure that shows text needs a tree repair a
+                        # sweep cannot infer; leave it for review, never silence it.
+                        continue
+                    # Word's far-side copy of a text box that crosses a page
+                    # break: its glyphs are in the stream and outside the
+                    # clip, so no pixel of the page is theirs.
+                    new_data, changed = _retag_orphan_bdc_as_artifact(
+                        new_data, mcid
+                    )
+                    if changed:
+                        page_changed = True
+                        updated += 1
+                        actions.append(
+                            f"orphan MCID {mcid}: retagged Figure whose text "
+                            "the page clips away to /Artifact"
+                        )
                     continue
                 draw_names = _body_xobject_names(body)
                 if draw_names and draw_names <= artifact_names or (
@@ -3068,6 +3312,232 @@ def _repair_parent_tree_named_figure_content(
     return updated
 
 
+def _struct_page_mcid_index(
+    pdf: pikepdf.Pdf,
+    page_key: tuple[int, int],
+) -> tuple[dict[int, pikepdf.Dictionary], dict[tuple[int, int], set[int]]]:
+    """Owners of one page's MCIDs, and the page MCIDs under each element.
+
+    The first map names the element whose /K holds each MCID; the second
+    gives, per reachable indirect element, every MCID of this page anywhere
+    in its subtree, which is what places a new sibling among its kids.
+    """
+    owners: dict[int, pikepdf.Dictionary] = {}
+    subtree: dict[tuple[int, int], set[int]] = {}
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return owners, subtree
+
+    def walk(obj: pikepdf.Dictionary, page: pikepdf.Object | None) -> set[int]:
+        own_page = obj.get("/Pg")
+        if own_page is not None:
+            page = own_page
+        found: set[int] = set()
+        for kid in _struct_kids_list(obj):
+            if isinstance(kid, int):
+                if page is not None and page.objgen == page_key:
+                    owners.setdefault(int(kid), obj)
+                    found.add(int(kid))
+            elif isinstance(kid, pikepdf.Dictionary):
+                if "/MCID" in kid:
+                    kid_page = kid.get("/Pg") or page
+                    if kid_page is not None and kid_page.objgen == page_key:
+                        owners.setdefault(int(kid["/MCID"]), obj)
+                        found.add(int(kid["/MCID"]))
+                elif kid.get("/Type") != "/OBJR":
+                    found |= walk(kid, page)
+        if obj.is_indirect:
+            subtree[obj.objgen] = found
+        return found
+
+    walk(struct_root, None)
+    return owners, subtree
+
+
+def _unowned_figure_block_placement(
+    mcid: int,
+    *,
+    owners: dict[int, pikepdf.Dictionary],
+    subtree: dict[tuple[int, int], set[int]],
+    reachable: set[tuple[int, int]],
+) -> tuple[pikepdf.Dictionary, int] | None:
+    """The container and kid index an unowned block takes from its neighbours.
+
+    The block goes after the owned block before it in content order, or
+    before the one after it, at the level of the nearest reachable ancestor
+    that takes a Figure. The kids on both sides of that slot must bracket the
+    MCID, or the tree's order disagrees with the stream's and nothing is
+    inferred.
+    """
+    before = [number for number in owners if number < mcid]
+    after = [number for number in owners if number > mcid]
+    if before:
+        neighbour, offset = owners[max(before)], 1
+    elif after:
+        neighbour, offset = owners[min(after)], 0
+    else:
+        return None
+    placement = _reachable_container_for(neighbour, reachable)
+    if placement is None:
+        return None
+    container, anchor = placement
+    if not anchor.is_indirect:
+        return None
+    kids = _struct_kids_list(container)
+    index = next(
+        (
+            position
+            for position, kid in enumerate(kids)
+            if isinstance(kid, pikepdf.Dictionary)
+            and kid.is_indirect
+            and kid.objgen == anchor.objgen
+        ),
+        None,
+    )
+    if index is None:
+        return None
+    insert_at = index + offset
+    container_mcids = subtree.get(container.objgen, set())
+
+    def covered(kid: object) -> set[int] | None:
+        if isinstance(kid, int):
+            return {int(kid)} if int(kid) in container_mcids else set()
+        if isinstance(kid, pikepdf.Dictionary):
+            if "/MCID" in kid:
+                return {int(kid["/MCID"])} if int(kid["/MCID"]) in container_mcids else set()
+            if kid.get("/Type") == "/OBJR":
+                return set()
+            return subtree.get(kid.objgen) if kid.is_indirect else None
+        return None
+
+    for position in range(insert_at - 1, -1, -1):
+        numbers = covered(kids[position])
+        if numbers is None:
+            return None
+        if numbers:
+            if max(numbers) > mcid:
+                return None
+            break
+    for position in range(insert_at, len(kids)):
+        numbers = covered(kids[position])
+        if numbers is None:
+            return None
+        if numbers:
+            if min(numbers) < mcid:
+                return None
+            break
+    return container, insert_at
+
+
+def _repair_unowned_text_figure_blocks(
+    pdf: pikepdf.Pdf,
+    *,
+    actions: list[str],
+) -> int:
+    """Give an orphan /Figure block that shows text an element of its own.
+
+    Word tags a text box as a /Figure block but writes no element for it and
+    leaves its ParentTree entry null, so no owner is anywhere in the file for
+    the two owner repairs above to find. Adobe fails "Other elements
+    alternate text" on the block and a reader never reaches it. The block
+    becomes a /Figure element whose /Alt is the text it shows, placed among
+    its neighbours in content order and named in the ParentTree; the later
+    non-image Figure pass turns that into a /Span, so the reader hears the
+    glyphs. A block whose text lies outside the clip in force paints
+    nothing and is left for the artifact retag; text the fonts do not fully
+    name, or name into Private Use codepoints, is left alone.
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return 0
+    reachable = _reachable_struct_objgens(pdf)
+    owned_page_mcids, wildcard_mcids = _collect_struct_page_mcids(pdf)
+    updated = 0
+
+    for index, page in enumerate(pdf.pages, 1):
+        data = _page_contents_data(page)
+        if data is None:
+            continue
+        page_key = page.obj.objgen
+        page_owned = {
+            mcid for pg, mcid in owned_page_mcids if pg == page_key
+        } | wildcard_mcids
+        candidates = [
+            mcid
+            for mcid, tag in _iter_bdc_mcids_on_page(data)
+            if tag == "Figure"
+            and mcid not in page_owned
+            and _parent_tree_owner(pdf, page, mcid) is None
+        ]
+        if not candidates:
+            continue
+        entry = _parent_tree_entry(pdf, page)
+        if entry is None:
+            # Without a ParentTree array for the page the new element could
+            # not be named there, and the tagged-content stage would write
+            # the entry on the next pass, so the output would not settle.
+            continue
+        font_code_maps = _page_font_code_maps(page)
+        owners, subtree = _struct_page_mcid_index(pdf, page_key)
+        for mcid in candidates:
+            block = _get_mcid_block_to_emc(data, mcid)
+            if block is None or not _body_has_show_ops(block[2]):
+                continue
+            body = block[2]
+            if _mcid_body_has_image(body) or _body_xobject_names(body):
+                continue
+            decoded = _decode_shown_text_in_order(
+                body,
+                font_code_maps=font_code_maps,
+                initial_font=_font_in_effect_at(data, block[0]),
+            )
+            text = " ".join(decoded.split()) if decoded else ""
+            if not text or any(_is_private_use(char) for char in text):
+                continue
+            if _shown_text_clipped_away(data, mcid):
+                continue
+            placement = _unowned_figure_block_placement(
+                mcid, owners=owners, subtree=subtree, reachable=reachable
+            )
+            if placement is None:
+                continue
+            container, insert_at = placement
+            element = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    {
+                        "/Type": pikepdf.Name("/StructElem"),
+                        "/S": pikepdf.Name("/Figure"),
+                        "/P": container,
+                        "/Pg": page.obj,
+                        "/K": mcid,
+                        "/Alt": pikepdf.String(text),
+                    }
+                )
+            )
+            kids = _struct_kids_list(container)
+            kids.insert(insert_at, element)
+            container["/K"] = pikepdf.Array(kids)
+            while len(entry) <= mcid:
+                entry.append(None)
+            entry[mcid] = element
+            reachable.add(element.objgen)
+            owners[mcid] = element
+            subtree[element.objgen] = {mcid}
+            ancestor: object = container
+            for _ in range(64):
+                if not isinstance(ancestor, pikepdf.Dictionary) or not ancestor.is_indirect:
+                    break
+                subtree.setdefault(ancestor.objgen, set()).add(mcid)
+                ancestor = ancestor.get("/P")
+            updated += 1
+            actions.append(
+                f"page {index}: adopted unowned Figure block MCID {mcid} "
+                f"showing {text[:40]!r} as a Figure under "
+                f"{str(container['/S']).lstrip('/')} and named it in the ParentTree"
+            )
+    return updated
+
+
 def _struct_page_ref(page: pikepdf.Page | pikepdf.Dictionary) -> pikepdf.Dictionary:
     """Return a page dictionary suitable for struct-tree /Pg entries."""
     if isinstance(page, pikepdf.Page):
@@ -3099,6 +3569,7 @@ def repair_marked_content_actualtext(
         _repair_pageless_alt_content_page(pdf, actions=actions)
         _repair_dead_alt_figure_owners(pdf, actions=actions)
         _repair_parent_tree_named_figure_content(pdf, actions=actions)
+        _repair_unowned_text_figure_blocks(pdf, actions=actions)
         figure_index = 0
         protected_mcids = _alt_precedence_protected_mcids(pdf)
 

@@ -2411,3 +2411,154 @@ class ParentTreeNamedFigureContentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClippedAwayFigureTextTests(unittest.TestCase):
+    """Word draws a text box that crosses a page break on both pages, clipped
+    to each page's share. The far side's orphan /Figure block shows text that
+    no pixel of the page carries, so it is decoration, not held text."""
+
+    @staticmethod
+    def _build(stream: bytes) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(stream)
+        page["/StructParents"] = 0
+        paragraph = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([1]), Pg=page.obj))
+        document = pdf.make_indirect(_struct_elem("Document", K=pikepdf.Array([paragraph])))
+        paragraph["/P"] = document
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([document]),
+                "/ParentTree": _parent_tree((0, [None, paragraph])),
+            }
+        )
+        return _save(pdf)
+
+    def test_text_outside_the_clip_set_before_the_block_is_an_artifact(self) -> None:
+        # The clip is set two levels up and the block opens with the Q that
+        # pops back to it, as in business-statistics 4338f8a9 page 2.
+        original = self._build(
+            b"q 0.24 0 0 0.24 0 0 cm 0 0 500 500 re W n q "
+            b"/Figure<</MCID 0 >> BDC Q BT /F1 10 Tf 1 0 0 1 300 700 Tm (far side) Tj ET q EMC "
+            b"Q Q /P<</MCID 1 >> BDC BT /F1 10 Tf 1 0 0 1 20 20 Tm (body) Tj ET EMC"
+        )
+        self.assertEqual(count_orphan_marked_missing_actualtext(original), 1)
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            data = _read_page_contents(pdf.pages[0]["/Contents"])
+            self.assertEqual(len(pdf.Root["/StructTreeRoot"]["/K"][0]["/K"]), 1)
+        self.assertIn(b"/Artifact BMC Q BT /F1 10 Tf 1 0 0 1 300 700 Tm (far side) Tj", data)
+        self.assertIn(
+            "orphan MCID 0: retagged Figure whose text the page clips away to /Artifact",
+            result.actions,
+        )
+
+    def test_text_inside_the_clip_stays_held(self) -> None:
+        # Same clip, glyphs inside it, and a hex string no font names: the
+        # block paints and cannot be spoken, so nothing may claim it.
+        original = self._build(
+            b"q 0.24 0 0 0.24 0 0 cm 0 0 500 500 re W n q "
+            b"/Figure<</MCID 0 >> BDC Q BT /F1 10 Tf 1 0 0 1 20 50 Tm <0041> Tj ET q EMC "
+            b"Q Q /P<</MCID 1 >> BDC BT /F1 10 Tf 1 0 0 1 20 20 Tm (body) Tj ET EMC"
+        )
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 1)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            data = _read_page_contents(pdf.pages[0]["/Contents"])
+        self.assertIn(b"/Figure<</MCID 0 >> BDC", data)
+        self.assertFalse(_mcid_bdc_has_actualtext(data, 0))
+        self.assertFalse(
+            any("clips away" in action or "adopted" in action for action in result.actions)
+        )
+
+
+class UnownedTextFigureBlockTests(unittest.TestCase):
+    """An orphan /Figure block showing text whose ParentTree entry is null has
+    no owner anywhere in the file; it gets an element of its own, placed
+    among its neighbours in content order and named in the ParentTree."""
+
+    @staticmethod
+    def _build(figure_body: bytes, *, bfchars: dict[str, str] | None = None) -> bytes:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"/P<</MCID 0 >> BDC BT /F1 10 Tf 1 0 0 1 20 700 Tm (Heading) Tj ET EMC "
+            b"/Figure<</MCID 1 >> BDC BT /F1 10 Tf 1 0 0 1 20 600 Tm " + figure_body + b" ET EMC "
+            b"/P<</MCID 2 >> BDC BT /F1 10 Tf 1 0 0 1 20 500 Tm (body) Tj ET EMC"
+        )
+        if bfchars is not None:
+            page["/Resources"] = pikepdf.Dictionary(
+                {"/Font": pikepdf.Dictionary({"/F1": _type0_font(pdf, bfchars)})}
+            )
+        page["/StructParents"] = 0
+        heading = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([0]), Pg=page.obj))
+        body = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([2]), Pg=page.obj))
+        document = pdf.make_indirect(_struct_elem("Document", K=pikepdf.Array([heading, body])))
+        heading["/P"] = document
+        body["/P"] = document
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([document]),
+                "/ParentTree": _parent_tree((0, [heading, None, body])),
+            }
+        )
+        return _save(pdf)
+
+    def test_block_becomes_an_element_between_its_neighbours(self) -> None:
+        original = self._build(b"(HYPOTHESIS TEST  Write Hypotheses) Tj")
+        self.assertEqual(count_orphan_marked_missing_actualtext(original), 1)
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            page = pdf.pages[0]
+            document = pdf.Root["/StructTreeRoot"]["/K"][0]
+            kids = document["/K"]
+            # The non-image Figure pass then makes it a Span speaking its glyphs.
+            self.assertEqual([str(kid["/S"]) for kid in kids], ["/P", "/Span", "/P"])
+            adopted = kids[1]
+            self.assertEqual(int(adopted["/K"]), 1)
+            self.assertEqual(adopted["/P"].objgen, document.objgen)
+            self.assertEqual(adopted["/Pg"].objgen, page.obj.objgen)
+            self.assertNotIn("/Alt", adopted)
+            entry = pdf.Root["/StructTreeRoot"]["/ParentTree"]["/Nums"][1]
+            self.assertEqual(entry[1].objgen, adopted.objgen)
+            data = _read_page_contents(page["/Contents"])
+        self.assertEqual(_get_mcid_block(data, 1)[0], "Span")
+        self.assertFalse(_mcid_bdc_has_actualtext(data, 1))
+        self.assertIn(
+            "page 1: adopted unowned Figure block MCID 1 showing "
+            "'HYPOTHESIS TEST Write Hypotheses' as a Figure under Document "
+            "and named it in the ParentTree",
+            result.actions,
+        )
+
+        again, second = repair_marked_content_actualtext(repaired)
+        self.assertEqual(count_orphan_marked_missing_actualtext(again), 0)
+        self.assertFalse(any("adopted" in action for action in second.actions))
+
+    def test_block_naming_a_private_use_glyph_is_left_alone(self) -> None:
+        # Cambria Math's stretchy delimiters map to U+F000..; an /Alt holding
+        # one would speak nothing for it, so the block stays for review.
+        original = self._build(
+            b"<00010002> Tj", bfchars={"0001": "0041", "0002": "F000"}
+        )
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 1)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            self.assertEqual(len(pdf.Root["/StructTreeRoot"]["/K"][0]["/K"]), 2)
+            data = _read_page_contents(pdf.pages[0]["/Contents"])
+        self.assertIn(b"/Figure<</MCID 1 >> BDC", data)
+        self.assertFalse(_mcid_bdc_has_actualtext(data, 1))
+        self.assertFalse(any("adopted" in action for action in result.actions))
