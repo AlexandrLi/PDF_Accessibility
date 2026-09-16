@@ -452,6 +452,45 @@ endcmap"""
             self.assertGreaterEqual(ord(replaced), 0x2500)
             self.assertLessEqual(ord(replaced), 0x257F)
 
+    def test_more_unreliable_destinations_than_the_placeholder_pool(self) -> None:
+        # Regression: the placeholder search used to wrap a counter inside the
+        # Box Drawing block, so a font with more unreliable glyphs than the
+        # block holds spun forever once every slot was taken. calculus topic
+        # 4b911bb3 has one font needing 163 and hung the sweep for 90 minutes.
+        count = 0x257F - 0x2500 + 2
+        entries = "\n".join(
+            f"<{0xF000 + index:04X}> <{0xF000 + index:04X}>"
+            for index in range(count)
+        )
+        cmap = f"""begincmap
+begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+{count} beginbfchar
+{entries}
+endbfchar
+endcmap"""
+        with pikepdf.new() as pdf:
+            font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/Test"),
+                    ToUnicode=pdf.make_stream(cmap.encode("latin1")),
+                )
+            )
+            self.assertTrue(_replace_unreliable_font_tounicode(pdf, font))
+            mapping = _load_tounicode_map(font)
+            replaced = [mapping.get(0xF000 + index) for index in range(count)]
+            self.assertEqual(
+                [char for char in replaced if char is None],
+                [],
+                "every unreliable destination gets a placeholder",
+            )
+            self.assertTrue(
+                all(0x2500 <= ord(char) <= 0x257F for char in replaced if char)
+            )
+
     def test_dedupe_replaces_unreliable_unicode_destinations(self) -> None:
         cmap = """begincmap
 begincodespacerange

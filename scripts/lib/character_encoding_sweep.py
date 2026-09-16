@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 
 import pikepdf
@@ -193,6 +194,40 @@ def _is_unreliable_tounicode_text(text: str) -> bool:
         or 0xE000 <= ord(char) <= 0xF8FF
         for char in text
     )
+
+
+# Placeholders are Box Drawing characters, the range
+# `_is_encoding_placeholder` in marked_content_actualtext_sweep recognizes so
+# the ActualText stage refuses to speak one. Widening the pool past it would
+# let a later sweep speak a placeholder as if it named its glyph.
+_PLACEHOLDER_FIRST = 0x2500
+_PLACEHOLDER_LAST = 0x257F
+_PLACEHOLDER_COUNT = _PLACEHOLDER_LAST - _PLACEHOLDER_FIRST + 1
+
+
+class _PlaceholderChars:
+    """Hand out placeholder characters for unreliable /ToUnicode destinations.
+
+    A font with more unreliable glyphs than the pool holds reuses characters
+    rather than looking forever for a free one. The placeholders carry no
+    meaning of their own and nothing speaks them, so a repeat costs only the
+    ability to tell two unmapped glyphs apart in extracted text.
+    """
+
+    def __init__(self, used: Iterable[str]) -> None:
+        self._used = set(used)
+        self._offset = 0
+
+    def take(self) -> str:
+        for _ in range(_PLACEHOLDER_COUNT):
+            char = chr(_PLACEHOLDER_FIRST + self._offset % _PLACEHOLDER_COUNT)
+            self._offset += 1
+            if char not in self._used:
+                self._used.add(char)
+                return char
+        char = chr(_PLACEHOLDER_FIRST + self._offset % _PLACEHOLDER_COUNT)
+        self._offset += 1
+        return char
 
 
 @dataclass
@@ -557,27 +592,18 @@ def _replace_unreliable_font_tounicode(
 
     used_dst: set[str] = set()
     replacements: list[tuple[int, str, str, str]] = []
-    next_fallback = 0x2500
     bfchar_pairs = _parse_bfchar_pairs(data)
     for _index, (src, dst) in enumerate(bfchar_pairs):
         if len(src) > 4:
             continue
         used_dst.add(_unicode_from_tounicode_dst(dst))
+    placeholders = _PlaceholderChars(used_dst)
     for index, (src, dst) in enumerate(bfchar_pairs):
         if len(src) > 4:
             continue
         unicode_char = _unicode_from_tounicode_dst(dst)
         if _is_unreliable_tounicode_text(unicode_char):
-            fallback_codepoint = next_fallback
-            while chr(fallback_codepoint) in used_dst:
-                fallback_codepoint += 1
-                if fallback_codepoint > 0x257F:
-                    fallback_codepoint = 0x2500
-            next_fallback = fallback_codepoint + 1
-            if next_fallback > 0x257F:
-                next_fallback = 0x2500
-            fallback_char = chr(fallback_codepoint)
-            used_dst.add(fallback_char)
+            fallback_char = placeholders.take()
             fallback_hex = fallback_char.encode("utf-16-be").hex().upper()
             replacements.append((index, src, dst, fallback_hex))
 
@@ -940,8 +966,7 @@ def _repair_missing_tounicode(
         is_winansi = not is_cid and font.get("/Encoding") == pikepdf.Name(
             "/WinAnsiEncoding"
         )
-        used_dst = set(entries.values())
-        next_fallback = 0x2500
+        placeholders = _PlaceholderChars(entries.values())
         added: dict[int, str] = {}
         for code in sorted(used - set(entries)):
             winansi_char = _winansi_char(code) if is_winansi else None
@@ -954,16 +979,7 @@ def _repair_missing_tounicode(
             elif not is_cid and 0x20 <= code <= 0x7E and code in valid_codepoints:
                 added[code] = chr(code)
             else:
-                fallback = next_fallback
-                while chr(fallback) in used_dst:
-                    fallback += 1
-                    if fallback > 0x257F:
-                        fallback = 0x2500
-                next_fallback = fallback + 1
-                if next_fallback > 0x257F:
-                    next_fallback = 0x2500
-                added[code] = chr(fallback)
-                used_dst.add(chr(fallback))
+                added[code] = placeholders.take()
 
         if not entries and not added:
             continue
