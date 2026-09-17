@@ -2281,14 +2281,19 @@ class DeadAltFigureOwnerTests(unittest.TestCase):
     Figure blocks goes back under the nearest reachable container."""
 
     @staticmethod
-    def _build(*, alt: str) -> bytes:
+    def _build(*, alt: str, bfchars: dict[str, str] | None = None) -> bytes:
         pdf = pikepdf.Pdf.new()
         page = pdf.add_blank_page()
+        first = b"<0001> Tj" if bfchars is not None else b"(x) Tj"
         page["/Contents"] = pdf.make_stream(
-            b"/Figure<</MCID 0 >> BDC BT (x) Tj ET EMC "
-            b"/Figure<</MCID 1 >> BDC BT (= y) Tj ET EMC "
+            b"/Figure<</MCID 0 >> BDC BT /F1 10 Tf " + first + b" ET EMC "
+            b"/Figure<</MCID 1 >> BDC BT /F1 10 Tf (= y) Tj ET EMC "
             b"/P<</MCID 2 >> BDC (body) Tj EMC"
         )
+        if bfchars is not None:
+            page["/Resources"] = pikepdf.Dictionary(
+                {"/Font": pikepdf.Dictionary({"/F1": _type0_font(pdf, bfchars)})}
+            )
         page["/StructParents"] = 0
         paragraph = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([2]), Pg=page.obj))
         # The earlier round left this Figure over the table it reverted; it
@@ -2345,15 +2350,43 @@ class DeadAltFigureOwnerTests(unittest.TestCase):
             result.actions,
         )
 
-    def test_dead_figure_with_caption_only_alt_stays_out_of_the_tree(self) -> None:
-        # Reattached, this alt would be spoken in place of the equation and
-        # stamped over its first block.
+    def test_caption_only_alt_is_dropped_when_the_blocks_name_their_glyphs(self) -> None:
+        # Reattached with this alt, the equation would be spoken as a caption;
+        # without it the element becomes a Span and the glyphs speak.
         original = self._build(
             alt="Figure 10. Spoken formula notation for inline chemistry text."
         )
 
         repaired, result = repair_marked_content_actualtext(original)
 
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            document = pdf.Root["/StructTreeRoot"]["/K"][0]
+            kids = document["/K"]
+            self.assertEqual([str(kid["/S"]) for kid in kids], ["/Figure", "/Span", "/P"])
+            self.assertNotIn("/Alt", kids[1])
+            self.assertNotIn("/C", kids[1])
+            data = _read_page_contents(pdf.pages[0]["/Contents"])
+        self.assertEqual(_get_mcid_block(data, 0)[0], "Span")
+        self.assertFalse(_mcid_bdc_has_actualtext(data, 0))
+        self.assertIn(
+            "page 1: reattached unreachable Figure 'Figure 10. Spoken formula "
+            "notation for i' owning orphan MCIDs [0, 1] under Document, dropping "
+            "the alt that names none of its text",
+            result.actions,
+        )
+
+    def test_caption_only_alt_over_an_unnamed_glyph_stays_out_of_the_tree(self) -> None:
+        # The first block's glyph maps to Private Use, so nothing in the file
+        # says what the reader would hear; the Figure stays for review.
+        original = self._build(
+            alt="Figure 10. Spoken formula notation for inline chemistry text.",
+            bfchars={"0001": "F000"},
+        )
+
+        repaired, result = repair_marked_content_actualtext(original)
+
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 2)
         with pikepdf.open(io.BytesIO(repaired)) as pdf:
             document = pdf.Root["/StructTreeRoot"]["/K"][0]
             self.assertEqual(len(document["/K"]), 2)
@@ -2545,6 +2578,42 @@ class UnownedTextFigureBlockTests(unittest.TestCase):
         again, second = repair_marked_content_actualtext(repaired)
         self.assertEqual(count_orphan_marked_missing_actualtext(again), 0)
         self.assertFalse(any("adopted" in action for action in second.actions))
+
+    def test_block_is_placed_by_the_next_neighbour_when_the_nearest_is_out_of_order(self) -> None:
+        # An earlier stage appended the element for MCID 1 after the one for
+        # MCID 2, so the slot beside it does not bracket MCID 0; the slot
+        # beside MCID 2's element does.
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page()
+        page["/Contents"] = pdf.make_stream(
+            b"/Figure<</MCID 0 >> BDC BT /F1 10 Tf (TOPIC: SERIES) Tj ET EMC "
+            b"/P<</MCID 1 >> BDC BT /F1 10 Tf (PRACTICE) Tj ET EMC "
+            b"/P<</MCID 2 >> BDC BT /F1 10 Tf (body) Tj ET EMC"
+        )
+        page["/StructParents"] = 0
+        practice = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([1]), Pg=page.obj))
+        body = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([2]), Pg=page.obj))
+        document = pdf.make_indirect(_struct_elem("Document", K=pikepdf.Array([body, practice])))
+        practice["/P"] = document
+        body["/P"] = document
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([document]),
+                "/ParentTree": _parent_tree((0, [None, practice, body])),
+            }
+        )
+
+        repaired, result = repair_marked_content_actualtext(_save(pdf))
+
+        self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 0)
+        with pikepdf.open(io.BytesIO(repaired)) as pdf:
+            kids = pdf.Root["/StructTreeRoot"]["/K"][0]["/K"]
+            # The adopted element is the Span; its neighbours keep their order.
+            self.assertEqual([str(kid["/S"]) for kid in kids], ["/Span", "/P", "/P"])
+            self.assertEqual(int(kids[0]["/K"]), 0)
+            self.assertEqual([int(kid["/K"][0]) for kid in list(kids)[1:]], [2, 1])
+        self.assertTrue(any("adopted unowned Figure block MCID 0" in a for a in result.actions))
 
     def test_block_naming_a_private_use_glyph_is_left_alone(self) -> None:
         # Cambria Math's stretchy delimiters map to U+F000..; an /Alt holding

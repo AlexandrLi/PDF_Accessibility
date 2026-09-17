@@ -3150,6 +3150,7 @@ def _repair_dead_alt_figure_owners(
             continue
         page_key = page.obj.objgen
         page_owned = {mcid for pg, mcid in owned_page_mcids if pg == page_key}
+        font_code_maps: dict[str, FontCodeMap] | None = None
         for mcid, tag in _iter_bdc_mcids_on_page(data):
             if tag != "Figure" or mcid in page_owned or mcid in wildcard_mcids:
                 continue
@@ -3159,17 +3160,24 @@ def _repair_dead_alt_figure_owners(
             alt_text = _normalize_figure_alt_text(owner.get("/Alt"))
             if owner.get("/S") != "/Figure" or not alt_text:
                 continue
-            if _figure_alt_names_no_content(alt_text, owner):
-                # Once reattached, the Alt is what a reader hears in place of
-                # the blocks, and the inline-formula walk stamps it over the
-                # first one. A label or caption would silence the equation.
-                continue
             owner_page = owner.get("/Pg")
             if owner_page is not None and owner_page.objgen != page_key:
                 continue
             mcids = _collect_mcids(owner.get("/K"))
             if mcid not in mcids or any(other in page_owned for other in mcids):
                 continue
+            drop_alt = _figure_alt_names_no_content(alt_text, owner)
+            if drop_alt:
+                # Once reattached, the Alt is what a reader hears in place of
+                # the blocks, and the inline-formula walk stamps it over the
+                # first one. A label or caption would silence the equation, so
+                # it goes only when every block names its own glyphs; with no
+                # Alt the non-image Figure pass makes the element a Span and
+                # the reader hears those glyphs.
+                if font_code_maps is None:
+                    font_code_maps = _page_font_code_maps(page)
+                if _figure_blocks_glyph_text(data, mcids, font_code_maps) is None:
+                    continue
             placement = _reachable_container_for(owner, reachable)
             if placement is None:
                 continue
@@ -3189,6 +3197,11 @@ def _repair_dead_alt_figure_owners(
             container["/K"] = pikepdf.Array(kids)
             owner["/P"] = container
             _set_struct_page_if_missing(owner, page)
+            if drop_alt:
+                del owner["/Alt"]
+                if "/Contents" in owner:
+                    del owner["/Contents"]
+                _strip_inline_formula_class(owner)
             reachable.add(owner.objgen)
             page_owned.update(mcids)
             updated += 1
@@ -3196,8 +3209,44 @@ def _repair_dead_alt_figure_owners(
                 f"page {index}: reattached unreachable Figure {alt_text[:40]!r} "
                 f"owning orphan MCIDs {mcids} under "
                 f"{str(container['/S']).lstrip('/')}"
+                + (", dropping the alt that names none of its text" if drop_alt else "")
             )
     return updated
+
+
+def _figure_blocks_glyph_text(
+    data: bytes,
+    mcids: list[int],
+    font_code_maps: dict[str, FontCodeMap],
+) -> str | None:
+    """The text a Figure's blocks show, or None unless every glyph is named.
+
+    A block that draws an image or XObject, hides its text behind the clip,
+    or shows a glyph the font does not name (or names into Private Use) makes
+    the whole Figure unnameable; blocks that paint only rules add nothing.
+    """
+    parts: list[str] = []
+    for mcid in mcids:
+        block = _get_mcid_block_to_emc(data, mcid)
+        if block is None:
+            return None
+        start, _end, body = block
+        if _mcid_body_has_image(body) or _body_xobject_names(body):
+            return None
+        if not _body_has_show_ops(body):
+            continue
+        decoded = _decode_shown_text_in_order(
+            body,
+            font_code_maps=font_code_maps,
+            initial_font=_font_in_effect_at(data, start),
+        )
+        if decoded is None or any(_is_private_use(char) for char in decoded):
+            return None
+        if decoded.strip() and _shown_text_clipped_away(data, mcid):
+            return None
+        parts.append(decoded)
+    text = " ".join(" ".join(parts).split())
+    return text or None
 
 
 def _struct_layout_bbox(
@@ -3366,17 +3415,32 @@ def _unowned_figure_block_placement(
     The block goes after the owned block before it in content order, or
     before the one after it, at the level of the nearest reachable ancestor
     that takes a Figure. The kids on both sides of that slot must bracket the
-    MCID, or the tree's order disagrees with the stream's and nothing is
-    inferred.
+    MCID, or the tree's order disagrees with the stream's there; the next
+    neighbour out is tried, since an earlier stage may have appended one
+    element out of order, and nothing is inferred when no slot brackets.
     """
-    before = [number for number in owners if number < mcid]
-    after = [number for number in owners if number > mcid]
-    if before:
-        neighbour, offset = owners[max(before)], 1
-    elif after:
-        neighbour, offset = owners[min(after)], 0
-    else:
-        return None
+    before = sorted((number for number in owners if number < mcid), reverse=True)
+    after = sorted(number for number in owners if number > mcid)
+    neighbours = [(owners[number], 1) for number in before] + [
+        (owners[number], 0) for number in after
+    ]
+    for neighbour, offset in neighbours:
+        slot = _bracketing_slot(
+            mcid, neighbour, offset, subtree=subtree, reachable=reachable
+        )
+        if slot is not None:
+            return slot
+    return None
+
+
+def _bracketing_slot(
+    mcid: int,
+    neighbour: pikepdf.Dictionary,
+    offset: int,
+    *,
+    subtree: dict[tuple[int, int], set[int]],
+    reachable: set[tuple[int, int]],
+) -> tuple[pikepdf.Dictionary, int] | None:
     placement = _reachable_container_for(neighbour, reachable)
     if placement is None:
         return None
