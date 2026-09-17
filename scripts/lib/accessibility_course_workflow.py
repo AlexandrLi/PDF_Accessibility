@@ -145,8 +145,11 @@ def run_sweeps(
             return None
 
     run_stage("tabOrder", repair_tab_order)
-    run_stage("taggedContent", repair_tagged_content)
+    # taggedAnnotations reconnects unreachable subtrees, which changes the set of
+    # orphan blocks taggedContent adopts, so it has to run first or taggedContent
+    # leaves work a second pass would do and the run is not byte-stable.
     run_stage("taggedAnnotations", repair_tagged_annotations)
+    run_stage("taggedContent", repair_tagged_content)
 
     started = perf_counter()
     try:
