@@ -503,8 +503,10 @@ def _effective_page_resources(page: pikepdf.Page) -> pikepdf.Dictionary:
     return pikepdf.Dictionary()
 
 
-def _effective_page_fonts(page: pikepdf.Page) -> list[tuple[str, pikepdf.Dictionary]]:
-    fonts = _effective_page_resources(page).get("/Font")
+def _resource_dict_fonts(
+    resources: pikepdf.Dictionary,
+) -> list[tuple[str, pikepdf.Dictionary]]:
+    fonts = resources.get("/Font")
     if not isinstance(fonts, pikepdf.Dictionary):
         return []
     return [
@@ -514,10 +516,62 @@ def _effective_page_fonts(page: pikepdf.Page) -> list[tuple[str, pikepdf.Diction
     ]
 
 
+def _reachable_page_fonts(
+    page: pikepdf.Page,
+) -> list[tuple[str, pikepdf.Dictionary, pikepdf.Page | pikepdf.Stream]]:
+    """Fonts the page and every form XObject it draws can select.
+
+    Each font comes with the page or form whose content stream selects it,
+    because a resource name only means something inside the dictionary that
+    defines it. A form can reach itself through its own resources, so every
+    form is walked once.
+    """
+    found: list[tuple[str, pikepdf.Dictionary, pikepdf.Page | pikepdf.Stream]] = []
+    seen_forms: set[tuple[int, int]] = set()
+    pending: list[tuple[pikepdf.Dictionary, pikepdf.Page | pikepdf.Stream]] = [
+        (_effective_page_resources(page), page)
+    ]
+    while pending:
+        resources, source = pending.pop()
+        for name, font in _resource_dict_fonts(resources):
+            found.append((name, font, source))
+        xobjects = resources.get("/XObject")
+        if not isinstance(xobjects, pikepdf.Dictionary):
+            continue
+        for _name, xobject in xobjects.items():
+            if not isinstance(xobject, pikepdf.Stream):
+                continue
+            if xobject.get("/Subtype") != "/Form" or xobject.objgen in seen_forms:
+                continue
+            seen_forms.add(xobject.objgen)
+            nested = xobject.get("/Resources")
+            if isinstance(nested, pikepdf.Dictionary):
+                pending.append((nested, xobject))
+    return found
+
+
+def _effective_page_fonts(page: pikepdf.Page) -> list[tuple[str, pikepdf.Dictionary]]:
+    return [(name, font) for name, font, _source in _reachable_page_fonts(page)]
+
+
+def _source_contents(source: pikepdf.Page | pikepdf.Stream) -> bytes:
+    if isinstance(source, pikepdf.Stream):
+        try:
+            return source.read_bytes()
+        except pikepdf.PdfError:
+            return b""
+    contents = source.get("/Contents")
+    if contents is None:
+        return b""
+    return _read_page_contents(contents)
+
+
 def _page_fontmaps(page: pikepdf.Page) -> dict[str, dict[int, str]]:
+    # Page content only: a form's /F1 may be a different font than the
+    # page's /F1, and these maps decode page content streams.
     return {
         name: _load_tounicode_map(font)
-        for name, font in _effective_page_fonts(page)
+        for name, font in _resource_dict_fonts(_effective_page_resources(page))
     }
 
 
@@ -901,14 +955,15 @@ def _repair_missing_tounicode(
     placeholder character.
     """
     fonts_by_key: dict[tuple[int, int] | tuple[str, int], pikepdf.Dictionary] = {}
-    names_by_key: dict[tuple[int, int] | tuple[str, int], set[str]] = {}
-    pages_by_key: dict[tuple[int, int] | tuple[str, int], list[pikepdf.Page]] = {}
+    usages_by_key: dict[
+        tuple[int, int] | tuple[str, int],
+        list[tuple[str, pikepdf.Page | pikepdf.Stream]],
+    ] = {}
     for page in pdf.pages:
-        for name, font in _effective_page_fonts(page):
+        for name, font, source in _reachable_page_fonts(page):
             key = _font_key(font)
             fonts_by_key[key] = font
-            names_by_key.setdefault(key, set()).add(name)
-            pages_by_key.setdefault(key, []).append(page)
+            usages_by_key.setdefault(key, []).append((name, source))
 
     donors: dict[tuple[tuple[int, int], str], pikepdf.Object] = {}
     for font in fonts_by_key.values():
@@ -945,12 +1000,10 @@ def _repair_missing_tounicode(
                 entries.setdefault(int(src, 16), _unicode_from_tounicode_dst(dst))
 
         used: set[int] = set()
-        for page in pages_by_key.get(key, []):
-            data = _read_page_contents(page.get("/Contents"))
+        for name, source in usages_by_key.get(key, []):
+            data = _source_contents(source)
             if data:
-                used.update(
-                    _used_codes_for_font(data, names_by_key[key], two_byte=is_cid)
-                )
+                used.update(_used_codes_for_font(data, {name}, two_byte=is_cid))
 
         font_buffer = (
             file_stream.read_bytes() if file_stream is not None else b""

@@ -556,6 +556,65 @@ endcmap"""
             self.assertGreaterEqual(ord(replaced), 0x2500)
             self.assertLessEqual(ord(replaced), 0x257F)
 
+    def test_unreliable_font_in_nested_form_xobject_gets_placeholders(self) -> None:
+        # Regression: fonts reached only through a form XObject's /Resources
+        # were never repaired. The form sits inside another form and draws
+        # its parent again, so the walk also has to stop at a resource cycle,
+        # and the page's own /F1 must stay untouched.
+        with pikepdf.new() as pdf:
+            page = pdf.add_blank_page()
+            page_font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/PageFont"),
+                    ToUnicode=pdf.make_stream(b"1 beginbfchar\n<41> <0041>\nendbfchar"),
+                )
+            )
+            form_font = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Font"),
+                    Subtype=pikepdf.Name("/Type1"),
+                    BaseFont=pikepdf.Name("/FormFont"),
+                    ToUnicode=pdf.make_stream(
+                        b"2 beginbfchar\n<41> <0042>\n<42> <FFFD>\nendbfchar"
+                    ),
+                )
+            )
+            outer = pdf.make_stream(b"/Fx1 Do")
+            inner = pdf.make_stream(b"BT /F1 12 Tf (AB) Tj ET")
+            for form in (outer, inner):
+                form["/Type"] = pikepdf.Name("/XObject")
+                form["/Subtype"] = pikepdf.Name("/Form")
+                form["/BBox"] = pikepdf.Array([0, 0, 100, 100])
+            outer["/Resources"] = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(Fx1=inner)
+            )
+            inner["/Resources"] = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(F1=form_font),
+                XObject=pikepdf.Dictionary(Fx0=outer),
+            )
+            page["/Resources"] = pikepdf.Dictionary(
+                Font=pikepdf.Dictionary(F1=page_font),
+                XObject=pikepdf.Dictionary(Fx0=outer),
+            )
+            page["/Contents"] = pdf.make_stream(b"BT /F1 12 Tf (A) Tj ET /Fx0 Do")
+            buf = io.BytesIO()
+            pdf.save(buf)
+
+        repaired, result = repair_character_encoding(buf.getvalue())
+        self.assertEqual(result.fonts_inspected, 2)
+        self.assertEqual(result.fonts_updated, 1)
+        with pikepdf.open(io.BytesIO(repaired)) as opened:
+            resources = opened.pages[0].Resources
+            self.assertEqual(_load_tounicode_map(resources.Font.F1), {0x41: "A"})
+            inner = resources.XObject.Fx0.Resources.XObject.Fx1
+            mapping = _load_tounicode_map(inner.Resources.Font.F1)
+            self.assertEqual(mapping[0x41], "B")
+            self.assertEqual(len(mapping[0x42]), 1)
+            self.assertGreaterEqual(ord(mapping[0x42]), 0x2500)
+            self.assertLessEqual(ord(mapping[0x42]), 0x257F)
+
     def test_repair_character_encoding_idempotent_for_biochemistry_topics(self) -> None:
         for topic_id in _ENCODING_FIX_TOPIC_IDS:
             pdf_path = _ENCODING_FIX_DIR / f"{topic_id}-before.pdf"
