@@ -54,7 +54,10 @@ residual whose only categories are Tables Headers or Tables Regularity also
 qualifies, since the local table audit is stricter than Acrobat), the
 file changed, the Adobe API reports zero failed rules, and the render is
 identical or the topic was Auto-Tagged with no page changing more than
-`--max-render-diff` (default 5%) of its pixels. Everything else lands in
+`--max-render-diff` (default 5%) of its pixels. A residual whose only
+category is Other Elements Alternate Text (orphan text blocks in fonts the
+file cannot name) also qualifies when the Adobe API passes, but that topic
+is never high confidence, so its row waits for the user's check on dev. Everything else lands in
 `reports/<course>-auto-<timestamp>.auto.review.json` with the reasons.
 
 The Adobe API passes files desktop Acrobat fails, so an `auto` push is not

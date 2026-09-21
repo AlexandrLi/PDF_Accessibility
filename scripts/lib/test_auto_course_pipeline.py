@@ -146,7 +146,7 @@ class DecisionTests(unittest.TestCase):
         passed = decide_topic(topic, adobe=PASS, autotagged=False, max_render_diff=0.05)
         self.assertTrue(passed["publishable"])
         self.assertTrue(passed["residualException"])
-        self.assertTrue(passed["notes"][0].startswith("local table audit residual"))
+        self.assertTrue(passed["notes"][0].startswith("local audit residual"))
         held = decide_topic(topic, adobe=None, autotagged=False, max_render_diff=0.05)
         self.assertIn("resultKind residual (Tables Headers, Tables Regularity)", held["reasons"])
         mixed = _topic(
@@ -154,6 +154,26 @@ class DecisionTests(unittest.TestCase):
             residualCategories={"Tables Headers": "residual", "Other Elements": "residual"},
         )
         self.assertFalse(is_check_candidate(mixed))
+
+    def test_orphan_block_residual_defers_to_adobe_but_is_not_high_confidence(self) -> None:
+        topic = _topic(
+            resultKind="residual",
+            residualCategories={
+                "Tables Headers": "resolved",
+                "Other Elements Alternate Text": "residual",
+            },
+        )
+        self.assertTrue(is_check_candidate(topic))
+        passed = decide_topic(topic, adobe=PASS, autotagged=False, max_render_diff=0.05)
+        self.assertTrue(passed["publishable"])
+        self.assertTrue(passed["residualException"])
+        held = decide_topic(topic, adobe=None, autotagged=False, max_render_diff=0.05)
+        self.assertIn("resultKind residual (Other Elements Alternate Text)", held["reasons"])
+        verdict = high_confidence(
+            topic, PASS, row_rules=["Other Elements"], fonts_without_tounicode=0
+        )
+        self.assertFalse(verdict["high"])
+        self.assertTrue(verdict["reasons"][0].startswith("pushed on a local"))
 
     def test_adobe_failure_holds_a_locally_resolved_topic(self) -> None:
         adobe = {**PASS, "pass": False, "failed": 2, "failedRules": ["Page Content: Other Elements"]}

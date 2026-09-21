@@ -8,8 +8,10 @@ or Adobe.
 A topic is publishable when every one of these holds:
 
 - the sweep finished with resultKind "resolved" and a byte-stable second pass,
-  or its only residual categories are the local table audit's (Tables Headers,
-  Tables Regularity), which Acrobat is known to accept;
+  or its only residual categories are ones the Adobe report decides: the local
+  table audit's (Tables Headers, Tables Regularity), which Acrobat is known to
+  accept, and Other Elements Alternate Text, the orphan text blocks whose glyphs
+  nothing in the file can name;
 - the repaired file differs from the original (otherwise there is nothing to
   push);
 - the Adobe PDF Services accessibility checker reports zero failed rules on
@@ -23,8 +25,10 @@ A pushed topic is "high confidence" when, on top of that, the render is
 byte-identical, Adobe marks nothing "Needs manual check" beyond the two rules
 it always marks that way, every rule named on the topic's tracker row passed,
 and no font lacks a ToUnicode map (the case where desktop Acrobat is stricter
-than the API). The orchestrator ticks those tracker rows itself; the rest wait
-for the user's check on dev.
+than the API). A topic published on an Other Elements Alternate Text residual
+is never high confidence, since desktop Acrobat is the checker that first
+failed those rows. The orchestrator ticks the high-confidence rows itself; the
+rest wait for the user's check on dev.
 """
 
 from __future__ import annotations
@@ -211,6 +215,10 @@ def high_confidence(
         reasons.append("no tracker row")
     if topic.get("renderIdentical") is not True or topic.get("autotagged"):
         reasons.append("render not byte-identical")
+    if orphan_block_residual(topic):
+        reasons.append(
+            f"pushed on a local {ORPHAN_BLOCK_CATEGORY} residual; awaiting desktop check"
+        )
     if adobe is None or not adobe.get("pass"):
         reasons.append("Adobe check did not pass")
     else:
@@ -345,9 +353,14 @@ def retag_topic(
 
 
 # The local table audit is stricter than Acrobat: it flags rows of unequal
-# width and headerless data cells that Acrobat's Tables rules accept. When
-# these are the only residual categories, the Adobe report decides.
+# width and headerless data cells that Acrobat's Tables rules accept.
 TABLE_CATEGORIES = frozenset({"Tables Headers", "Tables Regularity"})
+# Orphan text blocks the sweep cannot name (Acrobat-generated CFF fonts with
+# Private Use ToUnicode destinations) stay residual locally while the Adobe
+# checker passes the file (calculus 40ecc90a, 409dcc33, 2026-09-21).
+ORPHAN_BLOCK_CATEGORY = "Other Elements Alternate Text"
+# When these are the only residual categories, the Adobe report decides.
+ADOBE_DECIDED_CATEGORIES = TABLE_CATEGORIES | {ORPHAN_BLOCK_CATEGORY}
 
 
 def held_categories(topic: dict[str, Any]) -> list[str]:
@@ -355,14 +368,19 @@ def held_categories(topic: dict[str, Any]) -> list[str]:
     return sorted(name for name, status in categories.items() if status != "resolved")
 
 
-def table_only_residual(topic: dict[str, Any]) -> bool:
-    """True when the sweep's only complaint is the local table audit."""
+def adobe_decided_residual(topic: dict[str, Any]) -> bool:
+    """True when the sweep's only complaints are categories the Adobe report decides."""
     held = held_categories(topic)
     return (
         topic.get("resultKind") == "residual"
         and bool(held)
-        and set(held) <= TABLE_CATEGORIES
+        and set(held) <= ADOBE_DECIDED_CATEGORIES
     )
+
+
+def orphan_block_residual(topic: dict[str, Any]) -> bool:
+    """True when the sweep left orphan text blocks it could not name."""
+    return ORPHAN_BLOCK_CATEGORY in held_categories(topic)
 
 
 def decide_topic(
@@ -375,7 +393,7 @@ def decide_topic(
 ) -> dict[str, Any]:
     """Return {"publishable", "reasons", "notes", "renderException", "residualException"}.
 
-    `residualException` marks a table-only residual that Adobe passed; the
+    `residualException` marks an Adobe-decided residual that Adobe passed; the
     publisher needs it as an approved exception because the manifest entry
     still says residual.
     """
@@ -386,11 +404,11 @@ def decide_topic(
         reasons.append("sweep failed: " + "; ".join(topic.get("errors") or ["unknown"]))
     if topic.get("resultKind") != "resolved":
         held = held_categories(topic)
-        if table_only_residual(topic) and adobe is not None and adobe.get("pass"):
+        if adobe_decided_residual(topic) and adobe is not None and adobe.get("pass"):
             residual_override = True
             notes.append(
-                f"local table audit residual ({', '.join(held)}) overridden: "
-                "Adobe passes both Tables rules"
+                f"local audit residual ({', '.join(held)}) overridden: "
+                "Adobe passes every rule"
             )
         else:
             reasons.append(
@@ -434,10 +452,10 @@ def decide_topic(
 
 
 def is_check_candidate(topic: dict[str, Any]) -> bool:
-    """Topics worth an Adobe API call: resolved (or table-only residual), stable, changed."""
+    """Topics worth an Adobe API call: resolved (or Adobe-decided residual), stable, changed."""
     return (
         topic.get("status") != "failed"
-        and (topic.get("resultKind") == "resolved" or table_only_residual(topic))
+        and (topic.get("resultKind") == "resolved" or adobe_decided_residual(topic))
         and topic.get("secondPassByteStable") is True
         and bool(topic.get("reSweptSha256"))
         and topic.get("reSweptSha256") != topic.get("originalSha256")
