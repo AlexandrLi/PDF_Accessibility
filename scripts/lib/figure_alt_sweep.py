@@ -10,6 +10,7 @@ import pikepdf
 from lib.figure_alt_quality import (
     SuspiciousFigureAlt,
     classify_figure_alt,
+    speaks_for_content,
     struct_class_names,
 )
 
@@ -207,6 +208,8 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
 
     Any /Alt or /ActualText under the figure is removed first, so the new alt
     does not nest over it; readable fragments of that text join the fallback.
+    A figure whose ancestor already carries /Alt or /ActualText is left alone,
+    because that text speaks for the figure and an alt of its own would nest.
     A figure with no page content at all is dropped from the tree instead,
     because Acrobat fails alternate text that is not associated with content.
     Returns updated PDF bytes and 1-based figure indices that were repaired.
@@ -217,15 +220,20 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
         figure_index = 0
 
-        def walk(obj: pikepdf.Object, parent: pikepdf.Dictionary | None) -> None:
+        def walk(
+            obj: pikepdf.Object,
+            parent: pikepdf.Dictionary | None,
+            spoken_by_ancestor: bool = False,
+        ) -> None:
             nonlocal figure_index, removed_empty
             if not isinstance(obj, pikepdf.Dictionary):
                 return
+            spoken = spoken_by_ancestor or speaks_for_content(obj)
             if obj.get("/S") == "/Figure":
                 figure_index += 1
                 alt = obj.get("/Alt")
                 alt_text = str(alt).strip() if alt is not None else ""
-                if not alt_text:
+                if not alt_text and not spoken_by_ancestor:
                     if parent is not None and not _has_page_content(obj):
                         _remove_child(parent, obj)
                         removed_empty += 1
@@ -246,13 +254,13 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
             if isinstance(kids, pikepdf.Array):
                 for kid in list(kids):
                     if isinstance(kid, pikepdf.Dictionary):
-                        walk(kid, obj)
+                        walk(kid, obj, spoken)
                     elif isinstance(kid, pikepdf.Array):
                         for nested in list(kid):
                             if isinstance(nested, pikepdf.Dictionary):
-                                walk(nested, obj)
+                                walk(nested, obj, spoken)
             elif isinstance(kids, pikepdf.Dictionary):
-                walk(kids, obj)
+                walk(kids, obj, spoken)
 
         struct_root = pdf.Root.get("/StructTreeRoot")
         if struct_root is not None:

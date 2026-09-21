@@ -440,6 +440,26 @@ class IntegerChildRefReconnectionTests(unittest.TestCase):
             self.assertEqual(int(kids[0]), ref_objnum)
             self.assertEqual(str(kids[1].get("/S")), "/Reference")
 
+    def test_reconnection_skips_a_parent_whose_alternate_text_would_enclose_it(self) -> None:
+        pdf_bytes, _ref_objnum = self._build()
+        with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+            root = pdf.Root["/StructTreeRoot"]
+            figure = root["/K"][0]
+            figure["/ActualText"] = pikepdf.String("bullet Images")
+            for obj in pdf.objects:
+                if isinstance(obj, pikepdf.Dictionary) and obj.get("/S") == "/Reference":
+                    obj["/Alt"] = pikepdf.String("Figure 7")
+                    obj["/Contents"] = pikepdf.String("Figure 7")
+            pdf_bytes = _save(pdf)
+
+        repaired, result = repair_tagged_annotations(pdf_bytes)
+
+        self.assertEqual(repaired, pdf_bytes)
+        self.assertFalse(any("reconnected" in action for action in result.actions))
+        self.assertTrue(
+            any("outside the structure tree" in conflict for conflict in result.conflicts)
+        )
+
     def test_reconnection_is_idempotent(self) -> None:
         pdf_bytes, _ref_objnum = self._build()
         repaired_once, _first = repair_tagged_annotations(pdf_bytes)

@@ -8,6 +8,7 @@ from numbers import Integral
 
 import pikepdf
 
+from lib.figure_alt_quality import speaks_for_content
 from lib.tagged_content_sweep import (
     _flatten_parent_tree,
     _object_key,
@@ -436,6 +437,18 @@ _RECONNECT_ALLOWED_PARENTS = {
 }
 
 
+def _spoken_by_ancestor(element: pikepdf.Dictionary) -> bool:
+    """True when this element or one above it replaces its subtree with text."""
+    seen: set[tuple[int, int]] = set()
+    current: pikepdf.Object | None = element
+    while isinstance(current, pikepdf.Dictionary) and current.objgen not in seen:
+        seen.add(current.objgen)
+        if speaks_for_content(current):
+            return True
+        current = current.get("/P")
+    return False
+
+
 def _reconnect_orphaned_parenttree_subtrees(
     pdf: pikepdf.Pdf,
     root: pikepdf.Dictionary,
@@ -450,11 +463,13 @@ def _reconnect_orphaned_parenttree_subtrees(
     fails Adobe's tagged-annotations check for the annotations inside it.
     Reattach an unreachable element only on strong evidence of intent: its /P
     names a parent that is reachable, and its subtree is referenced by the
-    ParentTree (the author registered it as live content). Object numbers are
+    ParentTree (the author registered it as live content). A parent whose own
+    alternate text would enclose the subtree is left alone. Object numbers are
     never compared: pikepdf renumbers objects on every save.
     """
     live_refs = _parent_tree_value_objgens(parent_tree)
     reconnected = 0
+    left_detached: set[tuple[int, int]] = set()
     for _round in range(8):
         reachable = _reachable_struct_objgens(root)
         appended = False
@@ -479,6 +494,20 @@ def _reconnect_orphaned_parenttree_subtrees(
                 # would trade an ignored subtree for an invalid one.
                 continue
             if not (_subtree_objgens(obj) & live_refs):
+                continue
+            if _spoken_by_ancestor(parent):
+                # Acrobat speaks only the outermost alternate text: a Figure
+                # placed under it fails "Nested alternate text" with an /Alt
+                # and "Figures alternate text" without one. Left unreachable,
+                # its ParentTree entry still marks the content as tagged.
+                if obj.objgen in left_detached:
+                    continue
+                left_detached.add(obj.objgen)
+                actions.append(
+                    f"left unreachable {obj.get('/S')} subtree detached: its "
+                    f"parent {parent.get('/S')} carries alternate text that "
+                    "would enclose it"
+                )
                 continue
             kids = parent.get("/K")
             if isinstance(kids, pikepdf.Array):

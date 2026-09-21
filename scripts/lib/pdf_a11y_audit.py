@@ -8,7 +8,12 @@ from numbers import Integral
 
 import pikepdf
 
-from lib.figure_alt_quality import SuspiciousFigureAlt, classify_figure_alt, struct_class_names
+from lib.figure_alt_quality import (
+    SuspiciousFigureAlt,
+    classify_figure_alt,
+    speaks_for_content,
+    struct_class_names,
+)
 from lib.marked_content_actualtext_sweep import (
     count_orphan_marked_missing_actualtext,
     list_untagged_image_mcids_missing_actualtext,
@@ -205,16 +210,18 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         struct_root = pdf.Root.get("/StructTreeRoot")
         tagged_content = collect_tagged_content_diagnostics(pdf)
 
-        def walk_figures(obj: pikepdf.Object) -> None:
+        def walk_figures(obj: pikepdf.Object, spoken_by_ancestor: bool = False) -> None:
             nonlocal figure_index
             if not isinstance(obj, pikepdf.Dictionary):
                 return
+            spoken = spoken_by_ancestor or speaks_for_content(obj)
             if obj.get("/S") == "/Figure":
                 figure_index += 1
                 alt = obj.get("/Alt")
                 alt_text = str(alt).strip() if alt is not None else ""
                 if not alt_text:
-                    figures_missing_alt.append(figure_index)
+                    if not spoken_by_ancestor:
+                        figures_missing_alt.append(figure_index)
                 else:
                     reasons = classify_figure_alt(
                         alt_text,
@@ -232,13 +239,13 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
             if isinstance(kids, pikepdf.Array):
                 for kid in kids:
                     if isinstance(kid, pikepdf.Dictionary):
-                        walk_figures(kid)
+                        walk_figures(kid, spoken)
                     elif isinstance(kid, pikepdf.Array):
                         for nested in kid:
                             if isinstance(nested, pikepdf.Dictionary):
-                                walk_figures(nested)
+                                walk_figures(nested, spoken)
             elif isinstance(kids, pikepdf.Dictionary):
-                walk_figures(kids)
+                walk_figures(kids, spoken)
 
         def walk_tables(obj: pikepdf.Object) -> None:
             nonlocal table_count, tables_without_summary, tables_without_th

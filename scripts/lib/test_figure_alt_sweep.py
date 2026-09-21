@@ -38,6 +38,23 @@ def _pdf_with_figure(*children: pikepdf.Dictionary, alt: str | None = None) -> b
     return output.getvalue()
 
 
+def _pdf_with_figure_under_spoken_span(actual_text: str) -> bytes:
+    pdf = pikepdf.new()
+    figure = _elem("Figure")
+    figure["/K"] = pikepdf.Array([0])
+    span = _elem("Span", ActualText=actual_text)
+    span["/K"] = pikepdf.Array([figure])
+    document = _elem("Document")
+    document["/K"] = pikepdf.Array([span])
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {"/Type": pikepdf.Name("/StructTreeRoot"), "/K": pikepdf.Array([document])}
+    )
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
 def _figure_and_descendants(pdf_bytes: bytes) -> tuple[pikepdf.Dictionary, list[pikepdf.Dictionary]]:
     pdf = pikepdf.open(io.BytesIO(pdf_bytes))
     figure = pdf.Root.StructTreeRoot.K[0].K[0]
@@ -99,6 +116,14 @@ class RepairMissingFigureAltTests(unittest.TestCase):
 
         self.assertEqual(repaired, [])
         self.assertEqual(second, first)
+
+    def test_leaves_a_figure_alone_when_an_ancestor_speaks_for_it(self) -> None:
+        source = _pdf_with_figure_under_spoken_span("bullet Images")
+
+        repaired_bytes, repaired = repair_missing_figure_alt(source)
+
+        self.assertEqual(repaired, [])
+        self.assertEqual(repaired_bytes, source)
 
     def test_drops_a_figure_with_no_page_content_instead_of_stamping_alt(self) -> None:
         source = _pdf_with_figure()

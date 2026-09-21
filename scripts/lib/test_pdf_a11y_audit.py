@@ -126,7 +126,28 @@ def _make_table_pdf(*, residual: bool) -> bytes:
     return output.getvalue()
 
 
+def _make_figure_pdf(*, spoken_ancestor: bool) -> bytes:
+    pdf = pikepdf.new()
+    pdf.add_blank_page(page_size=(200, 200))
+    figure = pikepdf.Dictionary({"/S": pikepdf.Name("/Figure"), "/K": pikepdf.Array([0])})
+    span = pikepdf.Dictionary({"/S": pikepdf.Name("/Span"), "/K": pikepdf.Array([figure])})
+    if spoken_ancestor:
+        span["/ActualText"] = pikepdf.String("bullet Images")
+    document = pikepdf.Dictionary({"/S": pikepdf.Name("/Document"), "/K": pikepdf.Array([span])})
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {"/Type": pikepdf.Name("/StructTreeRoot"), "/K": pikepdf.Array([document])}
+    )
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
 class PdfA11yAuditTests(unittest.TestCase):
+    def test_figure_under_spoken_ancestor_is_not_missing_alt(self) -> None:
+        self.assertEqual(audit_pdf_bytes(_make_figure_pdf(spoken_ancestor=False)).figures_missing_alt, [1])
+        self.assertEqual(audit_pdf_bytes(_make_figure_pdf(spoken_ancestor=True)).figures_missing_alt, [])
+
     def test_clean_table_has_no_table_residuals_and_does_not_block(self) -> None:
         audit = audit_pdf_bytes(_make_table_pdf(residual=False))
 

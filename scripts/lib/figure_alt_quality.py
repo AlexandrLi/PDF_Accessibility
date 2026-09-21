@@ -45,6 +45,19 @@ class SuspiciousFigureAlt:
         }
 
 
+def speaks_for_content(element: pikepdf.Dictionary) -> bool:
+    """True when this element's /Alt or /ActualText replaces everything under it.
+
+    Acrobat reads such a subtree as one utterance, so a Figure inside it needs
+    no alt of its own, and giving it one fails "Nested alternate text".
+    """
+    for key in ("/Alt", "/ActualText"):
+        value = element.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
 def struct_class_names(struct_elem: object) -> set[str]:
     """Return Adobe style class names from a struct element /C entry."""
     if not hasattr(struct_elem, "get"):
