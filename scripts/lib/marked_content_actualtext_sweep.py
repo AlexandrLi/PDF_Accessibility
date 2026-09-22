@@ -55,6 +55,192 @@ def _pdf_literal_string(text: str) -> bytes:
     return bytes(out)
 
 
+
+_OVERFLOWING_OCTAL_ESCAPE = re.compile(rb"\\[4-7][0-7]{2}")
+_LEGACY_OCTAL_ESCAPE = re.compile(rb"\\[4-7][0-7]{2}|\\[0-7]{4,}")
+_ACTUALTEXT_LITERAL_OPEN = re.compile(rb"/ActualText\s*\(")
+_LITERAL_ESCAPES = {
+    b"n": "\n",
+    b"r": "\r",
+    b"t": "\t",
+    b"b": "\b",
+    b"f": "\f",
+    b"(": "(",
+    b")": ")",
+    b"\\": "\\",
+}
+
+
+def _legacy_literal_string(text: str) -> bytes:
+    """The literal the writer before 2026-09-02 produced for text.
+
+    It spelled every character above 126 as its whole codepoint in octal, so
+    a codepoint above 255 became an escape no lexer can read as one byte.
+    """
+    out = bytearray(b"(")
+    for char in text:
+        code = ord(char)
+        if char in ("\\", "(", ")"):
+            out.extend(f"\\{char}".encode("latin1"))
+        elif code > 126:
+            out.extend(f"\\{code:03o}".encode("latin1"))
+        else:
+            out.extend(char.encode("latin1"))
+    out.extend(b")")
+    return bytes(out)
+
+
+def _literal_string_end(data: bytes, start: int) -> int | None:
+    """Index just past the parenthesis closing the literal that opens at start."""
+    depth = 0
+    index = start
+    while index < len(data):
+        byte = data[index]
+        if byte == 0x5C:
+            index += 2
+            continue
+        if byte == 0x28:
+            depth += 1
+        elif byte == 0x29:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return None
+
+
+def _decode_legacy_literal(literal: bytes) -> str | None:
+    """Read a literal as its legacy writer meant it: an escape is the whole digit run."""
+    body = literal[1:-1]
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        if body[index : index + 1] != b"\\":
+            out.append(chr(body[index]))
+            index += 1
+            continue
+        index += 1
+        digits = re.match(rb"[0-7]{1,7}", body[index:])
+        if digits is not None:
+            code = int(digits.group(0), 8)
+            if code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
+                return None
+            out.append(chr(code))
+            index += len(digits.group(0))
+            continue
+        escaped = body[index : index + 1]
+        if escaped not in _LITERAL_ESCAPES:
+            return None
+        out.append(_LITERAL_ESCAPES[escaped])
+        index += 1
+    return "".join(out)
+
+
+def _enclosing_bdc_mcid(data: bytes, key_start: int, literal_end: int) -> int | None:
+    """MCID of the property dictionary holding the /ActualText key at key_start."""
+    dict_start = data.rfind(b"<<", 0, key_start)
+    dict_end = data.find(b">>", literal_end)
+    if dict_start < 0 or dict_end < 0:
+        return None
+    match = re.search(rb"/MCID\s+(\d+)(?!\d)", data[dict_start:dict_end])
+    return int(match.group(1)) if match is not None else None
+
+
+def _intended_legacy_text(
+    pdf: pikepdf.Pdf,
+    page: pikepdf.Page,
+    data: bytes,
+    key_start: int,
+    literal: bytes,
+    literal_end: int,
+) -> tuple[str, str] | None:
+    """The text a legacy literal meant, and where that reading came from.
+
+    A run of four or more digits is ambiguous on its own, since \\3562 may be
+    U+0772 or U+00EE then "2", so it is read only when the owning element's
+    text re-encodes to the literal or contains the reading (the writer gave an
+    element the joined text of its blocks). A three-digit escape above \\377
+    can only be the legacy spelling, so its digit run is read as written.
+    """
+    mcid = _enclosing_bdc_mcid(data, key_start, literal_end)
+    owner = _parent_tree_owner(pdf, page, mcid) if mcid is not None else None
+    owner_texts: dict[str, str] = {}
+    if owner is not None:
+        for key in ("/ActualText", "/Alt", "/Contents"):
+            value = owner.get(key)
+            if value is None:
+                continue
+            if _legacy_literal_string(str(value)) == literal:
+                return str(value), f"the owning element's {key.lstrip('/')}"
+            owner_texts[key.lstrip("/")] = str(value)
+    text = _decode_legacy_literal(literal)
+    if text is None or _legacy_literal_string(text) != literal:
+        return None
+    for key, owner_text in owner_texts.items():
+        if text in owner_text:
+            return text, f"the escape's full digit run, found in the owning element's {key}"
+    if _OVERFLOWING_OCTAL_ESCAPE.search(literal) is None:
+        return None
+    return text, "the escape's full digit run"
+
+
+def _repair_overflowing_actualtext_escapes(
+    pdf: pikepdf.Pdf,
+    *,
+    actions: list[str],
+) -> int:
+    """Rewrite ActualText literals whose octal escapes overflow a byte.
+
+    Until 2026-09-02 the writer spelled a character above 255 as its whole
+    codepoint in octal. Three digits above \\377, such as \\465, no lexer can
+    turn into a byte: Adobe's checker reads past it, cpdf refuses the content
+    stream and with it every chapter book that merges the page. A longer run
+    such as \\352146 every lexer reads as three digits then text, so the
+    spoken text is wrong rather than the file broken. The owning element's
+    own text says what was meant when it re-encodes to the same literal.
+    """
+    rewritten = 0
+    for index, page in enumerate(pdf.pages, 1):
+        contents = page.get("/Contents")
+        if contents is None:
+            continue
+        data = _read_page_contents(contents)
+        if _LEGACY_OCTAL_ESCAPE.search(data) is None:
+            continue
+        output = bytearray()
+        cursor = 0
+        for match in _ACTUALTEXT_LITERAL_OPEN.finditer(data):
+            if match.start() < cursor:
+                continue
+            start = match.end() - 1
+            end = _literal_string_end(data, start)
+            if end is None:
+                break
+            literal = data[start:end]
+            if _LEGACY_OCTAL_ESCAPE.search(literal) is None:
+                continue
+            reading = _intended_legacy_text(pdf, page, data, match.start(), literal, end)
+            if reading is None:
+                continue
+            text, source = reading
+            if all(ord(char) <= 255 for char in text) or any(
+                _is_private_use(char) for char in text
+            ):
+                continue
+            output += data[cursor:start] + _pdf_literal_string(text)
+            cursor = end
+            rewritten += 1
+            actions.append(
+                f"page {index}: rewrote /ActualText {text[:60]!r} from {source}, "
+                "its octal escape overflowed a byte"
+            )
+        if cursor == 0:
+            continue
+        output += data[cursor:]
+        page["/Contents"] = pdf.make_stream(bytes(output), compress=True)
+    return rewritten
+
+
 def _strip_inline_formula_class(struct_elem: pikepdf.Dictionary) -> None:
     raw = struct_elem.get("/C")
     if raw is None:
@@ -3214,6 +3400,37 @@ def _repair_dead_alt_figure_owners(
     return updated
 
 
+@dataclass
+class DeadFigureOwnerRepairResult:
+    figures_reattached: int
+    actions: list[str]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def reattach_dead_alt_figure_owners(
+    pdf_bytes: bytes,
+) -> tuple[bytes, DeadFigureOwnerRepairResult]:
+    """Reattach unreachable alt Figures on their own, ahead of taggedContent.
+
+    taggedContent places an orphan block between the neighbours it can reach,
+    so a block beside a Figure that is still unreachable ends the pass
+    unplaced and only the next pass adopts it. Reattaching first lets one
+    pass finish the page.
+    """
+    actions: list[str] = []
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        if pdf.Root.get("/StructTreeRoot") is None:
+            return pdf_bytes, DeadFigureOwnerRepairResult(0, [])
+        reattached = _repair_dead_alt_figure_owners(pdf, actions=actions)
+        if not reattached:
+            return pdf_bytes, DeadFigureOwnerRepairResult(0, actions)
+        output = io.BytesIO()
+        pdf.save(output)
+    return output.getvalue(), DeadFigureOwnerRepairResult(reattached, actions)
+
+
 def _figure_blocks_glyph_text(
     data: bytes,
     mcids: list[int],
@@ -3630,6 +3847,7 @@ def repair_marked_content_actualtext(
             result = MarkedContentActualTextRepairResult(0, 0, [])
             return pdf_bytes, result
 
+        _repair_overflowing_actualtext_escapes(pdf, actions=actions)
         _repair_pageless_alt_content_page(pdf, actions=actions)
         _repair_dead_alt_figure_owners(pdf, actions=actions)
         _repair_parent_tree_named_figure_content(pdf, actions=actions)

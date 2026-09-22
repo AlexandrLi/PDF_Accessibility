@@ -2442,6 +2442,184 @@ class ParentTreeNamedFigureContentTests(unittest.TestCase):
         self.assertFalse(any("MCID 2 into" in action for action in result.actions))
 
 
+_LEGACY_INTENDED_TEXT = "Find v\u0302 equals 4\u00ee plus 3\u0135."
+_LEGACY_OVERFLOWING_LITERAL = b"(Find v\\1402 equals 4\\356 plus 3\\465.)"
+_LEGACY_LONG_RUN_TEXT = "\U0001d466 \u2212 4"
+_LEGACY_LONG_RUN_LITERAL = b"(\\352146 \\21022 4)"
+
+
+def _build_legacy_octal_actualtext_pdf(
+    *, owner_alt: str | None, literal: bytes = _LEGACY_OVERFLOWING_LITERAL
+) -> bytes:
+    """A Figure block whose ActualText the pre-2026-09-02 writer spelled in octal."""
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page()
+    page["/Contents"] = pdf.make_stream(
+        b"/Figure << /MCID 0 /ActualText " + literal + b" >> BDC "
+        b"BT /F1 12 Tf 10 100 Td (v) Tj ET EMC "
+        b"/Span << /MCID 1 /ActualText (a \\\\465 literal backslash) >> BDC "
+        b"BT /F1 12 Tf 10 80 Td (b) Tj ET EMC"
+    )
+    page["/StructParents"] = 0
+    entries = {
+        "/Type": pikepdf.Name("/StructElem"),
+        "/S": pikepdf.Name("/Span"),
+        "/Pg": page.obj,
+        "/K": 0,
+    }
+    if owner_alt is not None:
+        entries["/Alt"] = pikepdf.String(owner_alt)
+    owner = pdf.make_indirect(pikepdf.Dictionary(entries))
+    other = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Span"),
+                "/Pg": page.obj,
+                "/K": 1,
+            }
+        )
+    )
+    document = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/Document"),
+                "/K": pikepdf.Array([owner, other]),
+            }
+        )
+    )
+    owner["/P"] = document
+    other["/P"] = document
+    root = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/StructTreeRoot"),
+                "/K": pikepdf.Array([document]),
+                "/ParentTree": pdf.make_indirect(
+                    pikepdf.Dictionary(
+                        {"/Nums": pikepdf.Array([0, pikepdf.Array([owner, other])])}
+                    )
+                ),
+            }
+        )
+    )
+    document["/P"] = root
+    pdf.Root["/StructTreeRoot"] = root
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+def _page_content(pdf_bytes: bytes) -> bytes:
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        return _read_page_contents(pdf.pages[0].obj["/Contents"])
+
+
+class OverflowingOctalEscapeRepairTests(unittest.TestCase):
+    def test_owning_element_text_that_re_encodes_to_the_literal_is_used(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            _build_legacy_octal_actualtext_pdf(owner_alt=_LEGACY_INTENDED_TEXT)
+        )
+
+        content = _page_content(repaired)
+        self.assertIn(
+            b"/MCID 0 /ActualText " + _pdf_literal_string(_LEGACY_INTENDED_TEXT),
+            content,
+        )
+        self.assertNotIn(b"\\465", content.replace(b"\\\\465", b""))
+        self.assertTrue(
+            any(
+                "rewrote /ActualText" in action and "owning element's Alt" in action
+                for action in result.actions
+            ),
+            result.actions,
+        )
+
+    def test_full_digit_run_is_read_when_no_element_text_matches(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            _build_legacy_octal_actualtext_pdf(owner_alt=None)
+        )
+
+        self.assertIn(
+            b"/MCID 0 /ActualText " + _pdf_literal_string(_LEGACY_INTENDED_TEXT),
+            _page_content(repaired),
+        )
+        self.assertTrue(
+            any("escape's full digit run" in action for action in result.actions),
+            result.actions,
+        )
+
+    def test_escaped_backslash_before_digits_is_not_an_overflow(self) -> None:
+        repaired, _result = repair_marked_content_actualtext(
+            _build_legacy_octal_actualtext_pdf(owner_alt=None)
+        )
+
+        self.assertIn(
+            b"/MCID 1 /ActualText (a \\\\465 literal backslash)", _page_content(repaired)
+        )
+
+    def test_long_digit_run_is_rewritten_when_the_owning_element_confirms_it(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            _build_legacy_octal_actualtext_pdf(
+                owner_alt=_LEGACY_LONG_RUN_TEXT, literal=_LEGACY_LONG_RUN_LITERAL
+            )
+        )
+
+        self.assertIn(
+            b"/MCID 0 /ActualText " + _pdf_literal_string(_LEGACY_LONG_RUN_TEXT),
+            _page_content(repaired),
+        )
+        self.assertTrue(
+            any("owning element's Alt" in action for action in result.actions),
+            result.actions,
+        )
+
+    def test_long_digit_run_is_rewritten_when_the_owning_element_contains_it(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            _build_legacy_octal_actualtext_pdf(
+                owner_alt=f"Recall {_LEGACY_LONG_RUN_TEXT} is a line.",
+                literal=_LEGACY_LONG_RUN_LITERAL,
+            )
+        )
+
+        self.assertIn(
+            b"/MCID 0 /ActualText " + _pdf_literal_string(_LEGACY_LONG_RUN_TEXT),
+            _page_content(repaired),
+        )
+        self.assertTrue(
+            any("found in the owning element's Alt" in action for action in result.actions),
+            result.actions,
+        )
+
+    def test_long_digit_run_alone_is_left_as_written(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            _build_legacy_octal_actualtext_pdf(
+                owner_alt=None, literal=_LEGACY_LONG_RUN_LITERAL
+            )
+        )
+
+        self.assertIn(
+            b"/MCID 0 /ActualText " + _LEGACY_LONG_RUN_LITERAL, _page_content(repaired)
+        )
+        self.assertFalse(
+            any("rewrote /ActualText" in action for action in result.actions),
+            result.actions,
+        )
+
+    def test_rewritten_literal_is_left_alone_on_the_next_run(self) -> None:
+        repaired, _first = repair_marked_content_actualtext(
+            _build_legacy_octal_actualtext_pdf(owner_alt=None)
+        )
+        again, second = repair_marked_content_actualtext(repaired)
+
+        self.assertFalse(
+            any("rewrote /ActualText" in action for action in second.actions),
+            second.actions,
+        )
+        self.assertEqual(_page_content(again), _page_content(repaired))
+
+
 if __name__ == "__main__":
     unittest.main()
 

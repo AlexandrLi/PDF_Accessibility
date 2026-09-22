@@ -19,7 +19,10 @@ from lib.figure_alt_sweep import repair_missing_figure_alt
 from lib.heading_nesting_sweep import repair_heading_nesting
 from lib.inline_formula_sweep import repair_inline_formula_figures
 from lib.layout_table_sweep import repair_layout_tables
-from lib.marked_content_actualtext_sweep import repair_marked_content_actualtext
+from lib.marked_content_actualtext_sweep import (
+    reattach_dead_alt_figure_owners,
+    repair_marked_content_actualtext,
+)
 from lib.pdf_a11y_audit import audit_pdf_bytes
 from lib.tab_order_sweep import repair_tab_order
 from lib.tagged_annotation_sweep import repair_tagged_annotations
@@ -145,10 +148,13 @@ def run_sweeps(
             return None
 
     run_stage("tabOrder", repair_tab_order)
-    # taggedAnnotations reconnects unreachable subtrees, which changes the set of
-    # orphan blocks taggedContent adopts, so it has to run first or taggedContent
-    # leaves work a second pass would do and the run is not byte-stable.
+    # taggedAnnotations reconnects unreachable subtrees and deadFigureOwners
+    # hangs abandoned alt Figures back under a reachable parent. Both change
+    # the neighbours taggedContent places an orphan block between, so they run
+    # first or taggedContent leaves work a second pass would do and the run is
+    # not byte-stable.
     run_stage("taggedAnnotations", repair_tagged_annotations)
+    run_stage("deadFigureOwners", reattach_dead_alt_figure_owners)
     run_stage("taggedContent", repair_tagged_content)
 
     started = perf_counter()

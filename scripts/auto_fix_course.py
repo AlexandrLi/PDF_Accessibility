@@ -183,6 +183,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Sweep every default-TOC topic instead of only the open tracker rows",
     )
+    parser.add_argument(
+        "--topic-id",
+        action="append",
+        default=[],
+        metavar="TOPIC_ID",
+        help="Sweep only this default-TOC topic (repeatable) instead of the open tracker rows",
+    )
     return parser.parse_args()
 
 
@@ -788,10 +795,14 @@ def main() -> int:
         )
         return 2 if rebuild.get("error") else 0
 
-    topic_ids = None if args.all_topics else open_topic_ids(args.tracker, args.course_id)
-    summary["topicSelection"] = (
-        "allTopics" if topic_ids is None else {"openTrackerRows": topic_ids}
-    )
+    if args.topic_id:
+        topic_ids = args.topic_id
+        summary["topicSelection"] = {"topicIds": topic_ids}
+    else:
+        topic_ids = None if args.all_topics else open_topic_ids(args.tracker, args.course_id)
+        summary["topicSelection"] = (
+            "allTopics" if topic_ids is None else {"openTrackerRows": topic_ids}
+        )
     if topic_ids is not None and not topic_ids:
         summary["stages"]["sweep"] = {"skipped": "no open topic rows in the tracker"}
         _write_json(summary_path, summary)

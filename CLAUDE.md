@@ -44,7 +44,8 @@ scripts/accessibility-course-workflow.sh auto <course-id> [--plan-only]
 
 `auto` runs the whole flow for one course with no approval step:
 sweep the topics with open rows in the tracker for that course (every
-default-TOC topic with `--all-topics`), Adobe Auto-Tag any topic with no
+default-TOC topic with `--all-topics`, or only the topics named with
+`--topic-id <id>`, repeatable, when one topic has to be re-pushed), Adobe Auto-Tag any topic with no
 structure tree and sweep the tagged file, run the Adobe PDF Services checker on every changed resolved
 topic, publish the topics that pass, rebuild the course's downloads and
 chapter books on dev and check them, append a dated sentence to the
