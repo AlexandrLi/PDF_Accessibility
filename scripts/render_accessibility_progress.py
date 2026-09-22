@@ -74,8 +74,12 @@ def render_prose(block: str) -> str:
                 out.append("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in r) + "</tr>")
             out.append("</tbody></table></div>")
             continue
+        if ln.startswith("### "):
+            out.append(f"<h3>{inline(ln[4:])}</h3>")
+            i += 1
+            continue
         if re.match(r"^\d+\. ", ln):
-            out.append("<ol>")
+            out.append(f'<ol start="{int(ln.split(".", 1)[0])}">')
             while i < len(lines) and re.match(r"^\d+\. ", lines[i]):
                 out.append(f"<li>{inline(re.sub(r'^\d+\. ', '', lines[i]))}</li>")
                 i += 1
@@ -196,6 +200,7 @@ code{font-size:.85em;background:var(--accent-soft);padding:.05em .3em;border-rad
 h1,h2,h3{font-weight:600;line-height:1.2;margin:0;text-wrap:balance}
 h1{font-size:clamp(1.4rem,3vw,1.9rem)}
 h2{font-size:1.1rem;margin-block:2.2rem .6rem}
+h3{font-size:.95rem;margin-block:1.4rem .4rem;color:var(--ink-2)}
 .page{max-width:1080px;margin:0 auto}
 header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:1rem 2rem;padding-block:2rem 1rem}
 header .sub{color:var(--muted);font-size:.85rem;margin-top:.3rem}
