@@ -10,6 +10,7 @@ import pikepdf
 from lib.figure_alt_quality import (
     SuspiciousFigureAlt,
     classify_figure_alt,
+    clear_descendant_alternate_text,
     speaks_for_content,
     struct_class_names,
 )
@@ -115,44 +116,6 @@ def strip_suspicious_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[Suspiciou
         return output.getvalue(), stripped
 
 
-def _struct_children(obj: pikepdf.Dictionary) -> list[pikepdf.Dictionary]:
-    kids = obj.get("/K")
-    children: list[pikepdf.Dictionary] = []
-    if isinstance(kids, pikepdf.Array):
-        for kid in kids:
-            if isinstance(kid, pikepdf.Dictionary):
-                children.append(kid)
-            elif isinstance(kid, pikepdf.Array):
-                children.extend(n for n in kid if isinstance(n, pikepdf.Dictionary))
-    elif isinstance(kids, pikepdf.Dictionary):
-        children.append(kids)
-    return [child for child in children if child.get("/S") is not None]
-
-
-def _clear_descendant_alt(figure: pikepdf.Dictionary) -> list[str]:
-    """Drop /Alt and /ActualText from every struct element under a Figure.
-
-    Acrobat's "Nested alternate text" rule fails an element whose alternate
-    text encloses more alternate text, so a Figure can only receive /Alt once
-    nothing beneath it speaks for itself. Word exports leave /ActualText on the
-    Spans inside a figure (mostly single spaces and mis-mapped math glyphs).
-    Returns the texts removed, in tree order, so the caller can fold anything
-    meaningful into the Figure's own alt.
-    """
-    removed: list[str] = []
-
-    def walk(obj: pikepdf.Dictionary) -> None:
-        for child in _struct_children(obj):
-            for key in ("/Alt", "/ActualText"):
-                if key in child:
-                    removed.append(str(child[key]))
-                    del child[key]
-            walk(child)
-
-    walk(figure)
-    return removed
-
-
 def _meaningful_fragments(texts: list[str]) -> list[str]:
     """Keep only removed texts that carry a Latin letter or digit.
 
@@ -238,7 +201,7 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
                         _remove_child(parent, obj)
                         removed_empty += 1
                         return
-                    removed = _clear_descendant_alt(obj)
+                    removed = clear_descendant_alternate_text(obj)
                     contents = obj.get("/Contents")
                     fallback = str(contents).strip() if contents is not None else ""
                     if not fallback:

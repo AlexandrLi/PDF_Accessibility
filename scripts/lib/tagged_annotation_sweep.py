@@ -8,7 +8,11 @@ from numbers import Integral
 
 import pikepdf
 
-from lib.figure_alt_quality import speaks_for_content
+from lib.figure_alt_quality import (
+    clear_descendant_alternate_text,
+    speaks_for_content,
+    struct_children,
+)
 from lib.tagged_content_sweep import (
     _flatten_parent_tree,
     _object_key,
@@ -449,6 +453,27 @@ def _spoken_by_ancestor(element: pikepdf.Dictionary) -> bool:
     return False
 
 
+def _clear_nested_alternate_text(subtree: pikepdf.Dictionary, actions: list[str]) -> None:
+    """Drop alternate text that a reconnected element's own /Alt would enclose.
+
+    Word leaves /ActualText on the Spans inside a Figure it also gave /Alt.
+    Unreachable, the pair is invisible; reattached, Acrobat fails it as
+    "Nested alternate text". The outer text stands for the whole subtree.
+    """
+    stack = [subtree]
+    while stack:
+        element = stack.pop()
+        if speaks_for_content(element):
+            removed = clear_descendant_alternate_text(element)
+            if removed:
+                actions.append(
+                    f"dropped {len(removed)} nested alternate text(s) under the "
+                    f"reconnected {element.get('/S')}, whose own text encloses them"
+                )
+            continue
+        stack.extend(struct_children(element))
+
+
 def _reconnect_orphaned_parenttree_subtrees(
     pdf: pikepdf.Pdf,
     root: pikepdf.Dictionary,
@@ -522,6 +547,7 @@ def _reconnect_orphaned_parenttree_subtrees(
                 f"reconnected unreachable {obj.get('/S')} subtree (registered "
                 f"in ParentTree) under its parent {parent.get('/S')}"
             )
+            _clear_nested_alternate_text(obj, actions)
         if not appended:
             break
     return reconnected

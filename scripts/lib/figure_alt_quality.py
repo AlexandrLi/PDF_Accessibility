@@ -58,6 +58,44 @@ def speaks_for_content(element: pikepdf.Dictionary) -> bool:
     return False
 
 
+def struct_children(obj: pikepdf.Dictionary) -> list[pikepdf.Dictionary]:
+    kids = obj.get("/K")
+    children: list[pikepdf.Dictionary] = []
+    if isinstance(kids, pikepdf.Array):
+        for kid in kids:
+            if isinstance(kid, pikepdf.Dictionary):
+                children.append(kid)
+            elif isinstance(kid, pikepdf.Array):
+                children.extend(n for n in kid if isinstance(n, pikepdf.Dictionary))
+    elif isinstance(kids, pikepdf.Dictionary):
+        children.append(kids)
+    return [child for child in children if child.get("/S") is not None]
+
+
+def clear_descendant_alternate_text(figure: pikepdf.Dictionary) -> list[str]:
+    """Drop /Alt and /ActualText from every struct element under a Figure.
+
+    Acrobat's "Nested alternate text" rule fails an element whose alternate
+    text encloses more alternate text, so a Figure can only receive /Alt once
+    nothing beneath it speaks for itself. Word exports leave /ActualText on the
+    Spans inside a figure (mostly single spaces and mis-mapped math glyphs).
+    Returns the texts removed, in tree order, so the caller can fold anything
+    meaningful into the Figure's own alt.
+    """
+    removed: list[str] = []
+
+    def walk(obj: pikepdf.Dictionary) -> None:
+        for child in struct_children(obj):
+            for key in ("/Alt", "/ActualText"):
+                if key in child:
+                    removed.append(str(child[key]))
+                    del child[key]
+            walk(child)
+
+    walk(figure)
+    return removed
+
+
 def struct_class_names(struct_elem: object) -> set[str]:
     """Return Adobe style class names from a struct element /C entry."""
     if not hasattr(struct_elem, "get"):

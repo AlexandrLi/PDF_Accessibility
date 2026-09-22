@@ -460,6 +460,29 @@ class IntegerChildRefReconnectionTests(unittest.TestCase):
             any("outside the structure tree" in conflict for conflict in result.conflicts)
         )
 
+    def test_reconnection_drops_alternate_text_its_own_alt_encloses(self) -> None:
+        pdf_bytes, _ref_objnum = self._build()
+        with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+            for obj in pdf.objects:
+                if not isinstance(obj, pikepdf.Dictionary):
+                    continue
+                if obj.get("/S") == "/Reference":
+                    obj["/Alt"] = pikepdf.String("Graph of y < x")
+                elif obj.get("/S") == "/Link":
+                    obj["/ActualText"] = pikepdf.String("\u2265 ")
+            pdf_bytes = _save(pdf)
+
+        repaired, result = repair_tagged_annotations(pdf_bytes)
+
+        self.assertTrue(any("reconnected" in action for action in result.actions))
+        self.assertTrue(any("dropped 1 nested alternate text" in action for action in result.actions))
+        with pikepdf.open(io.BytesIO(repaired)) as checked:
+            reference = checked.Root["/StructTreeRoot"]["/K"][0]["/K"][1]
+            self.assertEqual(str(reference["/Alt"]), "Graph of y < x")
+            link = reference["/K"][0]
+            self.assertEqual(str(link.get("/S")), "/Link")
+            self.assertNotIn("/ActualText", link)
+
     def test_reconnection_is_idempotent(self) -> None:
         pdf_bytes, _ref_objnum = self._build()
         repaired_once, _first = repair_tagged_annotations(pdf_bytes)
