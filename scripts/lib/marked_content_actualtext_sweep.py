@@ -12,6 +12,8 @@ import pymupdf
 
 from lib.figure_alt_quality import (
     classify_figure_alt,
+    clear_grouping_alternate_text_over_nested,
+    find_nested_alternate_text,
     looks_like_table_figure_alt,
     struct_class_names,
 )
@@ -2054,43 +2056,17 @@ def _repair_extra_char_span_nested_alt(
     return updated
 
 
-def _repair_nested_li_figure_alt(
+def _repair_grouping_alt_over_nested_alt(
     pdf: pikepdf.Pdf,
     *,
     actions: list[str],
 ) -> int:
-    """Remove /Alt from LI when a child Figure already carries alt text."""
     struct_root = pdf.Root.get("/StructTreeRoot")
     if struct_root is None:
         return 0
-
-    updated = 0
-
-    def walk(obj: pikepdf.Dictionary) -> None:
-        nonlocal updated
-        if obj.get("/S") == "/LI" and obj.get("/Alt") is not None:
-            for child in _struct_child_dicts(obj):
-                if child.get("/S") == "/Figure" and child.get("/Alt") is not None:
-                    del obj["/Alt"]
-                    updated += 1
-                    actions.append(
-                        "removed /Alt from LI with nested Figure alt to avoid duplicate alt"
-                    )
-                    break
-                for nested in _struct_child_dicts(child):
-                    if nested.get("/S") == "/Figure" and nested.get("/Alt") is not None:
-                        del obj["/Alt"]
-                        updated += 1
-                        actions.append(
-                            "removed /Alt from LI with nested Figure alt to avoid duplicate alt"
-                        )
-                        break
-
-        for child in _struct_child_dicts(obj):
-            walk(child)
-
-    walk(struct_root)
-    return updated
+    removed = clear_grouping_alternate_text_over_nested(struct_root)
+    actions.extend(removed)
+    return len(removed)
 
 
 def _struct_has_page_content(obj: pikepdf.Dictionary) -> bool:
@@ -3037,6 +3013,15 @@ def _repair_untagged_image_actualtext(
     return updated
 
 
+def list_nested_alternate_text(pdf_bytes: bytes) -> list[str]:
+    """Label alternate text nested under an ancestor's, e.g. "/LI 'List item 17' > /Lbl 'option c'"."""
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        struct_root = pdf.Root.get("/StructTreeRoot")
+        if struct_root is None:
+            return []
+        return find_nested_alternate_text(struct_root)
+
+
 def list_untagged_image_mcids_missing_actualtext(pdf_bytes: bytes) -> list[str]:
     """Label image MCIDs owned by alt-less non-Figure elements, e.g. 'page6 mcid25'."""
     labels: list[str] = []
@@ -3852,6 +3837,7 @@ def repair_marked_content_actualtext(
         _repair_dead_alt_figure_owners(pdf, actions=actions)
         _repair_parent_tree_named_figure_content(pdf, actions=actions)
         _repair_unowned_text_figure_blocks(pdf, actions=actions)
+        _repair_grouping_alt_over_nested_alt(pdf, actions=actions)
         figure_index = 0
         protected_mcids = _alt_precedence_protected_mcids(pdf)
 
@@ -3979,7 +3965,6 @@ def repair_marked_content_actualtext(
                 walk(kids)
 
         walk(struct_root)
-        _repair_nested_li_figure_alt(pdf, actions=actions)
         _repair_contentless_alt(pdf, actions=actions)
         _repair_extra_char_span_nested_alt(pdf, actions=actions)
         mcids_updated += _repair_list_image_labels(pdf, actions=actions)
@@ -3989,6 +3974,7 @@ def repair_marked_content_actualtext(
         mcids_updated += _repair_untagged_image_actualtext(pdf, actions=actions)
         _repair_figure_alt_precedence(pdf, actions=actions)
         _repair_figure_duplicate_contents(pdf, actions=actions)
+        _repair_grouping_alt_over_nested_alt(pdf, actions=actions)
 
         if not actions:
             result = MarkedContentActualTextRepairResult(

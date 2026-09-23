@@ -148,6 +148,35 @@ class PdfA11yAuditTests(unittest.TestCase):
         self.assertEqual(audit_pdf_bytes(_make_figure_pdf(spoken_ancestor=False)).figures_missing_alt, [1])
         self.assertEqual(audit_pdf_bytes(_make_figure_pdf(spoken_ancestor=True)).figures_missing_alt, [])
 
+    def test_reports_alternate_text_nested_under_alternate_text(self) -> None:
+        pdf = pikepdf.new()
+        pdf.add_blank_page(page_size=(200, 200))
+        label = pikepdf.Dictionary(
+            {"/S": pikepdf.Name("/Lbl"), "/ActualText": pikepdf.String("option c")}
+        )
+        item = pikepdf.Dictionary(
+            {
+                "/S": pikepdf.Name("/LI"),
+                "/Alt": pikepdf.String("List item 17"),
+                "/K": pikepdf.Array([label]),
+            }
+        )
+        pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+            {"/Type": pikepdf.Name("/StructTreeRoot"), "/K": pikepdf.Array([item])}
+        )
+        output = io.BytesIO()
+        pdf.save(output)
+
+        audit = audit_pdf_bytes(output.getvalue())
+
+        self.assertEqual(
+            audit.nested_alternate_text, ["/LI 'List item 17' > /Lbl 'option c'"]
+        )
+        self.assertEqual(
+            audit.to_dict()["nested_alternate_text"],
+            ["/LI 'List item 17' > /Lbl 'option c'"],
+        )
+
     def test_clean_table_has_no_table_residuals_and_does_not_block(self) -> None:
         audit = audit_pdf_bytes(_make_table_pdf(residual=False))
 

@@ -96,6 +96,81 @@ def clear_descendant_alternate_text(figure: pikepdf.Dictionary) -> list[str]:
     return removed
 
 
+GROUPING_ROLES = frozenset(
+    {
+        "/Document", "/Part", "/Art", "/Sect", "/Div", "/BlockQuote", "/Caption",
+        "/TOC", "/TOCI", "/Index", "/NonStruct", "/Private",
+        "/P", "/H", "/H1", "/H2", "/H3", "/H4", "/H5", "/H6",
+        "/L", "/LI", "/LBody",
+        "/Table", "/TR", "/TH", "/TD", "/THead", "/TBody", "/TFoot",
+    }
+)
+
+
+def alternate_text_keys(element: pikepdf.Dictionary) -> list[str]:
+    return [key for key in ("/Alt", "/ActualText") if str(element.get(key) or "").strip()]
+
+
+def _descendant_speaks(element: pikepdf.Dictionary) -> bool:
+    return any(
+        alternate_text_keys(child) or _descendant_speaks(child)
+        for child in struct_children(element)
+    )
+
+
+def clear_grouping_alternate_text_over_nested(struct_root: pikepdf.Dictionary) -> list[str]:
+    """Drop a grouping element's alternate text when a descendant carries its own.
+
+    Word writes /Alt on list items, list bodies and paragraphs from its own
+    guess at their glyphs ("List item 17", "LBody image 1", a fragment of the
+    paragraph). Acrobat fails the pair as "Nested alternate text", and the
+    container's text would hide everything beneath it from a screen reader,
+    so the alternate text underneath is the one that stays. Returns one
+    action line per element changed.
+    """
+    actions: list[str] = []
+
+    def walk(element: pikepdf.Dictionary) -> None:
+        if str(element.get("/S")) in GROUPING_ROLES:
+            keys = alternate_text_keys(element)
+            if keys and _descendant_speaks(element):
+                for key in keys:
+                    del element[key]
+                actions.append(
+                    f"removed {' and '.join(keys)} from {element.get('/S')} whose "
+                    "descendants carry their own alternate text"
+                )
+        for child in struct_children(element):
+            walk(child)
+
+    walk(struct_root)
+    return actions
+
+
+def find_nested_alternate_text(struct_root: pikepdf.Dictionary) -> list[str]:
+    """Label struct elements whose alternate text sits under an ancestor's.
+
+    Acrobat's "Nested alternate text" rule fails exactly this pair; inline
+    /ActualText in the content stream under an /Alt element does not count.
+    Labels read like "/LI 'List item 17' > /Lbl 'option c'".
+    """
+    labels: list[str] = []
+
+    def describe(element: pikepdf.Dictionary) -> str:
+        text = str(element[alternate_text_keys(element)[0]]).strip()
+        return f"{element.get('/S')} {text[:40]!r}"
+
+    def walk(element: pikepdf.Dictionary, speaking_ancestor: str | None) -> None:
+        for child in struct_children(element):
+            own = describe(child) if alternate_text_keys(child) else None
+            if own and speaking_ancestor:
+                labels.append(f"{speaking_ancestor} > {own}")
+            walk(child, speaking_ancestor or own)
+
+    walk(struct_root, None)
+    return labels
+
+
 def struct_class_names(struct_elem: object) -> set[str]:
     """Return Adobe style class names from a struct element /C entry."""
     if not hasattr(struct_elem, "get"):

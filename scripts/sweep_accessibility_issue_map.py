@@ -613,6 +613,15 @@ def build_residual_diagnostics(
             "status": "residual",
             "evidence": other_elements_evidence,
         }
+    nested_alternate_text = (audit or {}).get("nested_alternate_text") or []
+    if nested_alternate_text:
+        tracked_categories["Nested Alternate Text"] = {
+            "status": "residual",
+            "evidence": [
+                f"alternate text nested under alternate text at {label}"
+                for label in nested_alternate_text
+            ],
+        }
     return {
         "layoutTable": {
             "unresolved": layout.get("unresolved") or [],

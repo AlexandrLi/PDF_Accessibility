@@ -16,6 +16,7 @@ from lib.figure_alt_quality import (
 )
 from lib.marked_content_actualtext_sweep import (
     count_orphan_marked_missing_actualtext,
+    list_nested_alternate_text,
     list_untagged_image_mcids_missing_actualtext,
 )
 from lib.tagged_content_sweep import collect_tagged_content_diagnostics
@@ -50,6 +51,7 @@ class PdfA11yAudit:
     parent_tree_keys: list[int] = field(default_factory=list)
     nonfigure_image_mcids_missing_alt: list[str] = field(default_factory=list)
     orphan_marked_mcids_missing_actualtext: int = 0
+    nested_alternate_text: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -436,4 +438,5 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
         orphan_marked_mcids_missing_actualtext=(
             count_orphan_marked_missing_actualtext(pdf_bytes)
         ),
+        nested_alternate_text=list_nested_alternate_text(pdf_bytes),
     )

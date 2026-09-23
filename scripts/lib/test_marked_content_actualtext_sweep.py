@@ -36,6 +36,7 @@ from lib.marked_content_actualtext_sweep import (
     _tounicode_text,
     count_li_lbl_missing_actualtext,
     count_orphan_marked_missing_actualtext,
+    list_nested_alternate_text,
     list_untagged_image_mcids_missing_actualtext,
     repair_marked_content_actualtext,
 )
@@ -529,7 +530,10 @@ class ExtraCharSpanNestedAltRegressionTests(unittest.TestCase):
         actions = "\n".join(result.actions)
         contents = _page_contents_text(repaired)
 
-        self.assertIn("removed /Alt from LI with nested ExtraCharSpan", actions)
+        self.assertIn(
+            "removed /Alt from /LI whose descendants carry their own alternate text",
+            actions,
+        )
         self.assertIn("removed struct /ActualText from ExtraCharSpan", actions)
         self.assertIn("retagged struct ExtraCharSpan to Span", actions)
         self.assertIn("/Span<< /MCID 12", contents)
@@ -2094,6 +2098,93 @@ class ContentlessAltTests(unittest.TestCase):
         self.assertIn(
             "removed ActualText from empty Span with no page content", result.actions
         )
+
+
+def _build_grouping_alt_over_nested_alt_pdf() -> bytes:
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    page.Contents = pdf.make_stream(
+        b"/Lbl <</MCID 0>> BDC BT /F1 12 Tf 10 150 Td (c\\)) Tj ET EMC\n"
+        b"/LBody <</MCID 1>> BDC BT /F1 12 Tf 30 150 Td (Salting out) Tj ET EMC\n"
+        b"/Span <</MCID 2>> BDC BT /F1 12 Tf 10 100 Td (a) Tj ET EMC\n"
+        b"/Lbl <</MCID 3>> BDC BT /F1 12 Tf 10 50 Td (d\\)) Tj ET EMC\n"
+        b"/LBody <</MCID 4>> BDC BT /F1 12 Tf 30 50 Td (Dialysis) Tj ET EMC\n"
+    )
+    elem = _struct_elem
+    labelled_item = elem(
+        "LI",
+        Alt=pikepdf.String("List item 17"),
+        K=pikepdf.Array(
+            [
+                elem("Lbl", ActualText=pikepdf.String("option c"), K=pikepdf.Array([0]), Pg=page.obj),
+                elem("LBody", K=pikepdf.Array([1]), Pg=page.obj),
+            ]
+        ),
+    )
+    plain_item = elem(
+        "LI",
+        Alt=pikepdf.String("List item 18"),
+        K=pikepdf.Array(
+            [
+                elem("Lbl", K=pikepdf.Array([3]), Pg=page.obj),
+                elem("LBody", K=pikepdf.Array([4]), Pg=page.obj),
+            ]
+        ),
+    )
+    paragraph = elem(
+        "P",
+        ActualText=pikepdf.String("tasting sugar. mannose loses its sweet"),
+        K=pikepdf.Array([elem("Span", ActualText=pikepdf.String("\u03b1"), K=pikepdf.Array([2]), Pg=page.obj)]),
+    )
+    document = elem(
+        "Document",
+        K=pikepdf.Array([elem("L", K=pikepdf.Array([labelled_item, plain_item])), paragraph]),
+    )
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {"/Type": pikepdf.Name("/StructTreeRoot"), "/K": pikepdf.Array([document])}
+    )
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    return _save(pdf)
+
+
+class GroupingAltOverNestedAltTests(unittest.TestCase):
+    """Word's container alt over a labelled child fails "Nested alternate text"."""
+
+    def test_lists_struct_alt_under_struct_alt(self) -> None:
+        self.assertEqual(
+            list_nested_alternate_text(_build_grouping_alt_over_nested_alt_pdf()),
+            [
+                "/LI 'List item 17' > /Lbl 'option c'",
+                "/P 'tasting sugar. mannose loses its sweet' > /Span '\u03b1'",
+            ],
+        )
+
+    def test_drops_container_alt_and_keeps_the_nested_text(self) -> None:
+        repaired, result = repair_marked_content_actualtext(
+            _build_grouping_alt_over_nested_alt_pdf()
+        )
+
+        self.assertEqual(list_nested_alternate_text(repaired), [])
+        pdf = pikepdf.open(io.BytesIO(repaired))
+        items, paragraph = pdf.Root.StructTreeRoot.K[0].K
+        labelled_item, plain_item = items.K
+        self.assertNotIn("/Alt", labelled_item)
+        self.assertEqual(str(labelled_item.K[0].ActualText), "option c")
+        self.assertEqual(str(plain_item.Alt), "List item 18")
+        self.assertNotIn("/ActualText", paragraph)
+        self.assertEqual(str(paragraph.K[0].ActualText), "\u03b1")
+        self.assertIn(
+            "removed /Alt from /LI whose descendants carry their own alternate text",
+            result.actions,
+        )
+        self.assertIn(
+            "removed /ActualText from /P whose descendants carry their own alternate text",
+            result.actions,
+        )
+
+        second, second_result = repair_marked_content_actualtext(repaired)
+        self.assertEqual(second_result.actions, [])
+        self.assertEqual(second, repaired)
 
 
 def _struct_elem(name: str, **extra: object) -> pikepdf.Dictionary:

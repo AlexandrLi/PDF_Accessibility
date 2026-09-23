@@ -312,6 +312,30 @@ class AccessibilityIssueMapSweepTests(unittest.TestCase):
         )
         self.assertEqual(classify_residual_status(diagnostics)[0], "residual")
 
+    def test_nested_alternate_text_is_a_residual(self) -> None:
+        # biochemistry 2026-09-23: 14 topics read "resolved" while Adobe failed
+        # Nested alternate text on Word's list-item /Alt over a labelled child.
+        diagnostics = build_residual_diagnostics(
+            _sweep_result(
+                audit={
+                    "table_count": 0,
+                    "nested_alternate_text": ["/LI 'List item 17' > /Lbl 'option c'"],
+                }
+            ),
+            "",
+            all_categories=True,
+        )
+        category = diagnostics["categories"]["Nested Alternate Text"]
+        self.assertEqual(category["status"], "residual")
+        self.assertEqual(
+            category["evidence"],
+            [
+                "alternate text nested under alternate text at "
+                "/LI 'List item 17' > /Lbl 'option c'"
+            ],
+        )
+        self.assertEqual(classify_residual_status(diagnostics)[0], "residual")
+
     def test_regularity_residual_is_explicit(self) -> None:
         diagnostics = build_residual_diagnostics(
             _sweep_result(

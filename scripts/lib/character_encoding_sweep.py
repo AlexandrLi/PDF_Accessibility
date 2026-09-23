@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 import pikepdf
 import pymupdf
 
+from lib.figure_alt_quality import clear_grouping_alternate_text_over_nested
 from lib.marked_content_actualtext_sweep import (
     _get_mcid_block_to_emc,
     _inject_actualtext_on_page,
@@ -1131,6 +1132,16 @@ def _repair_orphan_symbol_mcids(
     return updated
 
 
+def _clear_alt_nested_by_stamping(pdf: pikepdf.Pdf, *, actions: list[str]) -> int:
+    """A struct /ActualText stamped under a container's own /Alt would nest; the container's goes."""
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return 0
+    removed = clear_grouping_alternate_text_over_nested(struct_root)
+    actions.extend(removed)
+    return len(removed)
+
+
 def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodingRepairResult]:
     struct_updated = 0
     mcids_updated = 0
@@ -1267,6 +1278,7 @@ def repair_character_encoding(pdf_bytes: bytes) -> tuple[bytes, CharacterEncodin
 
         mcids_updated += _repair_orphan_symbol_mcids(pdf, actions=actions)
         fonts_updated += _repair_font_tounicode_reliability(pdf, actions=actions)
+        struct_updated += _clear_alt_nested_by_stamping(pdf, actions=actions)
 
         result = CharacterEncodingRepairResult(
             struct_updated=struct_updated,
