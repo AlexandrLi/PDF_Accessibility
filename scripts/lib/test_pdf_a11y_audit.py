@@ -126,17 +126,20 @@ def _make_table_pdf(*, residual: bool) -> bytes:
     return output.getvalue()
 
 
-def _make_figure_pdf(*, spoken_ancestor: bool) -> bytes:
+def _make_figure_pdf(*, spoken_ancestor: bool, figure_type: str = "/Figure") -> bytes:
     pdf = pikepdf.new()
     pdf.add_blank_page(page_size=(200, 200))
-    figure = pikepdf.Dictionary({"/S": pikepdf.Name("/Figure"), "/K": pikepdf.Array([0])})
+    figure = pikepdf.Dictionary({"/S": pikepdf.Name(figure_type), "/K": pikepdf.Array([0])})
     span = pikepdf.Dictionary({"/S": pikepdf.Name("/Span"), "/K": pikepdf.Array([figure])})
     if spoken_ancestor:
         span["/ActualText"] = pikepdf.String("bullet Images")
     document = pikepdf.Dictionary({"/S": pikepdf.Name("/Document"), "/K": pikepdf.Array([span])})
-    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+    struct_root = pikepdf.Dictionary(
         {"/Type": pikepdf.Name("/StructTreeRoot"), "/K": pikepdf.Array([document])}
     )
+    if figure_type != "/Figure":
+        struct_root["/RoleMap"] = pikepdf.Dictionary({figure_type: pikepdf.Name("/Figure")})
+    pdf.Root["/StructTreeRoot"] = struct_root
     pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
     output = io.BytesIO()
     pdf.save(output)
@@ -147,6 +150,12 @@ class PdfA11yAuditTests(unittest.TestCase):
     def test_figure_under_spoken_ancestor_is_not_missing_alt(self) -> None:
         self.assertEqual(audit_pdf_bytes(_make_figure_pdf(spoken_ancestor=False)).figures_missing_alt, [1])
         self.assertEqual(audit_pdf_bytes(_make_figure_pdf(spoken_ancestor=True)).figures_missing_alt, [])
+
+    def test_role_mapped_figure_counts_as_missing_alt(self) -> None:
+        audit = audit_pdf_bytes(_make_figure_pdf(spoken_ancestor=False, figure_type="/Matéria"))
+
+        self.assertEqual(audit.figure_count, 1)
+        self.assertEqual(audit.figures_missing_alt, [1])
 
     def test_reports_alternate_text_nested_under_alternate_text(self) -> None:
         pdf = pikepdf.new()

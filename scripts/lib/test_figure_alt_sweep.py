@@ -38,6 +38,25 @@ def _pdf_with_figure(*children: pikepdf.Dictionary, alt: str | None = None) -> b
     return output.getvalue()
 
 
+def _pdf_with_role_mapped_figure(custom_type: str) -> bytes:
+    pdf = pikepdf.new()
+    figure = _elem(custom_type)
+    figure["/K"] = pikepdf.Array([0])
+    document = _elem("Document")
+    document["/K"] = pikepdf.Array([figure])
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array([document]),
+            "/RoleMap": pikepdf.Dictionary({f"/{custom_type}": pikepdf.Name("/Figure")}),
+        }
+    )
+    pdf.Root["/MarkInfo"] = pikepdf.Dictionary({"/Marked": True})
+    output = io.BytesIO()
+    pdf.save(output)
+    return output.getvalue()
+
+
 def _pdf_with_figure_under_spoken_span(actual_text: str) -> bytes:
     pdf = pikepdf.new()
     figure = _elem("Figure")
@@ -71,6 +90,13 @@ def _figure_and_descendants(pdf_bytes: bytes) -> tuple[pikepdf.Dictionary, list[
 
 
 class RepairMissingFigureAltTests(unittest.TestCase):
+    def test_stamps_alt_on_custom_type_the_rolemap_calls_a_figure(self) -> None:
+        repaired_bytes, repaired = repair_missing_figure_alt(_pdf_with_role_mapped_figure("Matéria"))
+
+        figure, _ = _figure_and_descendants(repaired_bytes)
+        self.assertEqual(repaired, [1])
+        self.assertEqual(str(figure.Alt), "Figure 1")
+
     def test_clears_descendant_actualtext_before_stamping_alt(self) -> None:
         source = _pdf_with_figure(
             _elem("Span", ActualText=" "),

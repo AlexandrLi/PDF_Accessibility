@@ -11,6 +11,7 @@ import pikepdf
 from lib.figure_alt_quality import (
     SuspiciousFigureAlt,
     classify_figure_alt,
+    is_figure,
     speaks_for_content,
     struct_class_names,
 )
@@ -217,7 +218,7 @@ def audit_pdf_bytes(pdf_bytes: bytes) -> PdfA11yAudit:
             if not isinstance(obj, pikepdf.Dictionary):
                 return
             spoken = spoken_by_ancestor or speaks_for_content(obj)
-            if obj.get("/S") == "/Figure":
+            if is_figure(obj, struct_root):
                 figure_index += 1
                 alt = obj.get("/Alt")
                 alt_text = str(alt).strip() if alt is not None else ""

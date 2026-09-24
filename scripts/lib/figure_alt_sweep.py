@@ -11,6 +11,7 @@ from lib.figure_alt_quality import (
     SuspiciousFigureAlt,
     classify_figure_alt,
     clear_descendant_alternate_text,
+    is_figure,
     speaks_for_content,
     struct_class_names,
 )
@@ -21,13 +22,14 @@ def find_suspicious_figure_alts(pdf_bytes: bytes) -> list[SuspiciousFigureAlt]:
     suspicious: list[SuspiciousFigureAlt] = []
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        struct_root = pdf.Root.get("/StructTreeRoot")
         figure_index = 0
 
         def walk(obj: pikepdf.Object) -> None:
             nonlocal figure_index
             if not isinstance(obj, pikepdf.Dictionary):
                 return
-            if obj.get("/S") == "/Figure":
+            if is_figure(obj, struct_root):
                 figure_index += 1
                 alt = obj.get("/Alt")
                 alt_text = str(alt).strip() if alt is not None else ""
@@ -55,7 +57,6 @@ def find_suspicious_figure_alts(pdf_bytes: bytes) -> list[SuspiciousFigureAlt]:
             elif isinstance(kids, pikepdf.Dictionary):
                 walk(kids)
 
-        struct_root = pdf.Root.get("/StructTreeRoot")
         if struct_root is not None:
             walk(struct_root)
 
@@ -71,11 +72,12 @@ def strip_suspicious_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[Suspiciou
     stripped: list[SuspiciousFigureAlt] = []
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        struct_root = pdf.Root.get("/StructTreeRoot")
         figure_index = 0
 
         def walk(obj: pikepdf.Dictionary) -> None:
             nonlocal figure_index
-            if obj.get("/S") == "/Figure":
+            if is_figure(obj, struct_root):
                 figure_index += 1
                 alt = obj.get("/Alt")
                 alt_text = str(alt).strip() if alt is not None else ""
@@ -107,7 +109,6 @@ def strip_suspicious_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[Suspiciou
             elif isinstance(kids, pikepdf.Dictionary):
                 walk(kids)
 
-        struct_root = pdf.Root.get("/StructTreeRoot")
         if struct_root is not None:
             walk(struct_root)
 
@@ -181,6 +182,7 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
     removed_empty = 0
 
     with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+        struct_root = pdf.Root.get("/StructTreeRoot")
         figure_index = 0
 
         def walk(
@@ -192,7 +194,7 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
             if not isinstance(obj, pikepdf.Dictionary):
                 return
             spoken = spoken_by_ancestor or speaks_for_content(obj)
-            if obj.get("/S") == "/Figure":
+            if is_figure(obj, struct_root):
                 figure_index += 1
                 alt = obj.get("/Alt")
                 alt_text = str(alt).strip() if alt is not None else ""
@@ -225,7 +227,6 @@ def repair_missing_figure_alt(pdf_bytes: bytes) -> tuple[bytes, list[int]]:
             elif isinstance(kids, pikepdf.Dictionary):
                 walk(kids, obj, spoken)
 
-        struct_root = pdf.Root.get("/StructTreeRoot")
         if struct_root is not None:
             walk(struct_root, None)
 

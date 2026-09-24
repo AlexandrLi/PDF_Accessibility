@@ -58,6 +58,30 @@ def speaks_for_content(element: pikepdf.Dictionary) -> bool:
     return False
 
 
+def resolved_structure_type(
+    element: pikepdf.Dictionary, struct_root: pikepdf.Dictionary | None
+) -> str | None:
+    """The element's structure type after following the document /RoleMap."""
+    stype = element.get("/S")
+    if stype is None:
+        return None
+    name = str(stype)
+    role_map = struct_root.get("/RoleMap") if struct_root is not None else None
+    seen: set[str] = set()
+    while isinstance(role_map, pikepdf.Dictionary) and name not in seen:
+        seen.add(name)
+        mapped = role_map.get(name)
+        if mapped is None:
+            break
+        name = str(mapped)
+    return name
+
+
+def is_figure(element: pikepdf.Dictionary, struct_root: pikepdf.Dictionary | None) -> bool:
+    """True for /Figure and for custom types the /RoleMap resolves to /Figure."""
+    return resolved_structure_type(element, struct_root) == "/Figure"
+
+
 def struct_children(obj: pikepdf.Dictionary) -> list[pikepdf.Dictionary]:
     kids = obj.get("/K")
     children: list[pikepdf.Dictionary] = []
