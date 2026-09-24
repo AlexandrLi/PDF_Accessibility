@@ -14,9 +14,11 @@ from lib.figure_alt_quality import (
     classify_figure_alt,
     clear_grouping_alternate_text_over_nested,
     find_nested_alternate_text,
+    is_figure,
     looks_like_table_figure_alt,
     struct_class_names,
 )
+from lib.figure_alt_sweep import _remove_child
 from lib.figure_to_table_sweep import _parse_column_headers, _parse_table_rows
 from lib.glyph_evidence import glyph_evidence_text
 from lib.inline_formula_sweep import expand_inline_formula_alt
@@ -2099,7 +2101,9 @@ def _repair_contentless_alt(
 
     Word leaves empty /Span elements with a single-space /ActualText inside
     text boxes. Acrobat fails them under "Alternate Text: Associated with
-    content" because the text replaces nothing on any page.
+    content" because the text replaces nothing on any page. An empty Figure is
+    removed instead, because a Figure left without alt fails "Figures
+    alternate text".
     """
     struct_root = pdf.Root.get("/StructTreeRoot")
     if struct_root is None:
@@ -2114,6 +2118,11 @@ def _repair_contentless_alt(
                 continue
             keys = [key for key in ("/Alt", "/ActualText") if key in child]
             if keys and not _struct_has_page_content(child):
+                if is_figure(child, struct_root):
+                    _remove_child(obj, child)
+                    updated += 1
+                    actions.append("removed empty Figure with no page content")
+                    continue
                 for key in keys:
                     del child[key]
                 updated += 1

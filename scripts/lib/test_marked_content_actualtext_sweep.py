@@ -2148,7 +2148,8 @@ def _build_contentless_span_pdf() -> bytes:
     spoken = elem("Span", ActualText=pikepdf.String("x"), K=pikepdf.Array([0]), Pg=page.obj)
     empty = elem("Span", ActualText=pikepdf.String(" "), K=pikepdf.Array([]))
     paragraph = elem("P", K=pikepdf.Array([spoken, empty]))
-    document = elem("Document", K=pikepdf.Array([paragraph]))
+    empty_figure = pdf.make_indirect(elem("Figure", Alt=pikepdf.String("Table")))
+    document = elem("Document", K=pikepdf.Array([paragraph, empty_figure]))
     pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
         {"/Type": pikepdf.Name("/StructTreeRoot"), "/K": pikepdf.Array([document])}
     )
@@ -2169,6 +2170,15 @@ class ContentlessAltTests(unittest.TestCase):
         self.assertIn(
             "removed ActualText from empty Span with no page content", result.actions
         )
+
+    def test_removes_empty_figure_whose_alt_names_no_content(self) -> None:
+        first, _ = repair_marked_content_actualtext(_build_contentless_span_pdf())
+        second, _ = repair_marked_content_actualtext(first)
+
+        with pikepdf.open(io.BytesIO(first)) as pdf:
+            document = pdf.Root.StructTreeRoot.K[0]
+            self.assertEqual([str(kid.S) for kid in document.K], ["/P"])
+        self.assertEqual(second, first)
 
 
 def _build_grouping_alt_over_nested_alt_pdf() -> bytes:
@@ -2459,7 +2469,8 @@ class DeadAltFigureOwnerTests(unittest.TestCase):
         page["/StructParents"] = 0
         paragraph = pdf.make_indirect(_struct_elem("P", K=pikepdf.Array([2]), Pg=page.obj))
         # The earlier round left this Figure over the table it reverted; it
-        # speaks its own alt, so nothing may be hung under it.
+        # speaks its own alt, so nothing may be hung under it, and it owns no
+        # content, so the sweep drops it.
         reverted = pdf.make_indirect(
             _struct_elem("Figure", Alt=pikepdf.String("Table"), K=pikepdf.Array([]), Pg=page.obj)
         )
@@ -2503,9 +2514,9 @@ class DeadAltFigureOwnerTests(unittest.TestCase):
             document = pdf.Root["/StructTreeRoot"]["/K"][0]
             kids = document["/K"]
             # The walk then retags the inline-formula Figure as a Span.
-            self.assertEqual([str(kid["/S"]) for kid in kids], ["/Figure", "/Span", "/P"])
-            self.assertEqual(str(kids[1]["/Alt"]), "x equals y")
-            self.assertEqual(kids[1]["/P"].objgen, document.objgen)
+            self.assertEqual([str(kid["/S"]) for kid in kids], ["/Span", "/P"])
+            self.assertEqual(str(kids[0]["/Alt"]), "x equals y")
+            self.assertEqual(kids[0]["/P"].objgen, document.objgen)
         self.assertIn(
             "page 1: reattached unreachable Figure 'x equals y' owning orphan "
             "MCIDs [0, 1] under Document",
@@ -2525,9 +2536,9 @@ class DeadAltFigureOwnerTests(unittest.TestCase):
         with pikepdf.open(io.BytesIO(repaired)) as pdf:
             document = pdf.Root["/StructTreeRoot"]["/K"][0]
             kids = document["/K"]
-            self.assertEqual([str(kid["/S"]) for kid in kids], ["/Figure", "/Span", "/P"])
-            self.assertNotIn("/Alt", kids[1])
-            self.assertNotIn("/C", kids[1])
+            self.assertEqual([str(kid["/S"]) for kid in kids], ["/Span", "/P"])
+            self.assertNotIn("/Alt", kids[0])
+            self.assertNotIn("/C", kids[0])
             data = _read_page_contents(pdf.pages[0]["/Contents"])
         self.assertEqual(_get_mcid_block(data, 0)[0], "Span")
         self.assertFalse(_mcid_bdc_has_actualtext(data, 0))
@@ -2551,7 +2562,7 @@ class DeadAltFigureOwnerTests(unittest.TestCase):
         self.assertEqual(count_orphan_marked_missing_actualtext(repaired), 2)
         with pikepdf.open(io.BytesIO(repaired)) as pdf:
             document = pdf.Root["/StructTreeRoot"]["/K"][0]
-            self.assertEqual(len(document["/K"]), 2)
+            self.assertEqual(len(document["/K"]), 1)
             data = _read_page_contents(pdf.pages[0]["/Contents"])
         self.assertFalse(_mcid_bdc_has_actualtext(data, 0))
         self.assertFalse(any("reattached" in action for action in result.actions))
