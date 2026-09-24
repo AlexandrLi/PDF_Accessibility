@@ -2415,6 +2415,34 @@ def _alt_precedence_protected_mcids(
     return protected
 
 
+def _described_table_figure_mcids(
+    pdf: pikepdf.Pdf,
+) -> set[tuple[tuple[int, int], int]]:
+    """(page objgen, MCID) pairs a table Figure with a descriptive /Alt speaks
+    for. A placeholder "Table" Figure sharing one of them must not overwrite
+    that text, or the two rewrite the block on every pass.
+    """
+    struct_root = pdf.Root.get("/StructTreeRoot")
+    if struct_root is None:
+        return set()
+
+    described: set[tuple[tuple[int, int], int]] = set()
+
+    def collect(obj: pikepdf.Dictionary) -> None:
+        if obj.get("/S") == "/Figure":
+            alt_text = _normalize_figure_alt_text(obj.get("/Alt"))
+            if alt_text and alt_text != "Table" and looks_like_table_figure_alt(alt_text):
+                page = _resolve_struct_page(pdf, obj)
+                if page is not None:
+                    for mcid in _collect_mcids(obj.get("/K")):
+                        described.add((page.objgen, mcid))
+        for child in _struct_child_dicts(obj):
+            collect(child)
+
+    collect(struct_root)
+    return described
+
+
 def _repair_figure_alt_precedence(
     pdf: pikepdf.Pdf,
     *,
@@ -3840,6 +3868,7 @@ def repair_marked_content_actualtext(
         _repair_grouping_alt_over_nested_alt(pdf, actions=actions)
         figure_index = 0
         protected_mcids = _alt_precedence_protected_mcids(pdf)
+        described_table_mcids = _described_table_figure_mcids(pdf)
 
         def walk(obj: pikepdf.Dictionary) -> None:
             nonlocal figure_index, figures_found, mcids_updated
@@ -3901,6 +3930,7 @@ def repair_marked_content_actualtext(
                                 mcid: text
                                 for mcid, text in mcid_texts.items()
                                 if not _mcid_block_shows_text(data, mcid)
+                                and (page_key, mcid) not in described_table_mcids
                             }
                         updated = _inject_actualtext_batch_on_page(
                             pdf,

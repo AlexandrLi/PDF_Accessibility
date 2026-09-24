@@ -380,6 +380,77 @@ class SharedMcidAltPrecedenceConflictTests(unittest.TestCase):
         )
 
 
+_PREFIX_TABLE_ALT = (
+    "Table of prefixes used to provide details on numbers, sizes or amounts. "
+    "The prefix 'mono-, uni-' is defined as 'one'."
+)
+
+
+def _build_described_and_placeholder_table_figures_pdf() -> bytes:
+    """376b9c8a-like page: a table Figure with a descriptive /Alt and a
+    table-figure-reverted placeholder both claim MCID 25."""
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page()
+    page["/Contents"] = pdf.make_stream(
+        b"q /Figure<</MCID 9 >> BDC /Im1 Do EMC Q "
+        b"q /Figure<</MCID 25 >> BDC /Im2 Do EMC Q"
+    )
+
+    described_figure = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Figure"),
+            "/Alt": _PREFIX_TABLE_ALT,
+            "/K": pikepdf.Array([25]),
+        }
+    )
+    placeholder_figure = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Figure"),
+            "/Alt": "Table",
+            "/Contents": "Table",
+            "/C": pikepdf.Array([pikepdf.Name("/table-figure-reverted")]),
+            "/K": pikepdf.Array([9, 25]),
+        }
+    )
+    document = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name("/Document"),
+            "/K": pikepdf.Array([described_figure, placeholder_figure]),
+        }
+    )
+    pdf.Root["/StructTreeRoot"] = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/StructTreeRoot"),
+            "/K": pikepdf.Array([document]),
+        }
+    )
+
+    buf = io.BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
+class DescribedTableFigureSharedMcidTests(unittest.TestCase):
+    def test_placeholder_table_figure_keeps_described_actualtext(self) -> None:
+        repaired, _ = repair_marked_content_actualtext(
+            _build_described_and_placeholder_table_figures_pdf()
+        )
+        contents = _page_contents_text(repaired)
+        self.assertEqual(_actualtext_for_mcid(contents, 25), _PREFIX_TABLE_ALT)
+        self.assertEqual(_actualtext_for_mcid(contents, 9), "Table")
+
+    def test_repair_is_byte_stable_with_described_and_placeholder_figures(self) -> None:
+        repaired_once, _ = repair_marked_content_actualtext(
+            _build_described_and_placeholder_table_figures_pdf()
+        )
+        repaired_twice, second = repair_marked_content_actualtext(repaired_once)
+        self.assertEqual(repaired_twice, repaired_once)
+        self.assertEqual(second.actions, [])
+
+
 class Cd099d0aRegressionTests(unittest.TestCase):
     def test_table_mcid_15_does_not_steal_bacteria_mcid_158_alt(self) -> None:
         pdf_bytes = _build_cd099d0a_regression_pdf()
