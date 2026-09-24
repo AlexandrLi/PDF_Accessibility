@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from figure_alt_quality import classify_figure_alt, is_suspicious_figure_alt
+from lib.figure_alt_quality import classify_figure_alt, is_suspicious_figure_alt
 
 
 class FigureAltQualityTests(unittest.TestCase):
